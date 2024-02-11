@@ -57,7 +57,7 @@ Description of module:
     generate either of the three classes. 
     
     Regions can be set using the 'Region' class constructor by reading a given DS9 file or 
-    inputing the necessary parameters. 
+    inputting the necessary parameters. 
     For example:
         import astroviz as av
         region1 = av.Region('directory_to_region_file')                # read given file
@@ -68,10 +68,8 @@ Description of module:
                             semimajor=3.5, semiminor=2.1, pa=36)       # another example
 """
 
-
 # numerical packages
 import numpy as np
-import pandas as pd
 
 # standard packages
 import copy
@@ -94,13 +92,17 @@ from astropy.convolution import Gaussian2DKernel, Box2DKernel, convolve, convolv
 
 # data visualization packages
 import matplotlib as mpl
-from matplotlib import pyplot as plt
-from matplotlib import cm, rcParams, ticker, patches
+from matplotlib import cm, rcParams, ticker, patches, colors, pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable, ImageGrid
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
+# clarify module's public interface
+__all__ = ["importfits", "Datacube", "Spatialmap", "PVdiagram", "Region", "plt_1ddata",
+           "search_molecular_line"]
 
-# -
+# initialize splatalogue catalogue (a global variable).
+splatalogue_df = None
+
 
 def importfits(fitsfile, hduindex=0, spatialunit="arcsec", quiet=False):
     """
@@ -367,8 +369,9 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", quiet=False):
     bmin = hdu_header.get("BMIN", np.nan)
     bpa =  hdu_header.get("BPA", np.nan)
     
-    if bmaj is not None:
+    if not np.isnan(bmaj):
         bmaj = u.Quantity(bmaj, u.deg).to_value(spatialunit)
+    if not np.isnan(bmin):
         bmin = u.Quantity(bmin, u.deg).to_value(spatialunit)
 
     # input information into dictionary as header information of image
@@ -502,17 +505,33 @@ def _get_hduheader(image):
         hdu_header["CRPIX4"] = np.float64(1.)
         hdu_header["CUNIT4"] = ''
 
-    # other information
-    updatedparams = {"BUNIT": image.header["bunit"],
-                     "DATE": "%04d-%02d-%02d"%(dtnow.year, dtnow.month, dtnow.day),
-                     "BMAJ": np.float64(u.Quantity(image.bmaj, image.unit).to_value(u.deg)),
-                     "BMIN": np.float64(u.Quantity(image.bmin, image.unit).to_value(u.deg)),
-                     "BPA": np.float64(image.bpa), 
-                     "INSTRUME": image.header["instrument"],
-                     "DATE-OBS": image.header["obsdate"],
-                     "RESTFRQ": np.float64(image.header["restfreq"]),
-                     "HISTORY": "Exported from Astroviz."
-                     }
+    # other information    
+    if np.isnan(image.bmaj) or np.isnan(image.bmin) or np.isnan(image.bpa):
+        updatedparams = {"BUNIT": image.header["bunit"],
+                         "DATE": "%04d-%02d-%02d"%(dtnow.year, dtnow.month, dtnow.day),
+                         "INSTRUME": image.header["instrument"],
+                         "DATE-OBS": image.header["obsdate"],
+                         "RESTFRQ": np.float64(image.header["restfreq"]),
+                         "HISTORY": "Exported from Astroviz."
+                         }
+    else:
+        bmaj = np.float64(u.Quantity(image.bmaj, image.unit).to_value(u.deg))   # this value can be NaN
+        bmin = np.float64(u.Quantity(image.bmin, image.unit).to_value(u.deg))
+        bpa = np.float64(image.bpa)
+        updatedparams = {"BUNIT": image.header["bunit"],
+                         "DATE": "%04d-%02d-%02d"%(dtnow.year, dtnow.month, dtnow.day),
+                         "BMAJ": bmin,
+                         "BMIN": bmaj,
+                         "BPA": bpa, 
+                         "INSTRUME": image.header["instrument"],
+                         "DATE-OBS": image.header["obsdate"],
+                         "RESTFRQ": np.float64(image.header["restfreq"]),
+                         "HISTORY": "Exported from Astroviz."
+                         }
+    
+    # don't write history if already in FITS file header
+    if "HISTORY" in hdu_header and hdu_header["HISTORY"] == "Exported from Astroviz.":
+        updatedparams.pop("HISTORY")
     
     # start updating other header info
     for key, value in updatedparams.items():
@@ -583,7 +602,7 @@ def _relative2icrs(coord, ref=None, unit="arcsec"):
 
 def _to_apu(unit_string):
     """
-    This is private function to fix a 'bug': astropy's incorrect reading of string units.
+    This is private function that fixes a 'bug': astropy's incorrect reading of string units.
     For instance, strings like "Jy/beam.km/s" would be read as u.Jy/u.beam*u.km/u.s 
     by this function.
     """
@@ -607,7 +626,7 @@ def _to_apu(unit_string):
 
 def _apu_to_str(unit):
     """
-    This is private function to fix a 'bug': astropy's incorrect conversion of units to strings.
+    This is private function that fixes a 'bug': astropy's incorrect conversion of units to strings.
     For instance, units like u.Jy/u.beam*u.km/u.s would be read as in the correct order in 
     the latex format by this function.
     """
@@ -663,6 +682,7 @@ class Datacube:
         if isinstance(self.data, u.quantity.Quantity):
             self.value = Datacube(fileinfo=self.fileinfo, data=self.data.value)
         
+        self._peakshifted = False
         self.__pltnax = 0
         self.__pltnchan = 0
         
@@ -954,15 +974,16 @@ class Datacube:
             return self
         return Datacube(fileinfo=self.fileinfo, data=newdata.reshape(self.shape))
    
-    # private method to calculate moment data.
     def __get_momentdata(self, moment, data=None, vaxis=None):
+        """
+        Private method to get the data array of the specified moment map.
+        Used for the public methods 'immoments' and 'peakshift' (moment 8 used).
+        """
         # intialize parameters
         vaxis = self.vaxis if vaxis is None else vaxis
         data = self.data if data is None else data
         nv = vaxis.size
-        dv = vaxis[1] - vaxis[0]
-        reshaped_vaxis = vaxis.reshape((1, nv, 1, 1))
-        vv = np.broadcast_to(reshaped_vaxis, (1, nv, self.nx, self.ny))
+        dv = vaxis[1] - vaxis[0]            
 
         # mean value of spectrum (unit: intensity)
         if moment == -1:
@@ -972,12 +993,16 @@ class Datacube:
         elif moment == 0:
             momdata = np.nansum(data, axis=1)*dv
         
-        # intensity weighted coordinate (unit: km/s)
+        # intensity weighted coordinate (unit: km/s) 
         elif moment == 1:
+            reshaped_vaxis = vaxis.reshape((1, nv, 1, 1))
+            vv = np.broadcast_to(reshaped_vaxis, (1, nv, self.nx, self.ny))
             momdata = np.nansum(data*vv, axis=1) / np.nansum(data, axis=1)
         
         # intensity weighted dispersion of the coordinate (unit: km/s)
         elif moment == 2:
+            reshaped_vaxis = vaxis.reshape((1, nv, 1, 1))
+            vv = np.broadcast_to(reshaped_vaxis, (1, nv, self.nx, self.ny))
             meanvel = np.nansum(data*vv, axis=1) / np.nansum(data, axis=1)
             momdata = np.sqrt(np.nansum(data*(vv-meanvel)**2, axis=1)/np.nansum(data, axis=1))
             
@@ -987,8 +1012,18 @@ class Datacube:
         
         # median coordinate (unit: km/s)
         elif moment == 4:
-            func = lambda m: np.nanmedian(np.broadcast_to(reshaped_vaxis, m.shape)*m, axis=1)
-            momdata = np.apply_along_axis(func, 1, data)
+            momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
+            for i in range(momdata.shape[2]):
+                for j in range(momdata.shape[3]):
+                    pixdata = data[0, :, i, j]  # shape: (nv,)
+                    if np.all(np.isnan(pixdata)):
+                        momdata[0, 0, i, j] = np.nan
+                    else:
+                        sorted_data = np.sort(pixdata)
+                        sorted_data = sorted_data[~np.isnan(sorted_data)]
+                        median_at_pix = sorted_data[sorted_data.size//2]  # this is approximation of median, not always exact
+                        vidx = np.where(pixdata == median_at_pix)[0][0]   # get index of coordinate of median
+                        momdata[0, 0, i, j] = vaxis[vidx]
         
         # standard deviation about the mean of the spectrum (unit: intensity)
         elif moment == 5:
@@ -1008,28 +1043,43 @@ class Datacube:
             
         # coordinate of the maximum value of the spectrum (unit: km/s)
         elif moment == 9:
-            maxidx = np.nanargmax(data, axis=1)
-            momdata = np.take_along_axis(reshaped_vaxis, maxidx, axis=2)
+            momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
+            for i in range(momdata.shape[2]):
+                for j in range(momdata.shape[3]):
+                    pixdata = data[0, :, i, j]    # data of data cube at this pixel
+                    if np.all(np.isnan(pixdata)):
+                        momdata[0, 0, i, j] = np.nan
+                    else:
+                        momdata[0, 0, i, j] = vaxis[np.nanargmax(pixdata)]
             
         # minimum value of the spectrum (unit: intensity)
         elif moment == 10:
             momdata = np.nanmin(data, axis=1)
         
-        # coordinate of the minimum value of the spectrum (unit: km/s)
+        # coordinate of the minimum value of the spectrum (unit: km/s) 
         elif moment == 11:
-            minidx = np.nanargmin(data, axis=1)
-            momdata = np.take_along_axis(vv, minidx, axis=2)
+            momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
+            for i in range(momdata.shape[2]):
+                for j in range(momdata.shape[3]):
+                    pixdata = data[0, :, i, j]   # data of data cube at this pixel
+                    if np.all(np.isnan(pixdata)):
+                        momdata[0, 0, i, j] = np.nan
+                    else:
+                        momdata[0, 0, i, j] = vaxis[np.nanargmin(pixdata)]            
         
         return momdata.reshape((1, 1, self.nx, self.ny))
     
-    def immoments(self, moments=[0], vrange=[], chans=[], threshold=None):
+    def immoments(self, moments=[0], vrange=None, chans=None, threshold=None):
         """
         Parameters:
             moments (list[int]): a list of moment maps to be outputted
-            vrange (list[float]): a list of [minimum velocity, maximum velocity] in km/s
+            vrange (list[float]): a list of [minimum velocity, maximum velocity] in km/s. 
+                                  Default is to use the entire velocity range.
+            chans (list[float]): a list of [minimum channel, maximum channel] using 1-based indexing.
+                                 Default is to use all channels.
             threshold (float): a threshold to be applied to data cube. None to not use a threshold.
         Returns:
-            A list of moment maps (Sptialmap objects).
+            A list of moment maps (Spatialmap objects).
         -------
         Additional notes:
             This method uses the following CASA definition of moment maps:
@@ -1047,6 +1097,12 @@ class Datacube:
                 10 - minimum value of the spectrum
                 11 - coordinate of the minimum value of the spectrum
         """
+        # initialize parameters:
+        if vrange is None:
+            vrange = []
+        if chans is None:
+            chans = []
+        
         # check if moments exceed 11. 
         if isinstance(moments, (int, float)):
             if moments > 11:
@@ -1368,7 +1424,7 @@ class Datacube:
         This method trims the data cube along the velocity axis.
         Parameters:
             vrange (iterable): the [minimum velocity, maximum velocity], inclusively.
-            nskip (float): the number of channel increments
+            nskip (int): the number of channel increments
             vskip (float): the velocity increment between channels in km/s. An alternative to 'nskip' parameter.
             inplace (True): True to modify the data cube in-place. False to return a new data cube.
         Returns:
@@ -1632,7 +1688,6 @@ class Datacube:
         bunit = self.bunit.replace(".", " ")
         
         clipped_data = sigma_clip(self.data, sigma=sigma, maxiters=10000, masked=False, axis=(1, 2, 3))
-        bg_image = self.set_data(clipped_data, inplace=False)
         mean = np.nanmean(clipped_data)
         rms = np.sqrt(np.nanmean(clipped_data**2))
         std = np.nanstd(clipped_data)
@@ -1680,6 +1735,7 @@ class Datacube:
                 ax.plot(fitx, fity, color=curvecolor, lw=curvelw)
                 
         if shownoise:
+            bg_image = self.set_data(clipped_data, inplace=False)
             bg_image.imview(title="Background Noise Distribution", **kwargs)
             
         if plthist or shownoise:
@@ -1734,6 +1790,22 @@ class Datacube:
             for i in range(self.__pltnchan):
                 grid[i].plot([region.start[0], region.end[0]], [region.start[1], region.end[1]], 
                              color=color, lw=lw, linestyle=ls)
+        elif region.shape == "box":
+            # make patch
+            pa = region.pa
+            pa_rad = np.deg2rad(pa)
+            center = region.center
+            width, height = region.width, region.height
+            dx, dy = -width/2, -height/2
+            x = center[0] + (dx*np.cos(pa_rad) + dy*np.sin(pa_rad))
+            y = center[1] - (dx*np.sin(pa_rad) - dy*np.cos(pa_rad))
+            
+            # add patch on all plots
+            for i in range(self.__pltnchan):
+                rect_patch = patches.Rectangle((x, y), width, height, angle=-region.pa,
+                                           linewidth=lw, linestyle=ls, edgecolor=color, 
+                                           facecolor='none')
+                grid[i].add_patch(rect_patch)
         if plot:
             plt.show()
         return grid
@@ -1768,11 +1840,22 @@ class Datacube:
             yy_prime = (xx-x)*np.sin(angle)+(yy-y)*np.cos(angle)
             mask = np.square(xx_prime/a) + np.square(yy_prime/b) <= 1
         elif region.shape == "box":
-            print("Not Implemented Yet")
-            return
-        elif region.shape == "rectangle":
-            print("Not Implemented Yet")
-            return
+            # get width and height
+            width, height = region.width, region.height
+            
+            # shift center
+            xx -= region.center[0]
+            yy -= region.center[1]
+
+            # rotate
+            pa_rad = np.deg2rad(region.pa)
+            xx_rot = xx*np.cos(pa_rad)-yy*np.sin(pa_rad)
+            yy_rot = xx*np.sin(pa_rad)+yy*np.cos(pa_rad)
+
+            # create masks
+            xmask = (-width/2 <= xx_rot) & (xx_rot <= width/2)
+            ymask = (-height/2 <= yy_rot) & (yy_rot <= height/2)
+            mask = xmask & ymask
         if exclude:
             mask = ~mask
         mask = np.broadcast_to(mask, data.shape[1:])
@@ -1805,6 +1888,19 @@ class Datacube:
                 region.start = region.header["start"] = (newstart[0].value, newstart[1].value)
                 region.end = region.header["end"] = (newend[0].value, newend[1].value)
                 region.length = region.header["length"] = u.Quantity(region.length, region.header["unit"]).to_value(self.unit)
+            elif region.shape == "ellipse":
+                newsemimajor = u.Quantity(region.semimajor, region.header["unit"]).to_value(self.unit)
+                newsemiminor = u.Quantity(region.semiminor, region.header["unit"]).to_value(self.unit)
+                region.semimajor = region.header["semimajor"] = newsemimajor
+                region.semiminor = region.header["semiminor"] = newsemiminor
+            elif region.shape == "circle":
+                newradius = u.Quantity(region.radius, region.header["unit"]).to_value(self.unit)
+                region.radius = region.semimajor = region.semiminor = region.header["radius"] = newradius
+            elif region.shape == "box":
+                height = u.Quantity(region.height, region.header["unit"]).to_value(self.unit)
+                region.height = region.header["height"] = height
+                width = u.Quantity(region.width, region.header["unit"]).to_value(self.unit)
+                region.width = region.header["width"] = width
         elif not region.header["relative"]:
             refx, refy = _icrs2relative(self.refcoord, unit=self.unit)
             centerx, centery = u.Quantity(center[0], region.header["unit"]), u.Quantity(center[1], region.header["unit"])
@@ -1827,6 +1923,11 @@ class Datacube:
                 newend = u.Quantity(endx-refx, self.unit).value, u.Quantity(endy-refy, self.unit).value
                 region.end = region.header["end"] = newend
                 region.length = region.header["length"] = u.Quantity(region.length, region.header["unit"]).to_value(self.unit)
+            elif region.shape == "box":
+                height = u.Quantity(region.height, region.header["unit"]).to_value(self.unit)
+                region.height = region.header["height"] = height
+                width = u.Quantity(region.width, region.header["unit"]).to_value(self.unit)
+                region.width = region.header["width"] = width
         region.relative = region.header["relative"] = True
         return region
     
@@ -1918,7 +2019,7 @@ class Datacube:
         vaxis = self.vaxis.copy()     # copy to prevent modifying after returning.
         
         # plot the data
-        ax = plt_spectrum(vaxis, intensity, xlabel=xlabel, ylabel=ylabel, **kwargs)
+        ax = _plt_spectrum(vaxis, intensity, xlabel=xlabel, ylabel=ylabel, **kwargs)
         
         # return the objects
         if returndata:
@@ -2002,7 +2103,7 @@ class Datacube:
         # calculate dx from imsize if imsize is given:
         if len(imsize) == 2:
             dx = -(self.xaxis.max()-self.xaxis.min())/imsize[0]
-            dy = (self.yaxis.max() - self.yaxis.min())/imsize[0]
+            dy = (self.yaxis.max() - self.yaxis.min())/imsize[1]
 
         # if dx or dy is not provided, raise an error
         if dx is None or dy is None:
@@ -2116,10 +2217,40 @@ class Datacube:
         pixely = int(shifty/dy)
         image.data = np.nan_to_num(image.data)
         shift = np.array([self.refny-1, self.refnx-1])-[self.refny-pixely, self.refnx+pixelx]
-        # this method of looping is somehow faster than specifying axis with the built-in parameter.
+        # list comprehension is somehow faster than specifying axis with the built-in parameter of ndimage.shift
         image.data[0] = np.array([ndimage.shift(image.data[0, i], shift=shift) for i in range(self.nchan)])
         image.__updateparams()
         return image
+    
+    def peakshift(self, inplace=False):
+        """
+        Shift the maximum value of the image to the center of the image.
+        Parameter:
+            inplace (bool): True to modify the current image in-place. False to return a new image.
+        Returns:
+            The shifted image.
+        """
+        mom8_data = self.__get_momentdata(8)    # maximum intensity of spectrum
+        indices = np.unravel_index(np.nanargmax(mom8_data[0, 0]), mom8_data[0, 0].shape)
+        xx, yy = self.get_xyaxes(grid=True, unit=None)
+        coord = xx[indices], yy[indices]
+        if self._peakshifted:
+            print("The peak is already shifted to the center.")
+            return self.copy()
+        else:
+            shifted_image = self.imshift(coord=coord, printcc=True, unit=self.unit, inplace=inplace)
+            if inplace:
+                self._peakshifted = True
+            else:
+                shifted_image._peakshifted = True
+            print(f"Shifted to {coord} [{self.unit}]")
+            return shifted_image
+    
+    def line_info(self):
+        """
+        This method searches for the molecular line data from the Splatalogue database
+        """
+        return search_molecular_line(self.restfreq, unit="Hz")
     
     def get_hduheader(self):
         """
@@ -2130,6 +2261,7 @@ class Datacube:
         Returns:
             The FITS header of the current image object (astropy.io.fits.header.Header).
         """
+        self.__updateparams()
         return _get_hduheader(self)
     
     def exportfits(self, outname, overwrite=False):
@@ -2149,9 +2281,6 @@ class Datacube:
         Returns:
             None
         """
-        # update parameters before saving
-        self.__updateparams()
-        
         # get header
         hdu_header = self.get_hduheader()
         
@@ -2412,8 +2541,8 @@ class Spatialmap:
             self.bunit = self.fileinfo["bunit"] = (self.data.unit).to_string()
         else:
             self.bunit = self.fileinfo["bunit"]
-        xmin, xmax = self.xaxis[[0,-1]]
-        ymin, ymax = self.yaxis[[0,-1]]
+        xmin, xmax = self.xaxis[[0, -1]]
+        ymin, ymax = self.yaxis[[0, -1]]
         self.imextent = [xmin-0.5*self.dx, xmax+0.5*self.dx, 
                          ymin-0.5*self.dy, ymax+0.5*self.dy]
         self.widestfov = max(self.xaxis[0], self.yaxis[-1])
@@ -2574,11 +2703,23 @@ class Spatialmap:
             yy_prime = (xx-x)*np.sin(angle)+(yy-y)*np.cos(angle)
             mask = np.square(xx_prime/a) + np.square(yy_prime/b) <= 1
         elif region.shape == "box":
-            print("Not Implemented Yet")
-            return
-        elif region.shape == "rectangle":
-            print("Not Implemented Yet")
-            return
+            # get width and height
+            width, height = region.width, region.height
+            
+            # shift center
+            xx -= region.center[0]
+            yy -= region.center[1]
+
+            # rotate
+            pa_rad = np.deg2rad(region.pa)
+            xx_rot = xx*np.cos(pa_rad)-yy*np.sin(pa_rad)
+            yy_rot = xx*np.sin(pa_rad)+yy*np.cos(pa_rad)
+
+            # create masks
+            xmask = (-width/2 <= xx_rot) & (xx_rot <= width/2)
+            ymask = (-height/2 <= yy_rot) & (yy_rot <= height/2)
+            mask = xmask & ymask
+            
         if exclude:
             mask = ~mask
 
@@ -2630,6 +2771,19 @@ class Spatialmap:
         elif region.shape == "line":
             ax.plot([region.start[0], region.end[0]], [region.start[1], region.end[1]], 
                      color=color, lw=lw, linestyle=ls)
+        elif region.shape == "box":
+            # make patch
+            pa = region.pa
+            pa_rad = np.deg2rad(pa)
+            center = region.center
+            width, height = region.width, region.height
+            dx, dy = -width/2, -height/2
+            x = center[0] + (dx*np.cos(pa_rad) + dy*np.sin(pa_rad))
+            y = center[1] - (dx*np.sin(pa_rad) - dy*np.cos(pa_rad))
+            rect_patch = patches.Rectangle((x, y), width, height, angle=-region.pa,
+                                           linewidth=lw, linestyle=ls, edgecolor=color, 
+                                           facecolor='none')
+            ax.add_patch(rect_patch)
         if plot:
             plt.show()
         return ax
@@ -2651,8 +2805,8 @@ class Spatialmap:
             dy = template.dy
         
         if len(imsize) == 2:
-            dx = -(self.xaxis.max()-self.xaxis.min())/imsize[0]
-            dy = (self.yaxis.max() - self.yaxis.min())/imsize[0]
+            dx = -(self.xaxis.max() - self.xaxis.min())/imsize[0]
+            dy = (self.yaxis.max() - self.yaxis.min())/imsize[1]
 
         # If dx or dy is not provided, raise an error
         if dx is None or dy is None:
@@ -2730,7 +2884,7 @@ class Spatialmap:
             bmin (float): the minor axis of the new beam. None to set it to the same as the major axis.
             bpa (float): the position angle of the elliptical beam
             unit (float): the unit of bmaj/bmin. None to use default unit of axes.
-            kernel (str): the type of convolution to be used .This parameter is case-insensitive.
+            kernel (str): the type of convolution to be used. This parameter is case-insensitive.
                           "gauss", "gaussian", "g": Gaussian convolution
                           "box", "b": Box shape (square).
                             
@@ -2933,6 +3087,19 @@ class Spatialmap:
                 region.start = region.header["start"] = (newstart[0].value, newstart[1].value)
                 region.end = region.header["end"] = (newend[0].value, newend[1].value)
                 region.length = region.header["length"] = u.Quantity(region.length, region.header["unit"]).to_value(self.unit)
+            elif region.shape == "ellipse":
+                newsemimajor = u.Quantity(region.semimajor, region.header["unit"]).to_value(self.unit)
+                newsemiminor = u.Quantity(region.semiminor, region.header["unit"]).to_value(self.unit)
+                region.semimajor = region.header["semimajor"] = newsemimajor
+                region.semiminor = region.header["semiminor"] = newsemiminor
+            elif region.shape == "circle":
+                newradius = u.Quantity(region.radius, region.header["unit"]).to_value(self.unit)
+                region.radius = region.semimajor = region.semiminor = region.header["radius"] = newradius
+            elif region.shape == "box":
+                height = u.Quantity(region.height, region.header["unit"]).to_value(self.unit)
+                region.height = region.header["height"] = height
+                width = u.Quantity(region.width, region.header["unit"]).to_value(self.unit)
+                region.width = region.header["width"] = width
         elif not region.header["relative"]:
             refx, refy = _icrs2relative(self.refcoord, unit=self.unit)
             centerx, centery = u.Quantity(center[0], region.header["unit"]), u.Quantity(center[1], region.header["unit"])
@@ -2955,6 +3122,11 @@ class Spatialmap:
                 newend = u.Quantity(endx-refx, self.unit).value, u.Quantity(endy-refy, self.unit).value
                 region.end = region.header["end"] = newend
                 region.length = region.header["length"] = u.Quantity(region.length, region.header["unit"]).to_value(self.unit)
+            elif region.shape == "box":
+                height = u.Quantity(region.height, region.header["unit"]).to_value(self.unit)
+                region.height = region.header["height"] = height
+                width = u.Quantity(region.width, region.header["unit"]).to_value(self.unit)
+                region.width = region.header["width"] = width
         region.relative = region.header["relative"] = True
         return region
     
@@ -3303,15 +3475,16 @@ class Spatialmap:
         return rms
             
     def imview(self, contourmap=None, title="", fov=None, vmin=None, vmax=None, 
-               scale="linear", gamma=None, crms=None, clevels=np.arange(3, 21, 3), tickscale=None, 
+               scale="linear", gamma=1.5, crms=None, clevels=np.arange(3, 21, 3), tickscale=None, 
                scalebaron=True, distance=None, cbarlabelon=True, cbarlabel=None, xlabelon=True,
                ylabelon=True, dpi=500, ha="left", va="top", titlepos=0.85, 
                cmap=None, fontsize=12, cbarwidth="5%", width=330, height=300,
-               imsmooth=None, scalebarsize=0.1, nancolor=None, beamcolor=None,
+               smooth=None, scalebarsize=0.1, nancolor=None, beamcolor=None,
                ccolors=None, clw=0.8, txtcolor=None, cbaron=True, cbarpad=0., tickson=False, 
                labelcolor="k", tickcolor="k", labelsize=10., ticklabelsize=10., 
                cbartick_length=3., cbartick_width=1., beamon=True, scalebar_fontsize=10,
-               axeslw=1., scalecolor=None, scalelw=1., orientation="vertical", plot=True):
+               axeslw=1., scalecolor=None, scalelw=1., orientation="vertical", 
+               cbarticks=[], plot=True):
         """
         Method to plot the image.
         Parameters:
@@ -3420,18 +3593,18 @@ class Spatialmap:
                   'figure.figsize': fig_size,
                   'font.family': 'Times New Roman',
                   "mathtext.fontset" : 'stix', 
-                  'mathtext.tt':'Times New Roman',
+                  'mathtext.tt': 'Times New Roman',
                   'axes.linewidth' : axeslw,
                   'xtick.major.width' : 1.0,
                   "xtick.direction": 'in',
                   "ytick.direction": 'in',
                   'ytick.major.width' : 1.0,
-                  'xtick.minor.width' : 1.0,
-                  'ytick.minor.width' : 1.0,
+                  'xtick.minor.width' : 0.,
+                  'ytick.minor.width' : 0.,
                   'xtick.major.size' : 6.,
                   'ytick.major.size' : 6.,
-                  'xtick.minor.size' : 4.,
-                  'ytick.minor.size' : 4.,
+                  'xtick.minor.size' : 0.,
+                  'ytick.minor.size' : 0.,
                   'figure.dpi': dpi,
                 }
         rcParams.update(params)
@@ -3452,12 +3625,52 @@ class Spatialmap:
             print(f"Estimated base contour level (rms): {crms:.4e} [{bunit}]")
         
         # add image
-        climage = ax.imshow(data[0, 0], cmap=my_cmap, extent=self.imextent, 
-                            vmin=vmin, vmax=vmax, origin='lower')
+        if scale.lower() == "linear":
+            climage = ax.imshow(data[0, 0], cmap=my_cmap, extent=self.imextent, 
+                                vmin=vmin, vmax=vmax, origin='lower')
+        elif scale.lower() in ["log", "logscale"]:
+            if vmin is None:
+                vmin = 3*self.noise()
+            if vmax is None:
+                vmax = np.nanmax(data)
+                if vmax <= 0:
+                    raise Exception("The data only contains negative values. Log scale is not suitable.")
+            climage = ax.imshow(data[0, 0], cmap=my_cmap, extent=self.imextent,
+                                norm=colors.LogNorm(vmin=vmin, vmax=vmax), 
+                                origin="lower")
+            if len(cbarticks) == 0:
+                cbarticks = np.linspace(vmin, vmax, 7)[1:-1]
+        elif scale.lower() == "gamma":
+            climage = ax.imshow(data[0, 0], cmap=my_cmap, extent=self.imextent, origin="lower",
+                                norm=colors.PowerNorm(gamma=gamma, vmin=vmin, vmax=vmax))
+        else:
+            raise ValueError("Scale must be 'linear', 'log', or 'gamma'.")
+            
+        if cbaron:
+            if cbarlabelon:
+                if cbarlabel is None:
+                    cbarlabel = f"({_apu_to_str(_to_apu(self.bunit))})"
+                else:
+                    cbarlabel = ""
+            ticklocation = "right"
+            divider = make_axes_locatable(ax)
+            ax_cb = divider.append_axes(ticklocation, size=cbarwidth, pad=cbarpad)
+            cb = plt.colorbar(climage, cax=ax_cb, orientation=orientation, 
+                              ticklocation=ticklocation)
+            if len(cbarticks) > 0:
+                cb.set_ticks(cbarticks)
+                if scale.lower() in ["log", "logscale"]:
+                    labels = ("%.2s"%label for label in cbarticks)
+                    labels = [label if label[-1] != "." else label[:-1] for label in labels]
+                    cb.set_ticklabels(labels)
+            cb.set_label(cbarlabel, fontsize=labelsize)
+            cb.ax.tick_params(labelsize=ticklabelsize, width=cbartick_width, 
+                              length=cbartick_length, direction='in')
+        
         if contourmap is not None:
             contour_data = contourmap.data[0, 0]
-            if imsmooth is not None:
-                contour_data = gaussian_filter(contour_data, imsmooth)
+            if smooth is not None:
+                contour_data = gaussian_filter(contour_data, smooth)
             ax.contour(contour_data, extent=contourmap.imextent, 
                        levels=crms*clevels, colors=ccolors, linewidths=clw, origin='lower')
         
@@ -3473,21 +3686,6 @@ class Spatialmap:
         if title:
             titlex, titley = fov*titlepos, fov*titlepos
             ax.text(x=titlex, y=titley, s=title, ha=ha, va=va, color=txtcolor, fontsize=fontsize)
-        
-        if cbaron:
-            if cbarlabelon:
-                if cbarlabel is None:
-                    cbarlabel = f"({_apu_to_str(_to_apu(self.bunit))})"
-                else:
-                    cbarlabel = ""
-            ticklocation = "right"
-            divider = make_axes_locatable(ax)
-            ax_cb = divider.append_axes(ticklocation, size=cbarwidth, pad=cbarpad)
-            cb = plt.colorbar(climage, cax=ax_cb, orientation=orientation, 
-                              ticklocation=ticklocation)
-            cb.set_label(cbarlabel, fontsize=labelsize)
-            cb.ax.tick_params(labelsize=ticklabelsize, width=cbartick_width, 
-                              length=cbartick_length, direction='in')
         
         ax.set_xlim([fov, -fov])
         ax.set_ylim([-fov, fov])
@@ -3514,7 +3712,7 @@ class Spatialmap:
         
         # add beam
         if beamon:
-            bmin_plot, bmaj_plot = ax.transLimits.transform((self.bmin, self.bmaj))-ax.transLimits.transform((0,0))
+            bmin_plot, bmaj_plot = ax.transLimits.transform((self.bmin, self.bmaj))-ax.transLimits.transform((0, 0))
             beam = patches.Ellipse(xy=(0.1, 0.11), width=bmin_plot, height=bmaj_plot, fc=beamcolor, 
                                    angle=self.bpa, transform=ax.transAxes)
             ax.add_patch(beam)
@@ -3527,6 +3725,12 @@ class Spatialmap:
             plt.show()
         return ax
     
+    def line_info(self):
+        """
+        This method searches for the molecular line data from the Splatalogue database
+        """
+        return search_molecular_line(self.restfreq, unit="Hz")
+    
     def get_hduheader(self):
         """
         To retrieve the header of the current FITS image. This method accesses the header 
@@ -3536,6 +3740,7 @@ class Spatialmap:
         Returns:
             The FITS header of the current image object (astropy.io.fits.header.Header).
         """
+        self.__updateparams()
         return _get_hduheader(self)
     
     def exportfits(self, outname, overwrite=False):
@@ -3555,9 +3760,6 @@ class Spatialmap:
         Returns:
             None
         """
-        # update parameters before saving
-        self.__updateparams()
-        
         # get header
         hdu_header = self.get_hduheader()
         
@@ -4236,6 +4438,12 @@ class PVdiagram:
         
         return ax
     
+    def line_info(self):
+        """
+        This method searches for the molecular line data from the Splatalogue database
+        """
+        return search_molecular_line(self.restfreq, unit="Hz")
+    
     def get_hduheader(self):
         """
         To retrieve the header of the current FITS image. This method accesses the header 
@@ -4245,6 +4453,7 @@ class PVdiagram:
         Returns:
             The FITS header of the current image object (astropy.io.fits.header.Header).
         """
+        self.__updateparams()
         return _get_hduheader(self)
     
     def exportfits(self, outname, overwrite=False):
@@ -4263,10 +4472,7 @@ class PVdiagram:
                               prevent overwriting existing files.
         Returns:
             None
-        """
-        # update parameters before saving
-        self.__updateparams()
-        
+        """        
         # get header
         hdu_header = self.get_hduheader()
         
@@ -4297,9 +4503,39 @@ class Region:
     various methods in Datacube, Spatialmap, and PVdiagram.
     """
     def __init__(self, regionfile=None, shape="ellipse", radius=None,
-                 semimajor=1., semiminor=1., pa=0., center=(0., 0.), 
-                 unit="arcsec", start=None, end=None, length=None, 
+                 semimajor=1., semiminor=1., pa=0., center=(0., 0.), start=None, 
+                 end=None, length=None, width=None, height=None, unit="arcsec",
                  relative=True, quiet=False):
+        """
+        Initializes a new instance of the Region class.
+
+        Parameters:
+            regionfile (str, optional): Path to the DS9 or CRTF region file.
+            shape (str): Shape of the region. Supported shapes are 'circle', 'ellipse', 'box', 'line'.
+            radius (float, optional): Radius of the circle. Required if shape is 'circle'.
+            semimajor (float): Semi-major axis of the ellipse or box. Defaults to 1.0.
+            semiminor (float): Semi-minor axis of the ellipse or box. Defaults to 1.0.
+            pa (float): Position angle of the shape in degrees. Defaults to 0.
+            center (tuple): Central position of the shape. Given as (x, y) coordinates.
+            start (tuple, optional): Starting point of the line. Required if shape is 'line'.
+            end (tuple, optional): End point of the line. Required if shape is 'line'.
+            length (float, optional): Length of the line. Calculated if start and end are provided.
+            width (float, optional): Width of the box. Required if shape is 'box'.
+            height (float, optional): Height of the box. Required if shape is 'box'.
+            unit (str): Unit of the coordinates (e.g., 'arcsec', 'degree'). Defaults to 'arcsec'.
+            relative (bool): If True, coordinates are interpreted as relative to the center. Defaults to True.
+            quiet (bool): If False, outputs more detailed information during processing. Defaults to False.
+
+        Raises:
+            ValueError: If required parameters for the specified shape are not provided.
+
+        Note:
+            - Some parameters are optional for shapes. For instance, if 'center', 'length', and 'pa'
+              of line are specified, then the 'start' and 'end' are not required.
+            - If 'regionfile' is provided, the shape and other parameters are read from the file.
+            - The position angle 'pa' is relevant for shapes 'ellipse', 'box', and 'line'.
+        """
+
         self.regionfile = regionfile
         shape = shape.lower()
         unit = unit.lower()
@@ -4310,6 +4546,9 @@ class Region:
         
         if length is not None or start is not None or end is not None:
             shape = "line"
+            
+        if width is not None or height is not None:
+            shape = "box"
         
         if regionfile is None:
             self.filetype = None
@@ -4421,6 +4660,44 @@ class Region:
                                "center": center,
                                "radius": semimajor,
                                "unit": unit}
+            if shape in ["box", "rectangle", "square"]:
+                if shape == "square":
+                    if width is not None:
+                        self.width = self.height = width
+                    elif height is not None:
+                        self.width = self.height = height
+                    elif length is not None:
+                        self.width = self.height = length
+                    elif semimajor is not None:
+                        self.width = self.height = semimajor*2
+                    else:
+                        raise ValueError("Must specify the 'width', 'height', or 'length' parameter.")
+                else:
+                    if width is not None:
+                        self.width = width
+                    elif semimajor is not None:
+                        self.width = semimajor*2
+                        
+                    if height is not None:
+                        self.height = height
+                    elif semiminor is not None:
+                        self.height = semiminor*2
+                    elif length is not None:
+                        self.height = length
+                    else:
+                        raise ValueError("Must specify the 'height'.")
+                self.shape = "box"
+                self.pa = pa
+                self.center = center
+                self.unit = unit
+                self.header = {"shape": self.shape,
+                               "center": self.center,
+                               "width": self.width,
+                               "height": self.height,
+                               "pa": self.pa,
+                               "unit": self.unit,
+                              }
+                    
             self.relative = self.header["relative"] = relative
         else:
             self.__readfile(quiet=quiet)
@@ -4500,6 +4777,28 @@ class Region:
                            "center": center,
                            "semimajor": semimajor,
                            "semiminor": semiminor,
+                           "pa": pa,
+                           "unit": unit,
+                           "relative": relative
+                           }
+        elif self.shape == "box":
+            self.unit = unit = "deg"
+            coord_tup = self.__filelst[3].replace(self.shape+"(", "")
+            coord_tup = coord_tup.split(")")[0]  # string
+            elements = coord_tup.split(", ")
+            center_ra, center_dec, width_str, height_str, pa_str = elements
+            self.center = center = float(center_ra), float(center_dec)
+            width_str = width_str.replace('"', "arcsec").replace("'", "arcmin").replace("∘", "deg")
+            height_str = height_str.replace('"', "arcsec").replace("'", "arcmin").replace("∘", "deg")
+            self.width = width = float(u.Quantity(width_str).to_value(u.deg))
+            self.height = height = float(u.Quantity(height_str).to_value(u.deg))
+            self.pa = pa = float(pa_str)
+            
+            self.relative = relative = False
+            self.header = {"shape": shape,
+                           "center": center,
+                           "width": width,
+                           "height": height,
                            "pa": pa,
                            "unit": unit,
                            "relative": relative
@@ -4599,7 +4898,7 @@ def plt_1ddata(xdata=None, ydata=None, xlim=[], ylim=[], mean_center=False, titl
     return ax
 
 
-def plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=[], ylim=[], 
+def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=[], ylim=[], 
                   gaussfit=True, mean_center=True, title=None, legendon=True,
                   xlabel=r"Velocity offset ($\rm km~s^{-1}$)", ylabel=r"Intensity ($\rm K$)", 
                   threshold=None, linewidth=0.8, figsize=(2.76, 2.76), xtick_spacing=None,
@@ -4770,3 +5069,53 @@ def plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=[], ylim=[],
     ax.set_ylabel(ylabel, fontsize=labelsize)
     
     return ax
+
+
+def search_molecular_line(restfreq, unit="Hz", printinfo=True):
+    """
+    Function to search for molecular line info given a rest frequency.
+    """
+    global splatalogue_df
+    
+    if restfreq is None:
+        raise ValueError("The rest frequnecy cannot be 'None'.")
+    restfreq = u.Quantity(restfreq, unit).to_value(u.GHz)
+    
+    # only start searching if the method is called for the first time
+    if splatalogue_df is None:
+        print("Reading Splatalogue data...")
+        import pandas as pd
+        splatalogue_df = pd.read_csv("http://www.cv.nrao.edu/~cbrogan/splat_for_casa/" + \
+                                     "splatalogue_known_1to950GHz.tsv", delimiter="\t")
+        print()
+    
+    # search for index of best-match result.
+    idx = np.nanargmin(np.abs(splatalogue_df["Freq in GHz"]-restfreq))
+    
+    # find information of the line 
+    species = splatalogue_df["Species"][idx]
+    chemical_name = splatalogue_df["Chemical Name"][idx]
+    freq = splatalogue_df["Freq in GHz"][idx]
+    qns = splatalogue_df["Resolved QNs"][idx]
+    log10_Aij = splatalogue_df["Log<sub>10</sub> (A<sub>ij</sub>)"][idx]
+    Aij = 10**log10_Aij
+    Sijmu_sq = splatalogue_df["S<sub>ij</sub>&#956;<sup>2</sup> (D<sup>2</sup>)"][idx]
+    lerg = splatalogue_df["E<sub>L</sub> (K)"][idx]
+    uerg = splatalogue_df["E<sub>U</sub> (K)"][idx]
+    
+    # print information if needed
+    if printinfo:
+        print(15*"#" + "Line Information" + 15*"#")
+        print(f"Species: {species}")
+        print(f"Chemical name: {chemical_name}")
+        print(f"Frequency: {freq} [GHz]")
+        print(f"Resolved quantum numbers: {qns}")
+        print(f"Sij mu^2: {Sijmu_sq} [Debye]")
+        print(f"Einstein A coefficient (Aij): {Aij:5e} [1/s]")
+        print(f"Lower energy level: {lerg} [K]")
+        print(f"Upper energy level: {uerg} [K]")
+        print(46*"#")
+        print()
+    
+    # return data
+    return species, chemical_name, freq, qns, Sijmu_sq, Aij, lerg, uerg
