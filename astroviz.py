@@ -57,7 +57,7 @@ Description of module:
     generate either of the three classes. 
     
     Regions can be set using the 'Region' class constructor by reading a given DS9 file or 
-    inputting the necessary parameters. 
+    inputing the necessary parameters. 
     For example:
         import astroviz as av
         region1 = av.Region('directory_to_region_file')                # read given file
@@ -81,9 +81,8 @@ import datetime as dt
 from scipy import ndimage
 from scipy.optimize import curve_fit
 from scipy.interpolate import griddata
-from astropy import units as u
-from astropy.units import Unit, def_unit
-from astropy import constants as const
+from astropy import units as u, constants as const
+from astropy.units import Unit, def_unit, UnitConversionError
 from astropy.io import fits
 from astropy.stats import sigma_clip
 from astropy.coordinates import Angle, SkyCoord
@@ -100,11 +99,13 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 __all__ = ["importfits", "Datacube", "Spatialmap", "PVdiagram", "Region", "plt_1ddata",
            "search_molecular_line"]
 
-# initialize splatalogue catalogue (a global variable).
-splatalogue_df = None
+# variables to control all maps globally
+_fontfamily = "Times New Roman"
+_mathtext_fontset = "stix"
+_mathtext_tt = "Times New Roman"
 
 
-def importfits(fitsfile, hduindex=0, spatialunit="arcsec", quiet=False):
+def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quiet=False):
     """
     This function reads the given FITS file directory and returns the corresponding image object.
     Parameters:
@@ -162,8 +163,8 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", quiet=False):
             data = good_hdu[hduindex].data
             hdu_header = dict(good_hdu[hduindex].header)
     
-    # read and export header
-    ctype = tuple(hdu_header.get(f"CTYPE{i+1}") for i in range(data.ndim))
+    # start reading and exporting header
+    ctype = [hdu_header.get(f"CTYPE{i}", "") for i in range(1, data.ndim+1)] # store ctypes as list, 1-based indexing
     
     # get rest frequency
     if "RESTFRQ" in hdu_header:
@@ -173,164 +174,113 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", quiet=False):
     elif "FREQ" in hdu_header:
         restfreq = hdu_header["FREQ"]
     else:
-        restfreq = None
+        raise Exception("Failed to read rest frequnecy.")
+    
+    # stokes axis
+    nstokes = hdu_header.get(f"NAXIS{ctype.index('STOKES')+1}") if "STOKES" in ctype else 1
 
-    # find corresponding axes
-    if "FREQ" not in ctype:
-        nchan = 1
-    else:
-        freq_axis_num = np.where(np.array(ctype)=="FREQ")[0][0]+1
+    # frequency axis
+    if "FREQ" in ctype:
+        freq_axis_num = ctype.index("FREQ") + 1
         nchan = hdu_header.get(f"NAXIS{freq_axis_num}")
-        
+        is_vel = False
+    elif "VRAD" in ctype:
+        freq_axis_num = ctype.index("VRAD") + 1
+        nchan = hdu_header.get(f"NAXIS{freq_axis_num}")
+        is_vel = True
+    elif "VELO" in ctype:
+        freq_axis_num = ctype.index("VELO") + 1
+        nchan = hdu_header.get(f"NAXIS{freq_axis_num}")
+        is_vel = True
+    elif "VELO-LSR" in ctype:
+        freq_axis_num = ctype.index("VELO-LSR") + 1
+        nchan = hdu_header.get(f"NAXIS{freq_axis_num}")
+        is_vel = True
+    else:
+        nchan = 1
+       
+    # cannot combine with previous statement because it can be an image with only 1 channel
     if nchan == 1:
-        df = None
-        startf = None
-        faxis = None
-        vaxis = None
         dv = None
         vrange = None
-    else:
-        funit = hdu_header.get(f"CUNIT{freq_axis_num}", "Hz")
-        df = u.Quantity(hdu_header.get(f"CDELT{freq_axis_num}"), funit).to_value("Hz")
-        startf = u.Quantity(hdu_header.get(f"CRVAL{freq_axis_num}"), funit).to_value("Hz")
-        faxis = np.arange(startf, startf+nchan*df, df)
-        clight = const.c.to_value(u.km/u.s)
-        vaxis = np.round(clight * (1-faxis/restfreq), 5)
-        dv = np.abs(vaxis[1]-vaxis[0])
-        vrange = [np.min(vaxis), np.max(vaxis)]
+        vtype = None
+        vunit = None
+    else:   
+        vunit = hdu_header.get(f"CUNIT{freq_axis_num}", "km/s" if is_vel else "Hz")
+        dv = hdu_header.get(f"CDELT{freq_axis_num}")
+        startv = hdu_header.get(f"CRVAL{freq_axis_num}")
+        endv = startv+dv*(nchan-1)
+        if u.Unit(vunit) != u.Unit(specunit):
+            equiv = u.doppler_radio(restfreq*u.Hz)
+            startv = u.Quantity(startv, vunit).to_value(specunit, equivalencies=equiv)
+            endv = u.Quantity(endv, vunit).to_value(specunit, equivalencies=equiv)
+            dv = (endv-startv)/(nchan-1)
+            if specunit == "km/s":
+                rounded_startv = round(startv, 5)
+                if np.isclose(startv, rounded_startv):
+                    start = rounded_startv
+                rounded_endv = round(endv, 5)
+                if np.isclose(endv, rounded_endv):
+                    endv = rounded_endv
+                rounded_dv = round(dv, 5)
+                if np.isclose(dv, rounded_dv):
+                    dv = rounded_dv
+        vrange = [startv, endv]
         
-    if "STOKES" not in ctype:
-        nstokes = 1
-    else:
-        stokes_axis_num = np.where(np.array(ctype)=="STOKES")[0][0]+1
-        nstokes = hdu_header.get(f"NAXIS{stokes_axis_num}")
+    # initialize projection parameter, updates if finds one
+    projection = None
     
-    projection = None    # initialize projection parameter, updates if finds one
-    if "RA---SIN" in ctype:
-        xaxis_num = np.where(np.array(ctype)=="RA---SIN")[0][0]+1
+    # right ascension / offset axis
+    ra_mask = ["RA" in item for item in ctype]
+    if any(ra_mask):  # checks if "RA" axis exists
+        xidx = ra_mask.index(True)
+        projection = ctype[xidx].split("-")[-1]
+        xaxis_num = xidx + 1
         xunit = hdu_header.get(f"CUNIT{xaxis_num}", "deg")
         refx = hdu_header.get(f"CRVAL{xaxis_num}")
         nx = hdu_header.get(f"NAXIS{xaxis_num}")
         dx = hdu_header.get(f"CDELT{xaxis_num}")
         refnx = hdu_header.get(f"CRPIX{xaxis_num}")
-        projection = 'SIN'
-        if dx is not None:
-            dx = u.Quantity(dx, xunit).to_value(spatialunit)
-        if refx is not None:
-            refx = u.Quantity(refx, xunit).to_value(spatialunit)
-    elif "RA---COS" in ctype:
-        xaxis_num = np.where(np.array(ctype)=="RA---COS")[0][0]+1
-        xunit = hdu_header.get(f"CUNIT{xaxis_num}", "deg")
-        refx = hdu_header.get(f"CRVAL{xaxis_num}")
-        nx = hdu_header.get(f"NAXIS{xaxis_num}")
-        dx = hdu_header.get(f"CDELT{xaxis_num}")
-        refnx = hdu_header.get(f"CRPIX{xaxis_num}")
-        projection = 'COS'
-        if dx is not None:
-            dx = u.Quantity(dx, xunit).to_value(spatialunit)
-        if refx is not None:
-            refx = u.Quantity(refx, xunit).to_value(spatialunit)
-    elif "RA---TAN" in ctype:
-        xaxis_num = np.where(np.array(ctype)=="RA---TAN")[0][0]+1
-        xunit = hdu_header.get(f"CUNIT{xaxis_num}", "deg")
-        refx = hdu_header.get(f"CRVAL{xaxis_num}")
-        nx = hdu_header.get(f"NAXIS{xaxis_num}")
-        dx = hdu_header.get(f"CDELT{xaxis_num}")
-        refnx = hdu_header.get(f"CRPIX{xaxis_num}")
-        projection = 'TAN'
-        if dx is not None:
-            dx = u.Quantity(dx, xunit).to_value(spatialunit)
-        if refx is not None:
-            refx = u.Quantity(refx, xunit).to_value(spatialunit)
+        if xunit != spatialunit:
+            if dx is not None:
+                dx = u.Quantity(dx, xunit).to_value(spatialunit)
+            if refx is not None:
+                refx = u.Quantity(refx, xunit).to_value(spatialunit)
     elif "OFFSET" in ctype:
-        xaxis_num = np.where(np.array(ctype)=="OFFSET")[0][0]+1
+        xaxis_num = ctype.index("OFFSET") + 1
         xunit = hdu_header.get(f"CUNIT{xaxis_num}", "deg")
         refx = hdu_header.get(f"CRVAL{xaxis_num}")
         nx = hdu_header.get(f"NAXIS{xaxis_num}")
         dx = hdu_header.get(f"CDELT{xaxis_num}")
         refnx = hdu_header.get(f"CRPIX{xaxis_num}")
-        if dx is not None:
-            dx = u.Quantity(dx, xunit).to_value(spatialunit)
-        if refx is not None:
-            refx = u.Quantity(refx, xunit).to_value(spatialunit)
+        if xunit != spatialunit:
+            if dx is not None:
+                dx = u.Quantity(dx, xunit).to_value(spatialunit)
+            if refx is not None:
+                refx = u.Quantity(refx, xunit).to_value(spatialunit)
     else:
         nx = 1
-        refx = None,
+        refx = None
         dx = None
         refnx = None
-        
-    if "DEC--COS" in ctype:
-        yaxis_num = np.where(np.array(ctype)=="DEC--COS")[0][0]+1
+    
+    # declination axis
+    dec_mask = ["DEC" in item for item in ctype]
+    if any(dec_mask):    # if dec axis exists
+        yidx = dec_mask.index(True) 
+        if projection is None:
+            projection = ctype[yidx].split("-")[-1]
+        yaxis_num = yidx + 1
         yunit = hdu_header.get(f"CUNIT{yaxis_num}", "deg")
         refy = hdu_header.get(f"CRVAL{yaxis_num}")
         ny = hdu_header.get(f"NAXIS{yaxis_num}")
         dy = hdu_header.get(f"CDELT{yaxis_num}")
         refny = hdu_header.get(f"CRPIX{yaxis_num}")
-        projection = "COS"
-        if dy is not None:
-            dy = u.Quantity(dy, yunit).to_value(spatialunit)
-        if refy is not None:
-            refy = u.Quantity(refy, yunit).to_value(spatialunit)
-    elif "DEC---COS" in ctype:
-        yaxis_num = np.where(np.array(ctype)=="DEC---COS")[0][0]+1
-        yunit = hdu_header.get(f"CUNIT{yaxis_num}", "deg")
-        refy = hdu_header.get(f"CRVAL{yaxis_num}")
-        ny = hdu_header.get(f"NAXIS{yaxis_num}")
-        dy = hdu_header.get(f"CDELT{yaxis_num}")
-        refny = hdu_header.get(f"CRPIX{yaxis_num}")
-        projection = "COS"
-        if dy is not None:
-            dy = u.Quantity(dy, yunit).to_value(spatialunit)
-        if refy is not None:
-            refy = u.Quantity(refy, yunit).to_value(spatialunit)
-    elif "DEC--TAN" in ctype:
-        yaxis_num = np.where(np.array(ctype)=="DEC--TAN")[0][0]+1
-        yunit = hdu_header.get(f"CUNIT{yaxis_num}", "deg")
-        refy = hdu_header.get(f"CRVAL{yaxis_num}")
-        ny = hdu_header.get(f"NAXIS{yaxis_num}")
-        dy = hdu_header.get(f"CDELT{yaxis_num}")
-        refny = hdu_header.get(f"CRPIX{yaxis_num}")
-        projection = "TAN"
-        if dy is not None:
-            dy = u.Quantity(dy, yunit).to_value(spatialunit)
-        if refy is not None:
-            refy = u.Quantity(refy, yunit).to_value(spatialunit)
-    elif "DEC---TAN" in ctype:
-        yaxis_num = np.where(np.array(ctype)=="DEC---TAN")[0][0]+1
-        yunit = hdu_header.get(f"CUNIT{yaxis_num}", "deg")
-        refy = hdu_header.get(f"CRVAL{yaxis_num}")
-        ny = hdu_header.get(f"NAXIS{yaxis_num}")
-        dy = hdu_header.get(f"CDELT{yaxis_num}")
-        refny = hdu_header.get(f"CRPIX{yaxis_num}")
-        projection = "TAN"
-        if dy is not None:
-            dy = u.Quantity(dy, yunit).to_value(spatialunit)
-        if refy is not None:
-            refy = u.Quantity(refy, yunit).to_value(spatialunit)
-    elif "DEC--SIN" in ctype:
-        yaxis_num = np.where(np.array(ctype)=="DEC--SIN")[0][0]+1
-        yunit = hdu_header.get(f"CUNIT{yaxis_num}", "deg")
-        refy = hdu_header.get(f"CRVAL{yaxis_num}")
-        ny = hdu_header.get(f"NAXIS{yaxis_num}")
-        dy = hdu_header.get(f"CDELT{yaxis_num}")
-        refny = hdu_header.get(f"CRPIX{yaxis_num}")
-        projection = "SIN"
-        if dy is not None:
-            dy = u.Quantity(dy, yunit).to_value(spatialunit)
-        if refy is not None:
-            refy = u.Quantity(refy, yunit).to_value(spatialunit)
-    elif "DEC---SIN" in ctype:
-        yaxis_num = np.where(np.array(ctype)=="DEC---SIN")[0][0]+1
-        yunit = hdu_header.get(f"CUNIT{yaxis_num}", "deg")
-        refy = hdu_header.get(f"CRVAL{yaxis_num}")
-        ny = hdu_header.get(f"NAXIS{yaxis_num}")
-        dy = hdu_header.get(f"CDELT{yaxis_num}")
-        refny = hdu_header.get(f"CRPIX{yaxis_num}")
-        projection = "SIN"
-        if dy is not None:
-            dy = u.Quantity(dy, yunit).to_value(spatialunit)
-        if refy is not None:
-            refy = u.Quantity(refy, yunit).to_value(spatialunit)
+        if yunit != spatialunit:
+            if dy is not None:
+                dy = u.Quantity(dy, yunit).to_value(spatialunit)
+            if refy is not None:
+                refy = u.Quantity(refy, yunit).to_value(spatialunit)
     else:
         ny = 1
         refy = None
@@ -343,37 +293,48 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", quiet=False):
         refcoord = SkyCoord(ra=u.Quantity(refx, spatialunit), dec=u.Quantity(refy, spatialunit)).to_string('hmsdms')
     
     # set shape 
-    newshape = (nstokes, nchan, nx, ny)
-    data = data.reshape(newshape)
+    
     
     # determine image type
     if nx > 1 and ny > 1 and nchan > 1:
         imagetype = "datacube"
+        newshape = (nstokes, nchan, nx, ny)
+        data = data.reshape(newshape)
     elif nx > 1 and ny > 1 and nchan == 1:
         imagetype = "spatialmap"
+        newshape = (nstokes, nchan, nx, ny)
+        data = data.reshape(newshape)
     elif nchan > 1 and nx > 1 and ny == 1:
         imagetype = "pvdiagram"
+        newshape = (nstokes, nchan, nx)
+        if data.shape == (nstokes, nx, nchan):
+            data = data[0].T[None, :, :]  # transpose if necessary
     else:
         raise Exception("Image cannot be read as 'datacube', 'spatialmap', or 'pvdiagram'")
     
-    # eliminate rounding error due to float64
-    if dx is not None:
-        dx = np.round(dx, 7)
-    if dy is not None:
-        dy = np.round(dy, 7)
-    if dv is not None:
-        dv = np.round(dv, 7)
-        
     # beam size
     bmaj = hdu_header.get("BMAJ", np.nan)
     bmin = hdu_header.get("BMIN", np.nan)
     bpa =  hdu_header.get("BPA", np.nan)
     
+    if spatialunit != "deg":  # convert beam size unit if necessary
+        if not np.isnan(bmaj):
+            bmaj = u.Quantity(bmaj, u.deg).to_value(spatialunit)
+        if not np.isnan(bmin):
+            bmin = u.Quantity(bmin, u.deg).to_value(spatialunit)
+    
+    # eliminate rounding error due to float64
+    if dx is not None:
+        dx = float(str(np.float32(dx)))
+    if dy is not None:
+        dy = float(str(np.float32(dy)))
     if not np.isnan(bmaj):
-        bmaj = u.Quantity(bmaj, u.deg).to_value(spatialunit)
+        bmaj = float(str(np.float32(bmaj)))
     if not np.isnan(bmin):
-        bmin = u.Quantity(bmin, u.deg).to_value(spatialunit)
-
+        bmin = float(str(np.float32(bmin)))
+    if not np.isnan(bpa):
+        bpa = float(str(np.float32(bpa)))
+            
     # input information into dictionary as header information of image
     fileinfo = {"name": fitsfile,
                 "shape": newshape,
@@ -390,18 +351,20 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", quiet=False):
                 "refny": refny,
                 "refcoord": refcoord,
                 "restfreq": restfreq,
-                "beam": tuple(np.round([bmaj, bmin, bpa], 5)),
-                "specframe": hdu_header.get("RADESYS"),
+                "beam": (bmaj, bmin, bpa),
+                "specframe": hdu_header.get("RADESYS", ""),
                 "unit": spatialunit,
-                "bunit": hdu_header.get('BUNIT'),
+                "specunit": _apu_to_headerstr(u.Unit(specunit)),
+                "bunit": hdu_header.get("BUNIT", ""),
                 "projection": projection,
-                "instrument": hdu_header.get('INSTRUME'),
-                "observer": hdu_header.get('OBSERVER'),
-                "obsdate": hdu_header.get('DATE-OBS'),
-                "date": hdu_header.get('DATE'),
-                "origin": hdu_header.get('ORIGIN'),
+                "object": hdu_header.get("OBJECT", ""),
+                "instrument": hdu_header.get("INSTRUME", ""),
+                "observer": hdu_header.get("OBSERVER", ""),
+                "obsdate": hdu_header.get("DATE-OBS", ""),
+                "date": hdu_header.get("DATE", ""),
+                "origin": hdu_header.get("ORIGIN", ""),
                 }
-    
+
     # return image
     if imagetype == "datacube":
         return Datacube(fileinfo=fileinfo, data=data)
@@ -409,8 +372,6 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", quiet=False):
         return Spatialmap(fileinfo=fileinfo, data=data)
     elif imagetype == "pvdiagram":
         return PVdiagram(fileinfo=fileinfo, data=data)
-    else:
-        raise Exception("ERROR: Cannot determine image type.")
 
 
 def _get_hduheader(image):
@@ -440,30 +401,34 @@ def _get_hduheader(image):
     
     # start reading header information
     if image.header["imagetype"] == "pvdiagram":
-        faxis = image.get_vaxis(freq=True)
+        faxis = image.get_vaxis(specunit='Hz')
         if hdu_header["NAXIS"] == 4:
             hdu_header["NAXIS"] = 3
-            hdu_header.pop("NAXIS4")
-            hdu_header.pop("CTYPE4")
-            hdu_header.pop("CRVAL4")
-            hdu_header.pop("CDELT4")
-            hdu_header.pop("CRPIX4")
-            hdu_header.pop("CUNIT4")
-            hdu_header.pop("PC4_1")
-            hdu_header.pop("PC4_2")
-            hdu_header.pop("PC4_3")
-            hdu_header.pop("PC4_4")
-        hdu_header["NAXIS1"] = np.int64(image.nx)
-        hdu_header["NAXIS2"] = np.int64(image.nchan)
-        hdu_header["NAXIS3"] = np.int64(1)
+            hdu_header.pop("NAXIS4", None)  # adding 'None' as a parameter prevents key error
+            hdu_header.pop("CTYPE4", None)
+            hdu_header.pop("CRVAL4", None)
+            hdu_header.pop("CDELT4", None)
+            hdu_header.pop("CRPIX4", None)
+            hdu_header.pop("CUNIT4", None)
+            hdu_header.pop("PC4_1", None)
+            hdu_header.pop("PC4_2", None)
+            hdu_header.pop("PC4_3", None)
+            hdu_header.pop("PC4_4", None)
+        hdu_header["NAXIS1"] = image.nx
+        hdu_header["NAXIS2"] = image.nchan
+        hdu_header["NAXIS3"] = 1
         hdu_header["CTYPE1"] = "OFFSET"
         hdu_header["CRVAL1"] = np.float64(0.)
         hdu_header["CDELT1"] = np.float64(image.dx)
         hdu_header["CRPIX1"] = np.float64(image.refnx)
         hdu_header["CUNIT1"] = image.unit
         hdu_header["CTYPE2"] = 'FREQ'
-        hdu_header["CRVAL2"] = np.float64(faxis[0])
-        hdu_header["CDELT2"] = np.float64(faxis[1]-faxis[0])
+        startf = faxis[0]
+        if not ("CRVAL2" in hdu_header and np.isclose(startf, hdu_header["CRVAL2"])):
+            hdu_header["CRVAL2"] = startf
+        df = faxis[1] - faxis[0]
+        if not ("CDELT2" in hdu_header and np.isclose(df, hdu_header["CDELT2"])):
+            hdu_header["CDELT2"] = df
         hdu_header["CRPIX2"] = np.float64(1.)
         hdu_header["CUNIT2"] = 'Hz'
         hdu_header["ALTRVAL"] = np.float64(image.vaxis[0])  # Alternative frequency referencenpoint
@@ -475,11 +440,11 @@ def _get_hduheader(image):
         hdu_header["CDELT3"] = ''
 
     elif image.header["imagetype"] in ("spatialmap", "datacube"):
-        hdu_header["NAXIS"] = np.int64(4)
-        hdu_header["NAXIS1"] = np.int64(image.shape[2])
-        hdu_header["NAXIS2"] = np.int64(image.shape[3])
-        hdu_header["NAXIS3"] = np.int64(image.shape[1])
-        hdu_header["NAXIS4"] = np.int64(image.shape[0])
+        hdu_header["NAXIS"] = 4
+        hdu_header["NAXIS1"] = image.shape[2]
+        hdu_header["NAXIS2"] = image.shape[3]
+        hdu_header["NAXIS3"] = image.shape[1]
+        hdu_header["NAXIS4"] = image.shape[0]
         hdu_header["CTYPE1"] = f'RA---{projection}'
         hdu_header["CRVAL1"] = np.float64(centerx)
         hdu_header["CDELT1"] = np.float64(dx)
@@ -491,13 +456,17 @@ def _get_hduheader(image):
         hdu_header["CRPIX2"] = np.float64(image.refny)
         hdu_header["CUNIT2"] = 'deg'
         if image.header["imagetype"] == "datacube":
-            faxis = image.get_vaxis(freq=True)
+            faxis = image.get_vaxis(specunit="Hz")
             hdu_header["CTYPE3"] = 'FREQ'
-            hdu_header["CRVAL3"] = np.float64(faxis[0])
-            hdu_header["CDELT3"] = np.float64(faxis[1]-faxis[0])
+            startf = faxis[0]
+            if not ("CRVAL3" in hdu_header and np.isclose(startf, hdu_header["CRVAL3"])):
+                hdu_header["CRVAL3"] = startf
+            df = faxis[1] - faxis[0]
+            if not ("CDELT3" in hdu_header and np.isclose(df, hdu_header["CDELT3"])):
+                hdu_header["CDELT3"] = df
             hdu_header["CRPIX3"] = np.float64(1.)
             hdu_header["CUNIT3"] = 'Hz'
-            hdu_header["ALTRVAL"] = np.float64(image.vaxis[0])  # Alternative frequency referencenpoint
+            hdu_header["ALTRVAL"] = np.float64(image.vaxis[0])  # Alternative frequency reference point
             hdu_header["ALTRPIX"] = np.float64(1.)              # Alternative frequnecy reference pixel
         hdu_header["CTYPE4"] = 'STOKES'
         hdu_header["CRVAL4"] = np.float64(1.)
@@ -509,10 +478,15 @@ def _get_hduheader(image):
     if np.isnan(image.bmaj) or np.isnan(image.bmin) or np.isnan(image.bpa):
         updatedparams = {"BUNIT": image.header["bunit"],
                          "DATE": "%04d-%02d-%02d"%(dtnow.year, dtnow.month, dtnow.day),
+                         "DATAMAX": np.float64(np.nanmax(image.data)),
+                         "DATAMIN": np.float64(np.nanmin(image.data)),
+                         "BSCALE": np.float64(1.),
+                         "BZERO": np.float64(1.),
+                         "OBJECT": image.header["object"],
                          "INSTRUME": image.header["instrument"],
                          "DATE-OBS": image.header["obsdate"],
-                         "RESTFRQ": np.float64(image.header["restfreq"]),
-                         "HISTORY": "Exported from Astroviz."
+                         "RESTFRQ": image.header["restfreq"],
+                         "HISTORY": "Exported from astroviz."
                          }
     else:
         bmaj = np.float64(u.Quantity(image.bmaj, image.unit).to_value(u.deg))   # this value can be NaN
@@ -523,14 +497,19 @@ def _get_hduheader(image):
                          "BMAJ": bmin,
                          "BMIN": bmaj,
                          "BPA": bpa, 
+                         "DATAMAX": np.float64(np.nanmax(image.data)),
+                         "DATAMIN": np.float64(np.nanmin(image.data)),
+                         "OBJECT": image.header["object"],
+                         "BSCALE": np.float64(1.),
+                         "BZERO": np.float64(1.),
                          "INSTRUME": image.header["instrument"],
                          "DATE-OBS": image.header["obsdate"],
-                         "RESTFRQ": np.float64(image.header["restfreq"]),
-                         "HISTORY": "Exported from Astroviz."
+                         "RESTFRQ": image.header["restfreq"],
+                         "HISTORY": "Exported from astroviz."
                          }
     
     # don't write history if already in FITS file header
-    if "HISTORY" in hdu_header and hdu_header["HISTORY"] == "Exported from Astroviz.":
+    if "HISTORY" in hdu_header and hdu_header["HISTORY"] == "Exported from astroviz.":
         updatedparams.pop("HISTORY")
     
     # start updating other header info
@@ -606,6 +585,14 @@ def _to_apu(unit_string):
     For instance, strings like "Jy/beam.km/s" would be read as u.Jy/u.beam*u.km/u.s 
     by this function.
     """
+    # if it is already a unit, return itself.
+    if isinstance(unit_string, u.Unit):
+        return unit_string
+    elif isinstance(unit_string, u.Quantity):
+        return unit_string.unit
+    elif isinstance(unit_string, (u.core.CompositeUnit, u.core.PrefixUnit)):
+        return unit_string
+    
     # Split the unit string by '.' and '/'
     units_split = unit_string.replace('.', ' * ').replace('/', ' / ').split()
 
@@ -630,7 +617,9 @@ def _apu_to_str(unit):
     For instance, units like u.Jy/u.beam*u.km/u.s would be read as in the correct order in 
     the latex format by this function.
     """
-    if unit.is_equivalent(u.Jy/u.beam*u.km/u.s) or unit.is_equivalent(u.Jy/u.rad**2*u.km/u.s):
+    if unit.is_equivalent(u.Jy/u.beam*u.km/u.s) or \
+       unit.is_equivalent(u.Jy/u.rad**2*u.km/u.s) or \
+       unit.is_equivalent(u.Jy/u.pixel*u.km/u.s):
         unitstr = unit.to_string(format='latex_inline')
         unitlst = list(unitstr)
         idx_left = unitlst.index("{")
@@ -641,7 +630,8 @@ def _apu_to_str(unit):
             if u.Unit(cleanunitstr).is_equivalent(u.Jy):
                 newlst[0] = ele
             elif u.Unit(cleanunitstr).is_equivalent(1/u.beam) or \
-                 u.Unit(cleanunitstr).is_equivalent(1/u.rad**2):
+                 u.Unit(cleanunitstr).is_equivalent(1/u.rad**2) or \
+                 u.Unit(cleanunitstr).is_equivalent(1/u.pixel):
                 newlst[1] = ele
             elif u.Unit(cleanunitstr).is_equivalent(u.km):
                 newlst[2] = ele
@@ -651,6 +641,151 @@ def _apu_to_str(unit):
         return newstr
     else:
         return f"{unit:latex_inline}"
+
+
+def _apu_to_headerstr(unit):
+    """
+    This is private function that converts an astropy unit object to the string 
+    value corresponding to the 'bunit' key in the header.
+    """
+    unit_str = _apu_to_str(unit)
+    unit_str = unit_str.replace("$", "").replace("\\mathrm", "")[1:-1]
+    unit_lst = unit_str.split(r",")
+    unit_lst = (item[:-1] if item[-1] == "\\" else item for item in unit_lst)  # create generator
+    headerstr = ""
+    for i, item in enumerate(unit_lst):
+        if "^{" in item:
+            ustr, power = item.split("^{")
+            power = power[:-1]
+        else:
+            ustr = item
+            power = 1
+        if float(power) == -1:
+            headerstr += "/" + ustr
+        elif float(power) < -1:
+            if int(float(power)) == float(power):
+                headerstr += "/" + ustr + str(-int(power))
+            else:
+                headerstr += "/" + ustr + str(-float(power))
+        elif float(power) > 1:
+            if i == 0:
+                if int(float(power)) == float(power):
+                    headerstr += ustr + str(int(power))
+                else:
+                    headerstr += ustr + str(float(power))
+            else:
+                if int(float(power)) == float(power):
+                    headerstr += "." + ustr + str(int(power))
+                else:
+                    headerstr += "." + ustr + str(float(power))
+        else:
+            if i == 0:
+                headerstr += ustr
+            else:
+                headerstr += "." + ustr
+    if headerstr.startswith("/"):
+        headerstr = "1" + headerstr
+    return headerstr
+
+
+def _convert_Bunit(quantity, newunit, equivalencies, factors, max_depth=10):
+    """
+    Private function to convert brightness units.
+    Used by the 'conv_bunit' method.
+    """
+    # helper function to recursively utilize equivalencies
+    def recursive_equiv(qt, eq, i):
+        if i >= len(eq):  # base case
+            return None
+        try:
+            return qt.to(newunit, equivalencies=eq[i])
+        except UnitConversionError:
+            return recursive_equiv(qt, eq, i+1)
+    
+    # helper function to recursively multiply/divide factors
+    def recursive_factors(qt, f, i):
+        if i >= len(factors)*2:  # base case
+            return None
+        try:
+            if i % 2 == 0:
+                return (qt / f[i//2]).to(newunit)
+            else:
+                return (qt * f[i//2]).to(newunit)
+        except UnitConversionError:
+            return recursive_factors(qt, f, i+1)
+        
+    try:
+        # try direct conversion
+        newqt = quantity.to(newunit)
+    except UnitConversionError:
+        # if that doesn't work, maybe try using equivalencies?
+        newqt = recursive_equiv(quantity, equivalencies, i=0)
+        j = 1
+        new_factors = factors
+        while newqt is None:
+            # if that still doesn't work, maybe try multiplying/dividing by factors?
+            newqt = recursive_factors(quantity, new_factors, i=0)
+            j += 1
+            new_factors = [factor**j for factor in factors]
+            if j >= max_depth:  # maximum depth
+                break
+    return newqt
+
+
+def set_font(font):
+    """
+    Function to control the font of all images globally.
+    Parameters:
+        font (str): the font of the image. 
+                    Supported options include 'Times New Roman', 'Helvetica', 'Arial',
+                    'Georgia', 'Garamond', 'Verdana', 'Calibri', 'Roboto', 'Courier New',
+                    'Consolas'.
+    """
+    global _fontfamily, _mathtext_fontset, _mathtext_tt
+    
+    font_case_insensitive = font.lower()
+    if font_case_insensitive == "times new roman":
+        _fontfamily = "Times New Roman"
+        _mathtext_fontset = "stix"
+        _mathtext_tt = "Times New Roman"
+    elif font_case_insensitive == "helvetica":
+        _fontfamily = "Helvetica"
+        _mathtext_fontset = "stixsans"
+        _mathtext_tt = "Helvetica"
+    elif font_case_insensitive == "arial":
+        _fontfamily = "Arial"
+        _mathtext_fontset = "custom"
+        _mathtext_tt = "Arial"
+    elif font_case_insensitive == "georgia":
+        _fontfamily = "Georgia"
+        _mathtext_fontset = "stix"
+        _mathtext_tt = "Georgia"
+    elif font_case_insensitive == "garamond":
+        _fontfamily = "Garamond"
+        _mathtext_fontset = "stix"
+        _mathtext_tt = "Garamond"
+    elif font_case_insensitive == "verdana":
+        _fontfamily = "Verdana"
+        _mathtext_fontset = "custom"
+        _mathtext_tt = "Verdana"
+    elif font_case_insensitive == "calibri":
+        _fontfamily = "Calibri"
+        _mathtext_fontset = "custom"
+        _mathtext_tt = "Calibri"
+    elif font_case_insensitive == "roboto":
+        _fontfamily = "Roboto"
+        _mathtext_fontset = "custom"
+        _mathtext_tt = "Roboto"
+    elif font_case_insensitive == "courier new":
+        _fontfamily = "Courier New"
+        _mathtext_fontset = "custom"
+        _mathtext_tt = "Courier New"
+    elif font_case_insensitive == "consolas":
+        _fontfamily = "Consolas"
+        _mathtext_fontset = "custom"
+        _mathtext_tt = "Consolas"
+    else:
+        raise ValueError("Unsupported font. Please choose a supported option.")
 
 
 class Datacube:
@@ -667,16 +802,18 @@ class Datacube:
         is in the correct format. It can handle FITS files with different configurations and
         is designed to be flexible for various data shapes and sizes.
     """
-    def __init__(self, fitsfile=None, fileinfo=None, data=None):
+    def __init__(self, fitsfile=None, fileinfo=None, data=None, hduindex=0, 
+                 spatialunit="arcsec", specunit="km/s", quiet=False):
         if fitsfile is not None:
-            fits = importfits(fitsfile, hduindex=hduindex, spatialunit=spatialunit, quiet=False)
+            fits = importfits(fitsfile, hduindex=hduindex, spatialunit=spatialunit, 
+                              specunit=specunit, quiet=False)
             self.fileinfo = fits.fileinfo
             self.data = fits.data
         elif fileinfo is not None:
             self.fileinfo = fileinfo
             self.data = data
         if self.fileinfo["imagetype"] != "datacube":
-            raise TypeError("The given fitsfile is not a data cube.")
+            raise TypeError("The given FITS file cannot be read as a data cube.")
         self.__updateparams()
         
         if isinstance(self.data, u.quantity.Quantity):
@@ -703,17 +840,33 @@ class Datacube:
         self.resolution = np.sqrt(self.beam[0]*self.beam[1]) if self.beam is not None else None
         self.refcoord = self.fileinfo["refcoord"]
         if isinstance(self.data, u.Quantity):
-            self.bunit = self.fileinfo["bunit"] = (self.data.unit).to_string()
+            self.bunit = self.fileinfo["bunit"] = _apu_to_headerstr(self.data.unit)
         else:
             self.bunit = self.fileinfo["bunit"]
-        xmin, xmax = self.xaxis[[0,-1]]
-        ymin, ymax = self.yaxis[[0,-1]]
-        self.imextent = [xmin-0.5*self.dx, xmax+0.5*self.dx, 
-                         ymin-0.5*self.dy, ymax+0.5*self.dy]
+        xmin, xmax = self.xaxis[[0, -1]]
+        ymin, ymax = self.yaxis[[0, -1]]
+        self.imextent = [xmin-0.5*dx, xmax+0.5*dx, 
+                         ymin-0.5*dy, ymax+0.5*dy]
         self.widestfov = max(self.xaxis[0], self.yaxis[-1])
-        self.dv = self.fileinfo["dv"]
-        self.vrange = self.fileinfo["vrange"]
-        self.nv = self.nchan = self.fileinfo["nchan"]
+        self.specunit = self.fileinfo["specunit"]
+        if self.specunit == "km/s":
+            rounded_dv = round(self.fileinfo["dv"], 5)
+            if np.isclose(self.fileinfo["dv"], rounded_dv):
+                self.dv = self.fileinfo["dv"] = rounded_dv
+            else:
+                self.dv = self.fileinfo["dv"]
+            specmin, specmax = self.fileinfo["vrange"]
+            rounded_specmin = round(specmin, 5)
+            rounded_specmax = round(specmax, 5)
+            if np.isclose(specmin, rounded_specmin):
+                specmin = rounded_specmin
+            if np.isclose(specmax, rounded_specmax):
+                specmax = rounded_specmax
+            self.vrange = self.fileinfo["vrange"] = [specmin, specmax]
+        else:
+            self.dv = self.fileinfo["dv"]
+            self.vrange = self.fileinfo["vrange"]
+        self.nv = self.nchan = self.fileinfo["nchan"]        
         self.vaxis = self.get_vaxis()
         
     # magic methods to define operators
@@ -722,6 +875,8 @@ class Datacube:
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
             return Datacube(fileinfo=self.fileinfo, data=self.data+other.data)
         return Datacube(fileinfo=self.fileinfo, data=self.data+other)
         
@@ -730,6 +885,8 @@ class Datacube:
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
             return Datacube(fileinfo=self.fileinfo, data=self.data-other.data)
         return Datacube(fileinfo=self.fileinfo, data=self.data-other)
         
@@ -897,6 +1054,15 @@ class Datacube:
         """
         return Datacube(fileinfo=self.fileinfo, data=self.data.to(unit, *args, **kwargs))
     
+    def to_value(self, unit, *args, **kwargs):
+        """
+        Duplicate of astropy.unit.Quantity's 'to_value' method.
+        """
+        image = self.copy()
+        image.data = image.data.to_value(unit, *args, **kwargs)
+        image.bunit = image.header["bunit"] = _apu_to_headerstr(u.Unit(unit))
+        return image
+    
     def copy(self):
         """
         This method creates a copy of the original image.
@@ -917,7 +1083,7 @@ class Datacube:
         """
         # create axes in the same unit as self.unit
         xaxis = self.dx * (np.arange(self.nx)-self.refnx+1)
-        yaxis = self.dy * (np.arange(self.ny)-self.refnx+1)
+        yaxis = self.dy * (np.arange(self.ny)-self.refny+1)
         
         # convert to the specified unit if necessary
         if unit is not None:
@@ -930,21 +1096,46 @@ class Datacube:
             return xx, yy
         return xaxis, yaxis
     
-    def get_vaxis(self, freq=False):
+    def get_vaxis(self, specunit=None):
         """
-        Get the spectral axis of the image.
+        To get the vaxis of the data cube.
         Parameters:
-            freq (bool): True to return the spectral axis as frequnecy (unit: Hz.)
-                         False to return the spectral axis as velocity (unit: km/s.)
+            specunit (str): the unit of the spectral axis. 
+                            Default is to use the same as the header unit.
         Returns:
-            The spectral axis (ndarray).
+            vaxis (ndarray): the spectral axis of the data cube.
         """
-        vaxis = np.round(np.arange(self.vrange[0], self.vrange[1]+self.dv, self.dv), 6)
-        if freq:
-            clight = const.c.to_value(u.km/u.s)
-            return self.restfreq*clight/(clight+vaxis)
+        vaxis = np.arange(self.vrange[0], self.vrange[-1]+self.dv, self.dv)
+        if specunit is None:
+            if u.Unit(self.specunit).is_equivalent(u.km/u.s):
+                round_mask = np.isclose(vaxis, np.round(vaxis, 5))
+                vaxis[round_mask] = np.round(vaxis, 5)
+            return vaxis
+        try:
+            # attempt direct conversion
+            vaxis = u.Quantity(vaxis, self.specunit).to_value(specunit)
+        except UnitConversionError:
+            # if that fails, try using equivalencies
+            equiv = u.doppler_radio(self.restfreq*u.Hz)
+            vaxis = u.Quantity(vaxis, self.specunit).to_value(specunit, equivalencies=equiv)
+        if u.Unit(specunit).is_equivalent(u.km/u.s):
+            round_mask = np.isclose(vaxis, np.round(vaxis, 5))
+            vaxis[round_mask] = np.round(vaxis, 5)
+            return vaxis
         return vaxis
     
+    def conv_specunit(self, specunit, inplace=False):
+        """
+        Convert the spectral axis into the desired unit.
+        """
+        image = self if inplace else self.copy()
+        vaxis = image.get_vaxis(specunit=specunit)
+        image.fileinfo["dv"] = vaxis[1]-vaxis[0]
+        image.fileinfo["vrange"] = vaxis[[0, -1]].tolist()
+        image.fileinfo["specunit"] = _apu_to_headerstr(u.Unit(specunit))
+        image.__updateparams()
+        return image
+
     def rotate(self, angle=0, ccw=True, unit="deg", inplace=False):
         """
         Rotate the image by the specified degree.
@@ -1020,7 +1211,7 @@ class Datacube:
                         momdata[0, 0, i, j] = np.nan
                     else:
                         sorted_data = np.sort(pixdata)
-                        sorted_data = sorted_data[~np.isnan(sorted_data)]
+                        sorted_data = sorted_data[~np.isnan(sorted_data)] # remove nan so that median is accurate
                         median_at_pix = sorted_data[sorted_data.size//2]  # this is approximation of median, not always exact
                         vidx = np.where(pixdata == median_at_pix)[0][0]   # get index of coordinate of median
                         momdata[0, 0, i, j] = vaxis[vidx]
@@ -1046,9 +1237,9 @@ class Datacube:
             momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
             for i in range(momdata.shape[2]):
                 for j in range(momdata.shape[3]):
-                    pixdata = data[0, :, i, j]    # data of data cube at this pixel
+                    pixdata = data[0, :, i, j]  # intensity values of data cube at this pixel
                     if np.all(np.isnan(pixdata)):
-                        momdata[0, 0, i, j] = np.nan
+                        momdata[0, 0, i, j] = np.nan  # assign nan if all nan at that pixel
                     else:
                         momdata[0, 0, i, j] = vaxis[np.nanargmax(pixdata)]
             
@@ -1061,11 +1252,11 @@ class Datacube:
             momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
             for i in range(momdata.shape[2]):
                 for j in range(momdata.shape[3]):
-                    pixdata = data[0, :, i, j]   # data of data cube at this pixel
+                    pixdata = data[0, :, i, j]  # intensity values of data cube at this pixel
                     if np.all(np.isnan(pixdata)):
-                        momdata[0, 0, i, j] = np.nan
+                        momdata[0, 0, i, j] = np.nan  # assign nan if all nan at that pixel
                     else:
-                        momdata[0, 0, i, j] = vaxis[np.nanargmin(pixdata)]            
+                        momdata[0, 0, i, j] = vaxis[np.nanargmin(pixdata)]      
         
         return momdata.reshape((1, 1, self.nx, self.ny))
     
@@ -1150,9 +1341,9 @@ class Datacube:
             if moment in (-1, 3, 5, 6, 7, 8, 10):
                 bunit = self.bunit
             elif moment == 0:
-                bunit = f"{self.bunit}.km/s"
+                bunit = f"{self.bunit}.{self.specunit}"
             else:
-                bunit = "km/s"
+                bunit = self.specunit
             # update header information
             newheader = copy.deepcopy(self.header)
             newheader["imagetype"] = "spatialmap"
@@ -1167,15 +1358,16 @@ class Datacube:
         return maps[0] if len(maps) == 1 else maps
         
     def imview(self, contourmap=None, fov=None, ncol=5, nrow=None, cmap="inferno",
-               figsize=(11.69, 8.27), vrange=None, nskip=1, vskip=None, tickscale=None, 
-               tickcolor="w", txtcolor='w', crosson=True, crosslw=0.5, crosscolor="w", 
-               crosssize=0.3, dpi=400, vmin=None, vmax=None, xlabel=None, ylabel=None, 
-               xlabelon=True, ylabelon=True, crms=None, clevels=np.arange(3, 21, 3), 
-               ccolor="w", clw=0.5, vsys=0., fontsize=12, decimals=2, vlabelon=True, 
-               cbarloc="right", cbarwidth="3%", cbarpad=0., cbarlabel=None, cbarlabelon=True, 
-               addbeam=True, beamcolor="skyblue", nancolor="k", labelcolor="k", axiscolor="w",
-               axeslw=0.8, labelsize=10, tickwidth=1., ticksize=3., tickdirection="in", 
-               vlabelsize=12, vlabelunit=False, cbaron=True, plot=True):
+               figsize=(11.69, 8.27), center=(0., 0.), vrange=None, nskip=1, vskip=None, 
+               tickscale=None, tickcolor="w", txtcolor='w', crosson=True, crosslw=0.5, 
+               crosscolor="w", crosssize=0.3, dpi=400, vmin=None, vmax=None, 
+               xlabel=None, ylabel=None, xlabelon=True, ylabelon=True, crms=None, 
+               clevels=np.arange(3, 21, 3), ccolor="w", clw=0.5, vsys=0., fontsize=12, 
+               decimals=2, vlabelon=True, cbarloc="right", cbarwidth="3%", cbarpad=0., 
+               cbarlabel=None, cbarlabelon=True, addbeam=True, beamcolor="skyblue", 
+               nancolor="k", labelcolor="k", axiscolor="w", axeslw=0.8, labelsize=10, 
+               tickwidth=1., ticksize=3., tickdirection="in", vlabelsize=12, vlabelunit=False, 
+               cbaron=True, plot=True):
         """
         To plot the data cube's channel maps.
         Parameters:
@@ -1185,6 +1377,7 @@ class Datacube:
             nrow (int): the number of rows to be drawn. Default is the minimum rows needed to plot all specified channels.
             cmap (str): the color map of the color image.
             figsize (tuple(float)): the size of the figure
+            center (tuple(float)): the center coordinate of the channel maps
             vrange (list(float)): the range of channels to be drawn.
             nskip (float): the channel intervals
             vskip (float): the velocity interval. An alternative to nskip. Default is the same as 'nskip'.
@@ -1237,6 +1430,8 @@ class Datacube:
             The image grid with the channel maps.
         """
         # initialize parameters:
+        if center != (0, 0):
+            raise Exception("Center parameter not implemented yet.")
         fov = self.widestfov if fov is None else fov
         if tickscale is not None:
             ticklist = np.arange(0, fov, tickscale) 
@@ -1252,15 +1447,21 @@ class Datacube:
         vskip = self.dv*nskip if vskip is None else vskip
         cmap = copy.deepcopy(mpl.colormaps[cmap]) 
         cmap.set_bad(color=nancolor) 
-        if (contourmap is not None and crms is None):
-            crms = contourmap.noise()
-            print(f"Estimated base contour level (rms): {crms:.4e}")
-        
+        if crms is None and contourmap is not None:
+            try:
+                crms = contourmap.noise()
+                bunit = self.bunit.replace(".", " ")
+                print(f"Estimated base contour level (rms): {crms:.4e} [{bunit}]")
+            except Exception:
+                contourmap = None
+                print("Failed to estimate RMS noise level of contour map.")
+                print("Please specify base contour level using 'crms' parameter.")
+            
         # trim data along vaxis for plotting:
         vmask = (velmin <= vaxis) & (vaxis <= velmax)
         trimmed_data = self.data[:, vmask, :, :][:, ::nskip, :, :]
         trimmed_vaxis = vaxis[vmask][::nskip]
-        
+            
         # trim data along xyaxes for plotting:
         if fov != self.widestfov:
             xmask = (-fov<=self.xaxis) & (self.xaxis<=fov)
@@ -1301,9 +1502,9 @@ class Datacube:
                   'xtick.major.top': True,
                   'figure.figsize': figsize,
                   'figure.dpi': dpi,
-                  'font.family': 'Times New Roman',
-                  'mathtext.fontset': 'stix', #"Times New Roman"
-                  'mathtext.tt':' Times New Roman',
+                  'font.family': _fontfamily,
+                  'mathtext.fontset': _mathtext_fontset,
+                  'mathtext.tt': _mathtext_tt,
                   'axes.linewidth': axeslw,
                   'xtick.major.width': tickwidth,
                   'xtick.major.size': ticksize,
@@ -1340,10 +1541,6 @@ class Datacube:
                     imcontour = ax.contour(thiscdata, colors=ccolor, origin='lower', 
                                            extent=contextent, levels=crms*clevels, linewidths=clw)
                 
-                # set field of view
-                ax.set_xlim(fov, -fov)
-                ax.set_ylim(-fov, fov)
-                
                 # set ticks
                 if tickscale is None:
                     ticklist = ax.get_xticks()
@@ -1355,7 +1552,7 @@ class Datacube:
                 
                 # plot channel labels
                 if vlabelon:
-                    vlabel = r"$\rm " + f"%.{decimals}f"%thisvel + r"~km~s^{-1}$" \
+                    vlabel = f"%.{decimals}f "%thisvel + _apu_to_str(u.Unit(self.specunit)) \
                              if vlabelunit else f"%.{decimals}f"%thisvel
                     ax.text(0.1, 0.9, vlabel, color=txtcolor, size=vlabelsize,
                             ha='left', va='top', transform=ax.transAxes)
@@ -1379,6 +1576,9 @@ class Datacube:
                 ax.spines["left"].set_color('none')
                 ax.spines["right"].set_color('none')
                 ax.axis('off')
+            # set field of view
+            ax.set_xlim(fov, -fov)
+            ax.set_ylim(-fov, fov)
                 
         # axis labels
         if xlabelon or ylabelon or addbeam:
@@ -1467,49 +1667,46 @@ class Datacube:
         Returns:
             A new image with the desired unit.
         """
+        # string to astropy units 
         bunit = _to_apu(bunit)
-        area_per_beam = self.beam_area(unit=None)
-        area_per_pix = self.pixel_area(unit=None)
-        equiv_bt = u.equivalencies.brightness_temperature(frequency=self.restfreq*u.Hz, beam_area=area_per_beam)
-        equiv_pix = u.pixel_scale(u.Quantity(np.abs(self.dx), self.unit)**2/u.pixel)
-        equiv_ba = u.beam_angular_area(area_per_beam)
-        try:
-            newdata = u.Quantity(self.data, _to_apu(self.bunit)).to(bunit)
-        except:
-            try:
-                newdata = u.Quantity(self.data, _to_apu(self.bunit)).to(bunit, equivalencies=equiv_bt)
-            except:
-                try:
-                    newdata = u.Quantity(self.data, _to_apu(self.bunit)).to(bunit, equivalencies=equiv_pix)
-                except:
-                    try: 
-                        newdata = u.Quantity(self.data, _to_apu(self.bunit)).to(bunit, equivalencies=equiv_ba)
-                    except:
-                        try:
-                            newdata = u.Quantity(self.data, _to_apu(self.bunit)).to("Jy/sr", equivalencies=equiv_ba)
-                            newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_pix)
-                        except:
-                            try:
-                                newdata = u.Quantity(self.data, _to_apu(self.bunit)).to("Jy/sr", equivalencies=equiv_pix)
-                                newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_ba)
-                            except:
-                                try:
-                                    newdata = u.Quantity(self.data, _to_apu(self.bunit)).to("Jy/sr", equivalencies=equiv_bt)
-                                    newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_pix)
-                                except:
-                                    newdata = u.Quantity(self.data, _to_apu(self.bunit)).to("Jy/sr", equivalencies=equiv_pix)
-                                    newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_bt)
+        oldunit = _to_apu(self.bunit)
         
+        # equivalencies
+        equiv_bt = u.equivalencies.brightness_temperature(frequency=self.restfreq*u.Hz, 
+                                                          beam_area=self.beam_area())
+        equiv_pix = u.pixel_scale(u.Quantity(np.abs(self.dx), self.unit)**2/u.pixel)
+        equiv_ba = u.beam_angular_area(self.beam_area())
+        equiv = [equiv_bt, equiv_pix, equiv_ba]
+
+        # factors
+        factor_bt = (1*u.Jy/u.beam).to(u.K, equivalencies=equiv_bt) / (u.Jy/u.beam)
+        factor_pix = (1*u.pixel).to(u.rad**2, equivalencies=equiv_pix) / (u.pixel)
+        factor_ba = (1*u.beam).to(u.rad**2, equivalencies=equiv_ba) / (u.beam)
+        factor_pix2bm = factor_pix / factor_ba
+        factor_Jypix2K = factor_pix2bm / factor_bt
+        factor_Jysr2K = factor_bt*factor_ba
+        factors = [factor_bt, factor_pix, factor_ba, factor_pix2bm, 
+                   factor_Jypix2K, factor_Jysr2K]
+        
+        # convert
+        if isinstance(self.data, u.Quantity):
+            olddata = self.data.copy()
+        else:
+            olddata = u.Quantity(self.data, oldunit)
+        newdata = _convert_Bunit(olddata, newunit=bunit, 
+                                 equivalencies=equiv, factors=factors)
+        
+        if newdata is None:
+            raise UnitConversionError(f"Failure to convert intensity unit to {bunit.to_string()}")
+
         # return and set values
-        newdata = newdata.value
-        if inplace:
-            self.data = newdata
-            self.header["bunit"] = bunit.to_string()
-            self.__updateparams()
-            return self
-        newfileinfo = copy.deepcopy(self.fileinfo)
-        newfileinfo["bunit"] = bunit
-        newimage = Datacube(fileinfo=newfileinfo, data=newdata)
+        if not isinstance(self.data, u.Quantity):
+            newdata = newdata.value
+            
+        newimage = self if inplace else self.copy()
+        newimage.data = newdata
+        newimage.header["bunit"] = _apu_to_headerstr(bunit)
+        newimage.__updateparams()
         return newimage
     
     def extract_channels(self, chans=None, vrange=None):
@@ -1591,7 +1788,7 @@ class Datacube:
         To calculate the beam area of the image.
         Parameters:
             unit (float): the unit of the beam area to be returned. 
-                          None to use same unit as the positional axes.
+                          Default (None) is to use same unit as the positional axes.
         Returns:
             The beam area.
         """
@@ -1607,7 +1804,7 @@ class Datacube:
         To calculate the beam area of the image.
         Parameters:
             unit (float): the unit of the pixel area to be returned.
-                          None to use the same unit as the positional axes.
+                          Default (None) is to use the same unit as the positional axes.
         Returns:
             The pixel area.
         """
@@ -1691,6 +1888,9 @@ class Datacube:
         mean = np.nanmean(clipped_data)
         rms = np.sqrt(np.nanmean(clipped_data**2))
         std = np.nanstd(clipped_data)
+    
+        if not rms:
+            raise Exception("Sigma clipping failed. It is likely that most noise has been masked.")
         
         if printstats:
             print(15*"#" + "Noise Statistics" + 15*"#")
@@ -1930,7 +2130,7 @@ class Datacube:
                 region.width = region.header["width"] = width
         region.relative = region.header["relative"] = True
         return region
-    
+        
     def pvextractor(self, region, vrange=None, width=1, preview=True, **kwargs):
         """
         This method extracts the pv diagram along the specified pv slice.
@@ -1943,20 +2143,27 @@ class Datacube:
         Returns:
             The extracted PVdiagram object.
         """
+        # get vaxis
+        vaxis = self.vaxis.copy()
+        
+        # get xaxis
+        xaxis = self.xaxis.copy()
+        
         # raise exception if width is an even number of pixels.
         if width % 2 == 0:
             raise ValueError("The parameter 'width' must be an odd positive integer.")
-        if isinstance(width, float):
+        if not isinstance(width, int):
             width = int(width)
             
         # initialize parameters
-        vrange = [self.vaxis[0], self.vaxis[-1]] if vrange is None else vrange
+        vrange = self.vaxis[[0, -1]] if vrange is None else vrange
         region = self.__readregion(region)
         center, pa, length = region.center, region.pa, region.length
         
         # shift and then rotate image
+        pa_prime = 90.-pa
         shifted_img = self.imshift(center, inplace=False, printcc=False) if center != (0, 0) else self.copy()
-        rotated_img = shifted_img.rotate(angle=pa, ccw=False, inplace=False) if pa != 0 else shifted_img
+        rotated_img = shifted_img.rotate(angle=-pa_prime, ccw=False, inplace=False) if pa_prime != 0 else shifted_img
         
         # trim data
         ymask = (-length/2 <= self.yaxis) & (self.yaxis <= length/2)
@@ -1970,11 +2177,12 @@ class Datacube:
         else:
             add_idx = int(width//2)
             idx = np.where(self.xaxis == np.abs(self.xaxis).min())[0][0]
-            xidx1, xidx2 = idx-add_idx, idx+add_idx+1 # plus 1 to avoid OBOB
+            xidx1, xidx2 = idx-add_idx, idx+add_idx+1  # plus 1 to avoid OBOB
             pv_data = pv_data[:, :, xidx1:xidx2, :]
             pv_data = np.nanmean(pv_data, axis=2)
-        pv_data = pv_data.reshape(1, pv_vaxis.size, pv_xaxis.size, 1)
-        
+        pv_data = np.fliplr(pv_data.reshape(pv_vaxis.size, pv_xaxis.size))
+        pv_data = pv_data[None, :, :]
+
         # export as pv data
         newfileinfo = copy.deepcopy(self.fileinfo)
         newfileinfo["shape"] = pv_data.shape
@@ -1984,7 +2192,7 @@ class Datacube:
         newfileinfo["nchan"] = pv_vaxis.size
         newfileinfo["dx"] = np.round(pv_xaxis[1] - pv_xaxis[0], 7)
         newfileinfo["nx"] = pv_xaxis.size
-        newfileinfo["refnx"] = pv_xaxis.size/2 + 1
+        newfileinfo["refnx"] = pv_xaxis.size//2 + 1
         newfileinfo["dy"] = None
         newfileinfo["ny"] = None
         newfileinfo["refny"] = None
@@ -1992,6 +2200,8 @@ class Datacube:
         
         # new image
         pv = PVdiagram(fileinfo=newfileinfo, data=pv_data)
+        pv.pa = pa
+        
         if preview:
             pv.imview(**kwargs)
         return pv
@@ -2091,6 +2301,7 @@ class Datacube:
             template (Datacube): Optional. A template image to use for the new grid.
             dx (float): New grid resolution along the x-axis.
             dy (float): New grid resolution along the y-axis.
+            imsize (list(float)): Optional. The new image size (number of pixels in x- and y-axes)
             inplace (bool): If True, modify the current image in-place. Otherwise, return a new image.
         Returns:
             Datacube: The regridded image.
@@ -2103,7 +2314,7 @@ class Datacube:
         # calculate dx from imsize if imsize is given:
         if len(imsize) == 2:
             dx = -(self.xaxis.max()-self.xaxis.min())/imsize[0]
-            dy = (self.yaxis.max() - self.yaxis.min())/imsize[1]
+            dy = (self.yaxis.max()-self.yaxis.min())/imsize[1]
 
         # if dx or dy is not provided, raise an error
         if dx is None or dy is None:
@@ -2246,11 +2457,11 @@ class Datacube:
             print(f"Shifted to {coord} [{self.unit}]")
             return shifted_image
     
-    def line_info(self):
+    def line_info(self, **kwargs):
         """
         This method searches for the molecular line data from the Splatalogue database
         """
-        return search_molecular_line(self.restfreq, unit="Hz")
+        return search_molecular_line(self.restfreq, unit="Hz", **kwargs)
     
     def get_hduheader(self):
         """
@@ -2318,7 +2529,8 @@ class Spatialmap:
         is in the correct format. It can handle FITS files with different configurations and
         is designed to be flexible for various data shapes and sizes.
     """
-    def __init__(self, fitsfile=None, fileinfo=None, data=None, hduindex=0, spatialunit="arcsec", quiet=False):
+    def __init__(self, fitsfile=None, fileinfo=None, data=None, hduindex=0, 
+                 spatialunit="arcsec", quiet=False):
         if fitsfile is not None:
             fits = importfits(fitsfile, hduindex=hduindex, spatialunit=spatialunit, quiet=False)
             self.fileinfo = fits.fileinfo
@@ -2327,7 +2539,7 @@ class Spatialmap:
             self.fileinfo = fileinfo
             self.data = data
         if self.fileinfo["imagetype"] != "spatialmap":
-            raise TypeError("The given fitsfile is not a spatialmap.")
+            raise TypeError("The given FITS file is not a spatial map.")
         self.__updateparams()
         self._peakshifted = False
         if isinstance(self.data, u.quantity.Quantity):
@@ -2339,6 +2551,8 @@ class Spatialmap:
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
             return Spatialmap(fileinfo=self.fileinfo, data=self.data+other.data)
         return Spatialmap(fileinfo=self.fileinfo, data=self.data+other)
         
@@ -2347,6 +2561,8 @@ class Spatialmap:
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
             return Spatialmap(fileinfo=self.fileinfo, data=self.data-other.data)
         return Spatialmap(fileinfo=self.fileinfo, data=self.data-other)
         
@@ -2514,6 +2730,15 @@ class Spatialmap:
         """
         return Spatialmap(fileinfo=self.fileinfo, data=self.data.to(unit, *args, **kwargs))
     
+    def to_value(self, unit, *args, **kwargs):
+        """
+        Duplicate of astropy.unit.Quantity's 'to_value' method.
+        """
+        image = self.copy()
+        image.data = image.data.to_value(unit, *args, **kwargs)
+        image.bunit = image.header["bunit"] = _apu_to_headerstr(u.Unit(unit))
+        return image
+    
     def copy(self):
         """
         This method creates a copy of the original image.
@@ -2538,7 +2763,7 @@ class Spatialmap:
         self.resolution = np.sqrt(self.beam[0]*self.beam[1]) if self.beam is not None else None
         self.refcoord = self.fileinfo["refcoord"]
         if isinstance(self.data, u.Quantity):
-            self.bunit = self.fileinfo["bunit"] = (self.data.unit).to_string()
+            self.bunit = self.fileinfo["bunit"] = _apu_to_headerstr(self.data.unit)
         else:
             self.bunit = self.fileinfo["bunit"]
         xmin, xmax = self.xaxis[[0, -1]]
@@ -2561,7 +2786,7 @@ class Spatialmap:
         """
         # create axes in the same unit as self.unit
         xaxis = self.dx * (np.arange(self.nx)-self.refnx+1)
-        yaxis = self.dy * (np.arange(self.ny)-self.refnx+1)
+        yaxis = self.dy * (np.arange(self.ny)-self.refny+1)
         
         # convert to the specified unit if necessary
         if unit is not None:
@@ -2796,6 +3021,7 @@ class Spatialmap:
             template (Spatialmap): Optional. A template image to use for the new grid.
             dx (float): New grid resolution along the x-axis.
             dy (float): New grid resolution along the y-axis.
+            imsize (list(float)): Optional. The new image size (number of pixels in x- and y-axes)
             inplace (bool): If True, modify the current image in-place. Otherwise, return a new image.
         Returns:
             Spatialmap: The regridded image.
@@ -3166,7 +3392,7 @@ class Spatialmap:
         bmin = u.Quantity(self.bmin, self.unit)
         area = np.pi*bmaj*bmin/(4*np.log(2))
         if unit is not None:
-            area = area.to(unit).value
+            area = area.to_value(unit)
         return area
     
     def pixel_area(self, unit=None):
@@ -3182,7 +3408,7 @@ class Spatialmap:
         height = u.Quantity(np.abs(self.dy), self.unit)
         area = width*height
         if unit is not None:
-            area = area.to(unit).value
+            area = area.to_value(unit)
         return area
     
     def conv_unit(self, unit, inplace=False):
@@ -3222,49 +3448,46 @@ class Spatialmap:
         Returns:
             A new image with the desired unit.
         """
+        # string to astropy units 
         bunit = _to_apu(bunit)
-        area_per_beam = self.beam_area(unit=None)
-        area_per_pix = self.pixel_area(unit=None)
-        equiv_bt = u.equivalencies.brightness_temperature(frequency=self.restfreq*u.Hz, beam_area=area_per_beam)
-        equiv_pix = u.pixel_scale(u.Quantity(np.abs(self.dx), self.unit)**2/u.pixel)
-        equiv_ba = u.beam_angular_area(area_per_beam)
-        try:
-            newdata = u.Quantity(self.data, _to_apu(self.bunit)).to(bunit)
-        except:
-            try:
-                newdata = u.Quantity(self.data, _to_apu(self.bunit)).to(bunit, equivalencies=equiv_bt)
-            except:
-                try:
-                    newdata = u.Quantity(self.data, _to_apu(self.bunit)).to(bunit, equivalencies=equiv_pix)
-                except:
-                    try: 
-                        newdata = u.Quantity(self.data, _to_apu(self.bunit)).to(bunit, equivalencies=equiv_ba)
-                    except:
-                        try:
-                            newdata = u.Quantity(self.data, _to_apu(self.bunit)).to("Jy/sr", equivalencies=equiv_ba)
-                            newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_pix)
-                        except:
-                            try:
-                                newdata = u.Quantity(self.data, _to_apu(self.bunit)).to("Jy/sr", equivalencies=equiv_pix)
-                                newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_ba)
-                            except:
-                                try:
-                                    newdata = u.Quantity(self.data, _to_apu(self.bunit)).to("Jy/sr", equivalencies=equiv_bt)
-                                    newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_pix)
-                                except:
-                                    newdata = u.Quantity(self.data, _to_apu(self.bunit)).to("Jy/sr", equivalencies=equiv_pix)
-                                    newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_bt)
+        oldunit = _to_apu(self.bunit)
         
+        # equivalencies
+        equiv_bt = u.equivalencies.brightness_temperature(frequency=self.restfreq*u.Hz, 
+                                                          beam_area=self.beam_area())
+        equiv_pix = u.pixel_scale(u.Quantity(np.abs(self.dx), self.unit)**2/u.pixel)
+        equiv_ba = u.beam_angular_area(self.beam_area())
+        equiv = [equiv_bt, equiv_pix, equiv_ba]
+
+        # factors
+        factor_bt = (1*u.Jy/u.beam).to(u.K, equivalencies=equiv_bt) / (u.Jy/u.beam)
+        factor_pix = (1*u.pixel).to(u.rad**2, equivalencies=equiv_pix) / (u.pixel)
+        factor_ba = (1*u.beam).to(u.rad**2, equivalencies=equiv_ba) / (u.beam)
+        factor_pix2bm = factor_pix / factor_ba
+        factor_Jypix2K = factor_pix2bm / factor_bt
+        factor_Jysr2K = factor_bt*factor_ba
+        factors = [factor_bt, factor_pix, factor_ba, factor_pix2bm, 
+                   factor_Jypix2K, factor_Jysr2K]
+        
+        # convert
+        if isinstance(self.data, u.Quantity):
+            olddata = self.data.copy()
+        else:
+            olddata = u.Quantity(self.data, oldunit)
+        newdata = _convert_Bunit(olddata, newunit=bunit, 
+                                 equivalencies=equiv, factors=factors)
+        
+        if newdata is None:
+            raise UnitConversionError(f"Failure to convert intensity unit to {bunit.to_string()}")
+
         # return and set values
-        newdata = newdata.value
-        if inplace:
-            self.data = newdata
-            self.header["bunit"] = bunit.to_string()
-            self.__updateparams()
-            return self
-        newfileinfo = copy.deepcopy(self.fileinfo)
-        newfileinfo["bunit"] = bunit.to_string()
-        newimage = Spatialmap(fileinfo=newfileinfo, data=newdata)
+        if not isinstance(self.data, u.Quantity):
+            newdata = newdata.value
+            
+        newimage = self if inplace else self.copy()
+        newimage.data = newdata
+        newimage.header["bunit"] = _apu_to_headerstr(bunit)
+        newimage.__updateparams()
         return newimage
             
     def imstat(self, region=None, exclude=False, preview=True):
@@ -3286,14 +3509,12 @@ class Spatialmap:
             rms (float): the root-mean-square average of the pixels in the region
             sumsq (float): the sum of the squares of pixels in the region
         """
-        region = self.__readregion(region)
         if region is None:
-            stat_image = copy.deepcopy(self)  
+            stat_image = copy.deepcopy(self) 
+            fov = None
         else:
-            if region is None:
-                fov = None
-            else:
-                fov = np.sqrt(region.semimajor*region.semiminor)  # also applies for circle
+            region = self.__readregion(region)
+            fov = np.sqrt(region.semimajor*region.semiminor)  # also applies for circle
             stat_image = copy.deepcopy(self).mask_region(region, exclude=exclude, preview=preview, fov=1.5*fov)
         statdata = stat_image.data[0, 0]
         
@@ -3421,6 +3642,9 @@ class Spatialmap:
         rms = np.sqrt(np.nanmean(clipped_data**2))
         std = np.nanstd(clipped_data)
         
+        if not rms:
+            raise Exception("Sigma clipping failed. It is likely that most noise has been masked.")
+        
         if printstats:
             print(15*"#" + "Noise Statistics" + 15*"#")
             print(f"Mean: {mean:.6e} [{bunit}]")
@@ -3477,16 +3701,18 @@ class Spatialmap:
     def imview(self, contourmap=None, title="", fov=None, vmin=None, vmax=None, 
                scale="linear", gamma=1.5, crms=None, clevels=np.arange(3, 21, 3), tickscale=None, 
                scalebaron=True, distance=None, cbarlabelon=True, cbarlabel=None, xlabelon=True,
-               ylabelon=True, dpi=500, ha="left", va="top", titlepos=0.85, 
+               ylabelon=True, center=(0., 0.), dpi=500, ha="left", va="top", titlepos=0.85, 
                cmap=None, fontsize=12, cbarwidth="5%", width=330, height=300,
-               smooth=None, scalebarsize=0.1, nancolor=None, beamcolor=None,
+               smooth=None, scalebarsize=None, nancolor=None, beamcolor=None,
                ccolors=None, clw=0.8, txtcolor=None, cbaron=True, cbarpad=0., tickson=False, 
                labelcolor="k", tickcolor="k", labelsize=10., ticklabelsize=10., 
                cbartick_length=3., cbartick_width=1., beamon=True, scalebar_fontsize=10,
                axeslw=1., scalecolor=None, scalelw=1., orientation="vertical", 
-               cbarticks=[], plot=True):
+               xlim=None, ylim=None, cbarticks=None, beamloc=(0.1, 0.1), vcenter=None, 
+               vrange=None, aspect_ratio=1, barloc=(0.85, 0.15), barlabelloc=(0.85, 0.075),
+               plot=True):
         """
-        Method to plot the image.
+        Method to plot the 2D image.
         Parameters:
             contourmap (Spatialmap): the image to be plotted as contour. Set to "None" to not add a contour.
             title (str): the title text to be plotted
@@ -3541,8 +3767,13 @@ class Spatialmap:
         Returns:
             The 2D image ax object.
         """
+        # set parameters to default values
         if cmap is None:
-            cmap = 'RdBu_r' if self.bunit == "km/s" else 'inferno'
+            if u.Unit(self.bunit).is_equivalent(u.Hz) or \
+               u.Unit(self.bunit).is_equivalent(u.km/u.s):
+                cmap = 'RdBu_r'
+            else:
+                cmap = "inferno"
             
         if ccolors is None:
             ccolors = "w" if cmap == "inferno" else "k"
@@ -3559,20 +3790,68 @@ class Spatialmap:
         if scalecolor is None:
             scalecolor = 'w' if cmap == "inferno" else "k"
         
+        if cbarticks is None:
+            cbarticks = []
+            
+        if fov is None:
+            fov = self.widestfov # set field of view to widest of image by default
+        
+        if xlim is None:
+            xlim = [center[0]+fov, center[0]-fov]
+        else:
+            xlim = xlim[:]  # create copy
+        
+        if xlim[1] > xlim[0]:
+            xlim[0], xlim[1] = xlim[1], xlim[0]  # swap
+        
+        if ylim is None:
+            ylim = [center[1]-fov, center[1]+fov]
+        else:
+            ylim = ylim[:]
+            
+        if ylim[0] > ylim[1]:
+            ylim[0], ylim[1] = ylim[1], ylim[0]  # swap
+            
+        if scalebarsize is None:
+            # default value of scale bar size
+            xrange = np.abs(xlim[1]-xlim[0])
+            
+            
+            order_of_magnitude = int(np.log10(xrange))
+            scalebarsize = 10**order_of_magnitude / 10
+            scalebarsize = np.clip(scalebarsize, 0.1, 10)
+                
+        if tickscale is not None:
+            ticklist = np.arange(-fov, fov+tickscale, tickscale)
+            xticklist = ticklist + center[0]
+            yticklist = ticklist + center[1]
+        
+        # convert contour levels to numpy array if necessary
+        if not isinstance(clevels, np.ndarray):
+            clevels = np.array(clevels)
+        
         # copy data and convert data to unitless array, if necessary
         data = self.data.copy()
         if isinstance(data, u.Quantity):
-            data = data.value
-            
-        clevels = np.array(clevels) if not isinstance(clevels, np.ndarray) else clevels
+            data = data.value.copy()
         
         # create a copy of the contour map
         if isinstance(contourmap, Spatialmap):
-            contourmap = contourmap.copy()            
-        
-        # set field of view to widest of image by default
-        fov = self.widestfov if fov is None else fov
-        
+            contourmap = contourmap.copy()
+            
+        if vcenter is not None:
+            if vrange is None:
+                dist = max([np.nanmax(data)-vcenter, vcenter-np.nanmin(data)])
+                vmin = vcenter - dist
+                vmax = vcenter + dist
+            else:
+                vmin = vcenter - vrange/2
+                vmax = vcenter + vrange/2
+        elif vrange is not None:
+            vcenter = (np.nanmax(data) + np.nanmin(data))/2
+            vmin = vcenter - vrange/2
+            vmax = vcenter + vrange/2
+            
         # change default parameters
         letterratio = 1.294
         ncols, nrows = 1, 1
@@ -3588,12 +3867,12 @@ class Spatialmap:
                   'legend.fontsize': fontsize,
                   'xtick.labelsize': ticklabelsize,
                   'ytick.labelsize': ticklabelsize,
-                  'xtick.top'           : True,   # draw ticks on the top side
+                  'xtick.top': True,   # draw ticks on the top side
                   'xtick.major.top' : True,
                   'figure.figsize': fig_size,
-                  'font.family': 'Times New Roman',
-                  "mathtext.fontset" : 'stix', 
-                  'mathtext.tt': 'Times New Roman',
+                  'font.family': _fontfamily,
+                  'mathtext.fontset': _mathtext_fontset,
+                  'mathtext.tt': _mathtext_tt,
                   'axes.linewidth' : axeslw,
                   'xtick.major.width' : 1.0,
                   "xtick.direction": 'in',
@@ -3609,20 +3888,22 @@ class Spatialmap:
                 }
         rcParams.update(params)
         
-        if tickscale is not None:
-            ticklist = np.arange(-100, 100+tickscale, tickscale)
-        
         # set colorbar
         my_cmap = copy.deepcopy(mpl.colormaps[cmap]) 
         my_cmap.set_bad(color=nancolor) 
         
-        fig, ax = plt.subplots(nrows=1,ncols=1,sharex=False,sharey=False)
+        fig, ax = plt.subplots(nrows=1, ncols=1, sharex=False, sharey=False)
         plt.subplots_adjust(wspace=0.4)
         
         if contourmap is not None and crms is None:
-            crms = contourmap.noise()
-            bunit = self.bunit.replace(".", " ")
-            print(f"Estimated base contour level (rms): {crms:.4e} [{bunit}]")
+            try:
+                crms = contourmap.noise()
+                bunit = self.bunit.replace(".", " ")
+                print(f"Estimated base contour level (rms): {crms:.4e} [{bunit}]")
+            except Exception:
+                contourmap = None
+                print("Failed to estimate RMS noise level of contour map.")
+                print("Please specify base contour level using 'crms' parameter.")
         
         # add image
         if scale.lower() == "linear":
@@ -3660,8 +3941,8 @@ class Spatialmap:
             if len(cbarticks) > 0:
                 cb.set_ticks(cbarticks)
                 if scale.lower() in ["log", "logscale"]:
-                    labels = ("%.2s"%label for label in cbarticks)
-                    labels = [label if label[-1] != "." else label[:-1] for label in labels]
+                    labels = ("%.2s"%label for label in cbarticks)  # generator object
+                    labels = [label[:-1] if label.endswith(".") else label for label in labels]
                     cb.set_ticklabels(labels)
             cb.set_label(cbarlabel, fontsize=labelsize)
             cb.ax.tick_params(labelsize=ticklabelsize, width=cbartick_width, 
@@ -3673,38 +3954,49 @@ class Spatialmap:
                 contour_data = gaussian_filter(contour_data, smooth)
             ax.contour(contour_data, extent=contourmap.imextent, 
                        levels=crms*clevels, colors=ccolors, linewidths=clw, origin='lower')
-        
-        if scalebaron and distance is not None:
-            obj_distance = distance*scalebarsize*2.06265*1e5*(np.pi/(3600*180)) 
-            obj_distance = np.round(distance, 1)
-            centerx = -0.7*fov
-            ax.text(centerx, fov*(-0.85), str(int(distance*scalebarsize))+' au', 
-                     ha='center', va='bottom',color=scalecolor, fontsize=scalebar_fontsize)
-            ax.plot([centerx-scalebarsize/2, centerx+scalebarsize/2],
-                     [fov*(-0.7),fov*(-0.7)], color=scalecolor,lw=scalelw)
             
         if title:
             titlex, titley = fov*titlepos, fov*titlepos
             ax.text(x=titlex, y=titley, s=title, ha=ha, va=va, color=txtcolor, fontsize=fontsize)
         
-        ax.set_xlim([fov, -fov])
-        ax.set_ylim([-fov, fov])
+        # set field of view
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
         
-        if tickscale is not None:
+        if tickscale is None:
+            # use the default ticks if ticklist is not specified
+            if center == (0., 0.):
+                default_ticks = ax.get_xticks().copy()
+                ax.set_xticks(default_ticks)
+                ax.set_yticks(-default_ticks)
+            else:
+                default_xticks = ax.get_xticks().copy()
+                d_xticks = np.abs(default_xticks[0] - default_xticks[1])
+                default_yticks = ax.get_yticks().copy()
+                d_yticks = np.abs(default_yticks[0] - default_yticks[1])
+                if d_xticks != d_yticks:
+                    miny = np.min(default_yticks)
+                    maxy = np.max(default_yticks)
+                    new_yticks = np.arange(miny, maxy+d_xticks, d_xticks)
+                    tick_mask = (ylim[0] < new_yticks) & (new_yticks < ylim[1])
+                    new_yticks = new_yticks[tick_mask]
+                    ax.set_xticks(default_xticks)
+                    ax.set_yticks(new_yticks)
+                else:
+                    ax.set_xticks(default_xticks)
+                    ax.set_yticks(default_yticks)
+        else:
             ax.set_xticks(ticklist)
             ax.set_yticks(ticklist)
-        else:
-            defaultticks = ax.get_xticks().copy()
-            ax.set_yticks(-defaultticks)
-            ax.set_xticks(defaultticks)
             
         if tickson:
-            ax.tick_params(which='both',direction='in',bottom=True, top=True, left=True, right=True,
-                    colors=tickcolor, labelrotation=0, labelcolor=labelcolor)
+            ax.tick_params(which='both', direction='in', bottom=True, top=True, left=True, right=True,
+                           colors=tickcolor, labelrotation=0, labelcolor=labelcolor)
         else:
-            ax.tick_params(which='both',direction='in',bottom=False, top=False, left=False, right=False,
-                        colors=tickcolor, labelrotation=0, labelcolor=labelcolor)
+            ax.tick_params(which='both', direction='in',bottom=False, top=False, left=False, right=False,
+                           colors=tickcolor, labelrotation=0, labelcolor=labelcolor)
             
+        # set labels
         if xlabelon:
             ax.set_xlabel(f"Relative RA ({self.unit})", fontsize=labelsize)
         if ylabelon:
@@ -3712,24 +4004,98 @@ class Spatialmap:
         
         # add beam
         if beamon:
-            bmin_plot, bmaj_plot = ax.transLimits.transform((self.bmin, self.bmaj))-ax.transLimits.transform((0, 0))
-            beam = patches.Ellipse(xy=(0.1, 0.11), width=bmin_plot, height=bmaj_plot, fc=beamcolor, 
-                                   angle=self.bpa, transform=ax.transAxes)
-            ax.add_patch(beam)
+            ax = self.__addbeam(ax, xlim=xlim, ylim=ylim, beamcolor=beamcolor, 
+                                beamloc=beamloc)
+            
+        # add scale bar
+        if scalebaron and distance is not None:
+            ax = self.__add_scalebar(ax, xlim=xlim, ylim=ylim, distance=distance, 
+                                     size=scalebarsize, scalecolor=scalecolor, scalelw=scalelw, 
+                                     fontsize=scalebar_fontsize, barloc=barloc, txtloc=barlabelloc)
+            
+        # aspect ratio
+        ax.set_aspect(aspect_ratio)
         
-        # set field of view
-        ax.set_xlim([fov, -fov])
-        ax.set_ylim([-fov, fov])
+        # reset field of view
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
         
         if plot:
             plt.show()
+            
         return ax
     
-    def line_info(self):
+    # need error checking.
+    def __add_scalebar(self, ax, xlim, ylim, distance, size=0.1, barloc=(0.85, 0.15), 
+                       txtloc=(0.85, 0.075), scalecolor="w", scalelw=1., fontsize=10.):
+        """
+        Private method to add a scale bar
+        Parameters:
+            ax: image on which scale bar will be added
+            distance: distance to object (parsec)
+            scale: size (length) of scale bar (same unit as spatial axes)
+            barloc: location of the bar (relative)
+            txtcenter: the location of the text center (relative)
+            scalecolor (str): the color of the scale bar
+            scaelw (float): the line width of the scale bar
+            fontsize (float): the font size of the text label
+        Returns:
+            ax: the image with the added scale bar
+        """
+        # conversion factor from angular unit to linear unit
+        if self.unit == "arcsec":
+            ang2au = distance
+        else:
+            ang2au = distance*u.Quantity(1, self.unit).to_value(u.arcsec)
+            
+        # distance in au
+        dist_au = size*ang2au
+        
+        # convert absolute to relative
+        xrange = xlim[1] - xlim[0]
+        yrange = ylim[1] - ylim[0]
+        
+        barx = xlim[0] + xrange*barloc[0]
+        bary = ylim[0] + yrange*barloc[1]
+            
+        textx = xlim[0] + xrange*txtloc[0]
+        texty = ylim[0] + yrange*txtloc[1]
+        
+        label = str(int(dist_au))+' au'
+        ax.text(textx, texty, label, ha='center', va='bottom', 
+                color=scalecolor, fontsize=fontsize)
+        ax.plot([barx-size/2, barx+size/2], [bary, bary], 
+                color=scalecolor, lw=scalelw)
+        
+        return ax
+        
+    def __addbeam(self, ax, xlim, ylim, beamcolor, beamloc=(0.1, 0.1)):
+        """
+        This method adds an ellipse representing the beam size to the specified ax.
+        """
+        # get axes limits
+        xrange = xlim[1] - xlim[0]
+        yrange = ylim[1] - ylim[0]
+        
+        # coordinate of ellipse center 
+        centerx = xlim[0] + beamloc[0]*xrange
+        centery = ylim[0] + beamloc[1]*yrange
+        coords = (centerx, centery)
+        
+        # beam size
+        bmaj, bmin = self.bmaj, self.bmin
+        
+        # add patch to ax
+        beam = patches.Ellipse(xy=coords, width=bmin, height=bmaj, fc=beamcolor,
+                               angle=-self.bpa, alpha=1, zorder=10)
+        ax.add_patch(beam)
+        return ax
+    
+    def line_info(self, **kwargs):
         """
         This method searches for the molecular line data from the Splatalogue database
         """
-        return search_molecular_line(self.restfreq, unit="Hz")
+        return search_molecular_line(self.restfreq, unit="Hz", **kwargs)
     
     def get_hduheader(self):
         """
@@ -3796,17 +4162,20 @@ class PVdiagram:
         is in the correct format. It can handle FITS files with different configurations and
         is designed to be flexible for various data shapes and sizes.
     """
-    def __init__(self, fitsfile=None, fileinfo=None, data=None):
+    def __init__(self, fitsfile=None, fileinfo=None, data=None, hduindex=0, 
+                 spatialunit="arcsec", specunit="km/s", quiet=False):
         if fitsfile is not None:
-            fits = importfits(fitsfile, hduindex=hduindex, spatialunit=spatialunit, quiet=False)
+            fits = importfits(fitsfile, hduindex=hduindex, spatialunit=spatialunit, 
+                              specunit=specunit, quiet=False)
             self.fileinfo = fits.fileinfo
             self.data = fits.data
         elif fileinfo is not None:
             self.fileinfo = fileinfo
             self.data = data
         if self.fileinfo["imagetype"] != "pvdiagram":
-            raise TypeError("The given fitsfile is not a PV diagram.")
+            raise TypeError("The given FITS file is not a PV diagram.")
         self.__updateparams()
+        self.pa = None  # position angle at which the PV diagram was cut (to calculate offset resolution)
         
         if isinstance(self.data, u.quantity.Quantity):
             self.value = PVdiagram(fileinfo=self.fileinfo, data=self.data.value)
@@ -3826,15 +4195,28 @@ class PVdiagram:
         self.resolution = np.sqrt(self.beam[0]*self.beam[1]) if self.beam is not None else None
         self.refcoord = self.fileinfo["refcoord"]
         if isinstance(self.data, u.Quantity):
-            self.bunit = self.fileinfo["bunit"] = (self.data.unit).to_string()
+            self.bunit = self.fileinfo["bunit"] = _apu_to_headerstr(self.data.unit)
         else:
             self.bunit = self.fileinfo["bunit"]
-        self.dv = self.fileinfo["dv"]
+        self.specunit = self.fileinfo["specunit"]
         self.vrange = self.fileinfo["vrange"]
+        self.dv = self.fileinfo["dv"]
         self.nv = self.nchan = self.fileinfo["nchan"]
+        if self.specunit == "km/s":
+            rounded_dv = round(self.fileinfo["dv"], 5)
+            vmin, vmax = self.fileinfo["vrange"]
+            rounded_vmin = round(vmin, 5)
+            rounded_vmax = round(vmax, 5)
+            if np.isclose(rounded_dv, self.fileinfo["dv"]):
+                self.dv = self.fileinfo["dv"] = rounded_dv
+            if np.isclose(vmin, rounded_vmin):
+                vmin = rounded_vmin
+            if np.isclose(vmax, rounded_vmax):
+                vmax = rounded_vmax
+            self.vrange = self.fileinfo["vrange"] = [vmin, vmax]
         self.vaxis = self.get_vaxis()
-        vmin, vmax = self.vaxis[[0,-1]]
-        xmin, xmax = self.xaxis[[0,-1]]
+        vmin, vmax = self.vaxis[[0, -1]]
+        xmin, xmax = self.xaxis[[0, -1]]
         self.imextent = [vmin-0.5*self.dx, vmax+0.5*self.dx, 
                          xmin-0.5*self.dx, xmax+0.5*self.dx]
         v1, v2 = self.vaxis[0]-self.dv*0.5, self.vaxis[-1]+self.dv*0.5
@@ -3843,8 +4225,8 @@ class PVdiagram:
         x2 = self.xaxis[-1]+self.dx*0.5 if self.xaxis[-1] == self.xaxis.max() \
              else self.xaxis[-1]-self.dx*0.5
         self.imextent = [v1, v2, x1, x2]
-        self.maxxlim = [self.xaxis[0], self.xaxis[-1]]
-        self.maxvlim = [self.vaxis[0], self.vaxis[-1]]
+        self.maxxlim = self.xaxis[[0, -1]]
+        self.maxvlim = self.vaxis[[0, -1]]
         
     # magic methods to define operators
     def __add__(self, other):
@@ -3852,6 +4234,8 @@ class PVdiagram:
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
             return PVdiagram(fileinfo=self.fileinfo, data=self.data+other.data)
         return PVdiagram(fileinfo=self.fileinfo, data=self.data+other)
         
@@ -3860,6 +4244,8 @@ class PVdiagram:
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
             return PVdiagram(fileinfo=self.fileinfo, data=self.data-other.data)
         return PVdiagram(fileinfo=self.fileinfo, data=self.data-other)
         
@@ -3986,7 +4372,7 @@ class PVdiagram:
                 return PVdiagram(fileinfo=self.fileinfo, data=self.data[indices])
             except:
                 print("WARNING: Returning value after reshaping image data to 2 dimensions.")
-                return self.data.copy[:, indices[0], :, indices[1]]
+                return self.data.copy[:, indices[0], indices[1]]
         except:
             return self.data[indices]
     
@@ -4026,6 +4412,15 @@ class PVdiagram:
         This method converts the intensity unit of original image to the specified unit.
         """
         return PVdiagram(fileinfo=self.fileinfo, data=self.data.to(unit, *args, **kwargs))
+
+    def to_value(self, unit, *args, **kwargs):
+        """
+        Duplicate of astropy.unit.Quantity's 'to_value' method.
+        """
+        image = self.copy()
+        image.data = image.data.to_value(unit, *args, **kwargs)
+        image.bunit = image.header["bunit"] = _apu_to_headerstr(u.Unit(unit))
+        return image
         
     def copy(self):
         """
@@ -4040,31 +4435,56 @@ class PVdiagram:
             unit (str): the unit of the spatial axis that will be returned.
                         Defualt (None) is to use the same unit as one read from the FITS file.
         Returns:
-            The spectral axis (ndarray).
+            The spatial axis (ndarray).
         """
-        # create axes in arcsec
-        xstart, xend = -self.nx/2*self.dx, self.nx/2*self.dx
-        xaxis = np.round(np.arange(xstart, xend, self.dx), 6)
+        # create axes in original unit
+        xaxis = self.dx * (np.arange(self.nx)-self.refnx+1)
+        xaxis = np.round(xaxis, 6)
         
         # convert units to specified
         if unit is not None:
             xaxis = u.Quantity(xaxis, self.unit).to_value(unit)
         return xaxis
     
-    def get_vaxis(self, freq=False):
+    def get_vaxis(self, specunit=None):
         """
-        Get the spectral axis of the image.
+        To get the vaxis of the data cube.
         Parameters:
-            freq (bool): True to return the spectral axis as frequnecy (unit: Hz.)
-                         False to return the spectral axis as velocity (unit: km/s.)
+            specunit (str): the unit of the spectral axis. 
+                            Default is to use the same as the header unit.
         Returns:
-            The spectral axis (ndarray).
+            vaxis (ndarray): the spectral axis of the data cube.
         """
-        vaxis = np.round(np.arange(self.vrange[0], self.vrange[1]+self.dv, self.dv), 6)
-        if freq:
-            clight = const.c.to_value(u.km/u.s)
-            return self.restfreq*clight/(clight+vaxis)
+        vaxis = np.arange(self.vrange[0], self.vrange[-1]+self.dv, self.dv)
+        if specunit is None:
+            if u.Unit(self.specunit).is_equivalent(u.km/u.s):
+                round_mask = np.isclose(vaxis, np.round(vaxis, 5))
+                vaxis[round_mask] = np.round(vaxis, 5)
+            return vaxis
+        try:
+            # attempt direct conversion
+            vaxis = u.Quantity(vaxis, self.specunit).to_value(specunit)
+        except UnitConversionError:
+            # if that fails, try using equivalencies
+            equiv = u.doppler_radio(self.restfreq*u.Hz)
+            vaxis = u.Quantity(vaxis, self.specunit).to_value(specunit, equivalencies=equiv)
+        if u.Unit(specunit).is_equivalent(u.km/u.s):
+            round_mask = np.isclose(vaxis, np.round(vaxis, 5))
+            vaxis[round_mask] = np.round(vaxis, 5)
+            return vaxis
         return vaxis
+    
+    def conv_specunit(self, specunit, inplace=False):
+        """
+        Convert the spectral axis into the desired unit.
+        """
+        image = self if inplace else self.copy()
+        vaxis = image.get_vaxis(specunit=specunit)
+        image.fileinfo["dv"] = vaxis[1]-vaxis[0]
+        image.fileinfo["vrange"] = vaxis[[0, -1]].tolist()
+        image.fileinfo["specunit"] = _apu_to_headerstr(u.Unit(specunit))
+        image.__updateparams()
+        return image
     
     def set_data(self, data, inplace=False):
         """
@@ -4083,6 +4503,29 @@ class PVdiagram:
         newimg = self.copy()
         newimg.data = data
         return newimg
+    
+    def set_threshold(self, threshold=None, minimum=True, inplace=False):
+        """
+        To mask the intensities above or below this threshold.
+        Parameters:
+            threshold (float): the value of the threshold. Default is to use three times the rms noise level.
+            minimum (bool): True to remove intensities below the threshold. 
+                            False to remove intensities above the threshold.
+            inplace (bool): True to modify the data in-place. False to return a new image.
+        Returns:
+            Image with the masked data.
+        """
+        if threshold is None:
+            threshold = 3*self.noise()
+        if inplace:
+            if minimum:
+                self.data = np.where(self.data<threshold, np.nan, self.data)
+            else:
+                self.data = np.where(self.data<threshold, self.data, np.nan)
+            return self
+        if minimum:
+            return PVdiagram(fileinfo=self.fileinfo, data=np.where(self.data<threshold, np.nan, self.data))
+        return PVdiagram(fileinfo=self.fileinfo, data=np.where(self.data<threshold, self.data, np.nan))
     
     def noise(self, sigma=3., plthist=False, shownoise=False, printstats=False, bins='auto', 
               gaussfit=False, curvecolor="crimson", curvelw=0.6, fixmean=True, histtype='step', 
@@ -4109,11 +4552,14 @@ class PVdiagram:
         """
         bunit = self.bunit.replace(".", " ")
         
-        clipped_data = sigma_clip(self.data, sigma=sigma, maxiters=10000, masked=False, axis=(0, 1, 2, 3))
+        clipped_data = sigma_clip(self.data, sigma=sigma, maxiters=10000, masked=False, axis=(0, 1, 2))
         bg_image = self.set_data(clipped_data, inplace=False)
         mean = np.nanmean(clipped_data)
         rms = np.sqrt(np.nanmean(clipped_data**2))
         std = np.nanstd(clipped_data)
+        
+        if not rms:
+            raise Exception("Sigma clipping failed. It is likely that most noise has been masked.")
         
         if printstats:
             print(15*"#" + "Noise Statistics" + 15*"#")
@@ -4184,13 +4630,13 @@ class PVdiagram:
         if inplace:
             self.header["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
             self.header["beam"] = newbeam
-            self.header["unit"] = u.Unit(unit).to_string()
+            self.header["unit"] = _apu_to_headerstr(u.Unit(unit))
             self.__updateparams()
             return self
         newfileinfo = copy.deepcopy(self.fileinfo)
         newfileinfo["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
         newfileinfo["beam"] = newbeam
-        newfileinfo["unit"] = u.Unit(unit).to_string()
+        newfileinfo["unit"] = _apu_to_headerstr(u.Unit(unit).to_string())
         return PVdiagram(fileinfo=newfileinfo, data=self.data)
     
     def conv_bunit(self, bunit, inplace=False):
@@ -4203,58 +4649,110 @@ class PVdiagram:
         Returns:
             A new image with the desired unit.
         """
-        area_per_beam = self.beam_area(unit=None)
-        area_per_pix = self.pixel_area(unit=None)
-        equiv_bt = u.equivalencies.brightness_temperature(frequency=self.restfreq*u.Hz, beam_area=area_per_beam)
-        equiv_pix = u.pixel_scale(u.Quantity(np.abs(self.dx), self.unit)**2/u.pixel)
-        equiv_ba = u.beam_angular_area(area_per_beam)
-        try:
-            newdata = u.Quantity(self.data, self.bunit).to(bunit)
-        except:
-            try:
-                newdata = u.Quantity(self.data, self.bunit).to(bunit, equivalencies=equiv_bt)
-            except:
-                try:
-                    newdata = u.Quantity(self.data, self.bunit).to(bunit, equivalencies=equiv_pix)
-                except:
-                    try: 
-                        newdata = u.Quantity(self.data, self.bunit).to(bunit, equivalencies=equiv_ba)
-                    except:
-                        try:
-                            newdata = u.Quantity(self.data, self.bunit).to("Jy/sr", equivalencies=equiv_ba)
-                            newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_pix)
-                        except:
-                            try:
-                                newdata = u.Quantity(self.data, self.bunit).to("Jy/sr", equivalencies=equiv_pix)
-                                newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_ba)
-                            except:
-                                try:
-                                    newdata = u.Quantity(self.data, self.bunit).to("Jy/sr", equivalencies=equiv_bt)
-                                    newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_pix)
-                                except:
-                                    newdata = u.Quantity(self.data, self.bunit).to("Jy/sr", equivalencies=equiv_pix)
-                                    newdata = u.Quantity(newdata).to(bunit, equivalencies=equiv_bt)
+        # string to astropy units 
+        bunit = _to_apu(bunit)
+        oldunit = _to_apu(self.bunit)
         
+        # equivalencies
+        equiv_bt = u.equivalencies.brightness_temperature(frequency=self.restfreq*u.Hz, 
+                                                          beam_area=self.beam_area())
+        equiv_pix = u.pixel_scale(u.Quantity(np.abs(self.dx), self.unit)**2/u.pixel)
+        equiv_ba = u.beam_angular_area(self.beam_area())
+        equiv = [equiv_bt, equiv_pix, equiv_ba]
+
+        # factors
+        factor_bt = (1*u.Jy/u.beam).to(u.K, equivalencies=equiv_bt) / (u.Jy/u.beam)
+        factor_pix = (1*u.pixel).to(u.rad**2, equivalencies=equiv_pix) / (u.pixel)
+        factor_ba = (1*u.beam).to(u.rad**2, equivalencies=equiv_ba) / (u.beam)
+        factor_pix2bm = factor_pix / factor_ba
+        factor_Jypix2K = factor_pix2bm / factor_bt
+        factor_Jysr2K = factor_bt*factor_ba
+        factors = [factor_bt, factor_pix, factor_ba, factor_pix2bm, 
+                   factor_Jypix2K, factor_Jysr2K]
+        
+        # convert
+        if isinstance(self.data, u.Quantity):
+            olddata = self.data.copy()
+        else:
+            olddata = u.Quantity(self.data, oldunit)
+        newdata = _convert_Bunit(olddata, newunit=bunit, 
+                                 equivalencies=equiv, factors=factors)
+        
+        if newdata is None:
+            raise UnitConversionError(f"Failed to convert intensity unit to {bunit.to_string()}")
+
         # return and set values
-        newdata = newdata.value
-        if inplace:
-            self.data = newdata
-            self.header["bunit"] = bunit
-            self.__updateparams()
-            return self
-        newfileinfo = copy.deepcopy(self.fileinfo)
-        newfileinfo["bunit"] = bunit
-        newimage = PVdiagram(fileinfo=newfileinfo, data=newdata)
+        if not isinstance(self.data, u.Quantity):
+            newdata = newdata.value
+            
+        newimage = self if inplace else self.copy()
+        newimage.data = newdata
+        newimage.header["bunit"] = _apu_to_headerstr(bunit)
+        newimage.__updateparams()
         return newimage
     
-    def imview(self, contourmap=None, cmap="inferno", nancolor="k", crms=None, clevels=np.arange(3, 21, 3),
-               ccolor="w", clw=1., dpi=500, cbaron=True, cbarloc="right", cbarpad="0%", vsys=None, 
-               xlim=None, vlim=None, xcenter=0., vlineon=True, xlineon=True, cbarlabelon=True, cbarwidth='5%',
-               cbarlabel=None, fontsize=18, labelsize=18, figsize=(11.69, 8.27), plotres=True, 
-               xlabelon=True, vlabelon=True, xlabel=None, vlabel=None, offset_as_hor=False, 
+    def _mean_velocities_at_position(self):
+        # intiialize variables
+        vaxis = self.vaxis.copy()
+        data = self.data[0]
+        nv = self.nv
+        nx = self.nx
+
+        # broadcast vaxis
+        vv = vaxis[:, None]
+        vv = np.broadcast_to(vv, (nv, nx))
+        
+        # mean velocity at each position, weighted by intensity
+        mean_vel = np.nansum(vv*data, axis=0)/np.nansum(data, axis=0)  # size: nx
+        
+        # calculate standard error
+        N = np.count_nonzero(~np.isnan(data), axis=0)  # number of observations
+        weighted_sqdev = data*(vv-mean_vel[None, :])**2  # weighted deviations squared
+        weighted_var = np.nansum(weighted_sqdev, axis=0)/np.nansum(data, axis=0)  # weighted variance
+        weighted_sd = np.sqrt(weighted_var)
+        std_err = weighted_sd / np.sqrt(N-1)
+        
+        return mean_vel, std_err
+           
+    def _mean_positions_at_velocity(self):
+        # intiialize variables
+        xaxis = self.xaxis.copy()
+        data = self.data[0]
+        nv = self.nv
+        nx = self.nx
+
+        # broadcast vaxis
+        xx = xaxis[None, :]
+        xx = np.broadcast_to(xx, (nv, nx))
+        
+        # mean velocity at each position, weighted by intensity
+        mean_offset = np.nansum(xx*data, axis=1)/np.nansum(data, axis=1)  # size: nx
+        
+        # calculate standard error
+        N = np.count_nonzero(~np.isnan(data), axis=1)  # number of observations
+        weighted_sqdev = data*(xx-mean_offset[:, None])**2  # weighted deviations squared
+        weighted_var = np.nansum(weighted_sqdev, axis=1)/np.nansum(data, axis=1)  # weighted variance
+        weighted_sd = np.sqrt(weighted_var)
+        std_err = weighted_sd / np.sqrt(N-1)
+        
+        return mean_offset, std_err        
+    
+    def __get_offset_resolution(self, pa=None):
+        if pa is None:
+            return np.sqrt(self.bmaj*self.bmin)  # simply take average if pa is not specified
+        angle = np.deg2rad(pa-self.bpa)
+        aa = np.square(np.sin(angle)/self.bmin)
+        bb = np.square(np.cos(angle)/self.bmaj)
+        return np.sqrt(1/(aa+bb))
+        
+    def imview(self, contourmap=None, cmap="inferno", vmin=None, vmax=None, nancolor="k", crms=None, 
+               clevels=np.arange(3, 21, 3), ccolor="w", clw=1., dpi=500, cbaron=True, cbarloc="right", 
+               cbarpad="0%", vsys=None, xlim=None, vlim=None, xcenter=0., vlineon=True, xlineon=True, 
+               cbarlabelon=True, cbarwidth='5%', cbarlabel=None, fontsize=18, labelsize=18, figsize=(11.69, 8.27), 
+               plotres=True, xlabelon=True, vlabelon=True, xlabel=None, vlabel=None, offset_as_hor=False, 
                aspect_ratio=1.1, axeslw=1.3, tickwidth=1.3, tickdirection="in", ticksize=5., 
                xticks=None, vticks=None, title=None, titlepos=0.85, ha="left", va="top", txtcolor="w", 
-               refline_color="w", refline_width=None, plot=True):
+               refline_color="w", pa=None, refline_width=None, subtract_vsys=False, plot=True):
         """
         Display a Position-Velocity (PV) diagram.
 
@@ -4309,18 +4807,41 @@ class PVdiagram:
             matplotlib.axes.Axes: The Axes object of the plot if 'plot' is True, allowing further customization.
         """
         # initialize parameters:
-        clevels = clevels if isinstance(clevels, np.ndarray) else np.array(clevels)
-        crms = contourmap.noise() if (crms is None and contourmap is not None) else crms
+        if not isinstance(clevels, np.ndarray):
+            clevels = np.array(clevels)
+        if pa is None:
+            pa = self.pa
+        if subtract_vsys and vsys is None:
+            raise ValueError("'vsys' parameter cannot be None if subtract_vsys = True.")
+        if crms is None and contourmap is not None:
+            try:
+                crms = contourmap.noise()
+                bunit = self.bunit.replace(".", " ")
+                print(f"Estimated base contour level (rms): {crms:.4e} [{bunit}]")
+            except Exception:
+                contourmap = None
+                print("Failed to estimate RMS noise level of contour map.")
+                print("Please specify base contour level using 'crms' parameter.")
         contmap = contourmap.copy() if contourmap is not None else contourmap
         xlim = self.maxxlim if xlim is None else xlim
-        vlim = self.maxvlim if vlim is None else vlim
+        if vlim is None:
+            if subtract_vsys:
+                vlim = np.array(self.maxvlim)-vsys
+            else:
+                vlim = self.maxvlim
         if vlabel is None:
-            vlabel = r'$\mathrm{LSR\ velocity\ (km\ s^{-1})}$' \
-                        if vsys is None else r'$v_{\rm obs}-v_{\rm sys}$ ($\rm km~s^{-1}$)'
-        xlabel = f'Offset ({self.unit})' if xlabel is None else xlabel
-        cbarlabel = f"({u.Unit(self.bunit):latex_inline})" if cbarlabel is None else cbarlabel
-        refline_width = clw if refline_width is None else refline_width
-        vres, xres = self.dv, np.sqrt(self.bmaj*self.bmin)
+            if subtract_vsys:
+                vlabel = r"$v_{\rm obs}-v_{\rm sys}$ " + "(" + _apu_to_str(u.Unit(self.specunit)) + ")"
+            else:
+                vlabel = "LSR velocity " + "(" + _apu_to_str(u.Unit(self.specunit)) + ")"
+        
+        if xlabel is None:
+            xlabel = f'Offset ({self.unit})'
+        if cbarlabel is None:
+            cbarlabel = f"({u.Unit(self.bunit):latex_inline})"
+        if refline_width is None:
+            refline_width = clw
+        vres, xres = self.dv, self.__get_offset_resolution(pa=pa)
         cmap = copy.deepcopy(mpl.colormaps[cmap]) 
         cmap.set_bad(color=nancolor)
                 
@@ -4335,9 +4856,9 @@ class PVdiagram:
                   'xtick.major.top': True,
                   'figure.figsize': figsize,
                   'figure.dpi': dpi,
-                  'font.family': 'Times New Roman',
-                  'mathtext.fontset': 'stix', #"Times New Roman"
-                  'mathtext.tt':' Times New Roman',
+                  'font.family': _fontfamily,
+                  'mathtext.fontset': _mathtext_fontset,
+                  'mathtext.tt': _mathtext_tt,
                   'axes.linewidth': axeslw,
                   'xtick.major.width': tickwidth,
                   'xtick.major.size': ticksize,
@@ -4354,11 +4875,14 @@ class PVdiagram:
         # plot image
         if offset_as_hor:
             imextent = [self.imextent[2], self.imextent[3], self.imextent[0], self.imextent[1]]
-            colordata = self.data[0, :, :, 0]
-            climage = ax.imshow(colordata, cmap=cmap, extent=imextent, origin='lower')
+            if subtract_vsys:
+                imextent[3] -= vsys
+                imextent[4] -= vsys
+            colordata = self.data[0, :, :]
+            climage = ax.imshow(colordata, cmap=cmap, extent=imextent, origin='lower', vmin=vmin, vmax=vmax)
             if contmap is not None:
                 contextent = [contmap.imextent[2], contmap.imextent[3], contmap.imextent[0], contmap.imextent[1]]
-                contdata = contmap.data[0, :, :, 0].reshape(contmap.nv, contmap.nx)
+                contdata = contmap.data[0, :, :]
                 ax.contour(contdata, colors=ccolor, origin='lower', extent=contextent, 
                            levels=crms*clevels, linewidths=clw)
             
@@ -4374,15 +4898,22 @@ class PVdiagram:
                 ax.plot([xcenter, xcenter], [vlim[0], vlim[1]], color=refline_color, 
                         ls='dashed', lw=refline_width)
             if vlineon and vsys is not None:
-                ax.plot([xlim[0], xlim[1]], [vsys, vsys], color=refline_color, 
-                        ls='dashed', lw=refline_width)
+                if subtract_vsys:
+                    ax.plot([xlim[0], xlim[1]], [0, 0], color=refline_color, 
+                            ls='dashed', lw=refline_width)
+                else:
+                    ax.plot([xlim[0], xlim[1]], [vsys, vsys], color=refline_color, 
+                            ls='dashed', lw=refline_width)
         else:
-            imextent = self.imextent
-            colordata = self.data[0, :, :, 0].T
-            climage = ax.imshow(colordata, cmap=cmap, extent=imextent, origin='lower')
+            imextent = self.imextent[:]
+            if subtract_vsys:
+                imextent[0] -= vsys
+                imextent[1] -= vsys
+            colordata = self.data[0, :, :].T
+            climage = ax.imshow(colordata, cmap=cmap, extent=imextent, origin='lower', vmin=vmin, vmax=vmax)
             if contmap is not None:
                 contextent = contmap.imextent
-                contdata = contmap.data[0, :, :, 0].T
+                contdata = contmap.data[0, :, :].T
                 ax.contour(contdata, colors=ccolor, origin='lower', extent=contextent, 
                            levels=crms*clevels, linewidths=clw)
             ax.set_xlabel(vlabel, fontsize=fontsize)
@@ -4394,8 +4925,12 @@ class PVdiagram:
             if xticks is not None:
                 ax.set_vticks(xticks)
             if vlineon and vsys is not None:
-                ax.plot([vsys, vsys], [xlim[0], xlim[1]], color=refline_color, 
+                if subtract_vsys:
+                    ax.plot([0, 0], [xlim[0], xlim[1]], color=refline_color, 
                         ls='dashed', lw=refline_width)
+                else:
+                    ax.plot([vsys, vsys], [xlim[0], xlim[1]], color=refline_color, 
+                            ls='dashed', lw=refline_width)
             if xlineon:
                 ax.plot([vlim[0], vlim[1]], [xcenter, xcenter], color=refline_color, 
                         ls='dashed', lw=refline_width)
@@ -4429,7 +4964,7 @@ class PVdiagram:
             xmidpt = (hormin + hormax)/2
             vertmin, vertmax = ax.get_ylim()
             yfov = (vertmax - vertmin)/2
-            ymidpt = (vertmax+vertmin)/2
+            ymidpt = (vertmax + vertmin)/2
             titlex, titley = xmidpt-xfov*titlepos, ymidpt+yfov*titlepos
             ax.text(x=titlex, y=titley, s=title, ha=ha, va=va, color=txtcolor, fontsize=fontsize)
 
@@ -4438,11 +4973,11 @@ class PVdiagram:
         
         return ax
     
-    def line_info(self):
+    def line_info(self, **kwargs):
         """
         This method searches for the molecular line data from the Splatalogue database
         """
-        return search_molecular_line(self.restfreq, unit="Hz")
+        return search_molecular_line(self.restfreq, unit="Hz", **kwargs)
     
     def get_hduheader(self):
         """
@@ -4752,6 +5287,7 @@ class Region:
             pa = -np.rad2deg(np.arctan(dx/dy)) if dy != 0 else (90. if dx > 0 else -90.)
             self.center = center = (start[0]+end[0])/2, (start[1]+end[1])/2
             self.relative = relative = False
+            self.pa = pa
             self.header = {"shape": shape,
                            "start": start,
                            "end": end,
@@ -4834,11 +5370,9 @@ def plt_1ddata(xdata=None, ydata=None, xlim=[], ylim=[], mean_center=False, titl
               'axes.linewidth': borderwidth,
               'xtick.major.width': borderwidth,
               'ytick.major.width': borderwidth,
-#               'xtick.minor.width': 1.0,
-#               'ytick.minor.width': 1.0,
-               'xtick.major.size': ticksize,
-               'ytick.major.size': ticksize,
-                }
+              'xtick.major.size': ticksize,
+              'ytick.major.size': ticksize,
+              }
     rcParams.update(params)
     
     fig, ax = plt.subplots(nrows=1,ncols=1,sharex=False,sharey=False)
@@ -5071,51 +5605,366 @@ def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=[], ylim=[],
     return ax
 
 
-def search_molecular_line(restfreq, unit="Hz", printinfo=True):
+# duplicate function
+def exportfits(image, *args, **kwargs):
+    return image.exportfits(*args, **kwargs)
+
+
+def search_molecular_line(restfreq, unit="GHz", printinfo=True):
     """
     Function to search for molecular line info given a rest frequency.
+    This function requires internet connection.
     """
-    global splatalogue_df
+    # import data base
+    from astroquery.splatalogue import Splatalogue 
     
+    # error checking for rest frequency
     if restfreq is None:
-        raise ValueError("The rest frequnecy cannot be 'None'.")
-    restfreq = u.Quantity(restfreq, unit).to_value(u.GHz)
+        raise ValueError("The rest frequency cannot be 'None'.")
+        
+    if unit != "GHz":
+        restfreq = u.Quantity(restfreq, unit).to_value(u.GHz)   # convert unit to GHz
     
-    # only start searching if the method is called for the first time
-    if splatalogue_df is None:
-        print("Reading Splatalogue data...")
-        import pandas as pd
-        splatalogue_df = pd.read_csv("http://www.cv.nrao.edu/~cbrogan/splat_for_casa/" + \
-                                     "splatalogue_known_1to950GHz.tsv", delimiter="\t")
-        print()
-    
-    # search for index of best-match result.
-    idx = np.nanargmin(np.abs(splatalogue_df["Freq in GHz"]-restfreq))
+    # search for best-match result.
+    possible_lines = Splatalogue.query_lines(restfreq*u.GHz-0.01*u.GHz, restfreq*u.GHz+0.01*u.GHz,
+                                             show_upper_degeneracy=True, only_NRAO_recommended=False)
+    freq1 = possible_lines["Freq-GHz(rest frame,redshifted)"]
+    freq2 = possible_lines["Meas Freq-GHz(rest frame,redshifted)"]
+    possible_restfreq = np.where(np.ma.is_masked(freq1), freq2, freq1)
+    error = np.abs(possible_restfreq - restfreq)
+    idx = np.nanargmin(error)
+    best_match_result = possible_lines[idx]
     
     # find information of the line 
-    species = splatalogue_df["Species"][idx]
-    chemical_name = splatalogue_df["Chemical Name"][idx]
-    freq = splatalogue_df["Freq in GHz"][idx]
-    qns = splatalogue_df["Resolved QNs"][idx]
-    log10_Aij = splatalogue_df["Log<sub>10</sub> (A<sub>ij</sub>)"][idx]
+    species = best_match_result["Species"]
+    chemical_name = best_match_result["Chemical Name"]
+    freq = possible_restfreq[idx]
+    freq_err = best_match_result["Meas Freq Err(rest frame,redshifted)"]
+    qns = best_match_result["Resolved QNs"]
+    CDMS_JPL_intensity = best_match_result["CDMS/JPL Intensity"]
+    Sijmu_sq = best_match_result["S<sub>ij</sub>&#956;<sup>2</sup> (D<sup>2</sup>)"]
+    Sij = best_match_result["S<sub>ij</sub>"]
+    log10_Aij = best_match_result["Log<sub>10</sub> (A<sub>ij</sub>)"]
     Aij = 10**log10_Aij
-    Sijmu_sq = splatalogue_df["S<sub>ij</sub>&#956;<sup>2</sup> (D<sup>2</sup>)"][idx]
-    lerg = splatalogue_df["E<sub>L</sub> (K)"][idx]
-    uerg = splatalogue_df["E<sub>U</sub> (K)"][idx]
+    Sijmu_sq = best_match_result["S<sub>ij</sub>&#956;<sup>2</sup> (D<sup>2</sup>)"]
+    Lovas_AST_intensity = best_match_result["Lovas/AST Intensity"]
+    lerg = best_match_result["E_L (K)"]
+    uerg = best_match_result["E_U (K)"]
+    gu = best_match_result["Upper State Degeneracy"]
+    source = best_match_result["Linelist"]
+    
+    # find species id
+    species_ids = Splatalogue.get_species_ids(species.split("v=")[0])
+    species_id = None
+    for key, value in species_ids.items():
+        str_lst = key[6:].split(" - ")
+        if str_lst[0].replace(" ", "") == species and str_lst[1] == chemical_name:
+            species_id = value
+            break
+    if species_id is None:
+        print("Failed to find species ID / rotational constants. \n")
+        constants = None
+    else:
+        # find rotational constant
+        try:
+            # search the web for rotational constants 
+            from urllib.request import urlopen
+            url = f"https://splatalogue.online/species_metadata_displayer.php?species_id={species_id}"
+            page = urlopen(url)
+            html = page.read().decode("utf-8")
+        except:
+            print(f"Failed to read webpage: {url} \n")
+            print(f"Double check internet connection / installation of 'urllib' module.")
+            url = None
+            constants = None
+        else:
+            lines = np.array(html.split("\n"))
+            a_mask = np.char.find(lines, "<td>A</td><td>") != -1
+            b_mask = np.char.find(lines, "<td>B</td><td>") != -1
+            c_mask = np.char.find(lines, "<td>C</td><td>") != -1
+            if np.all(~(a_mask|b_mask|c_mask)):
+                constants = None
+                print("Failed to find rotational constants. \n")
+            else:
+                # get rotational A constant
+                if np.any(a_mask):
+                    a_const = float("".join(char for char in lines[a_mask][0] if char.isnumeric() or char == "."))
+                else:
+                    a_const = None
+                # get rotational B constant
+                if np.any(b_mask):
+                    b_const = float("".join(char for char in lines[b_mask][0] if char.isnumeric() or char == "."))
+                else:
+                    b_const = None
+                # get rotational C constant
+                if np.any(c_mask):
+                    c_const = float("".join(char for char in lines[c_mask][0] if char.isnumeric() or char == "."))
+                else:
+                    c_const = None
+                constants = (a_const, b_const, c_const)
+                
+    # store data in a list to be returned and convert masked data to NaN
+    data = [species, chemical_name, freq, freq_err, qns, CDMS_JPL_intensity, Sijmu_sq,
+            Sij, Aij, Lovas_AST_intensity, lerg, uerg, gu, constants, source]
+    
+    for i, item in enumerate(data):
+        if np.ma.is_masked(item):
+            data[i] = np.nan
+    
+    # error as warning
+    if not np.isclose(error[idx], 0.):
+        print("WARNING: This image may not be of a molecular line. \n")
     
     # print information if needed
     if printinfo:
         print(15*"#" + "Line Information" + 15*"#")
-        print(f"Species: {species}")
-        print(f"Chemical name: {chemical_name}")
-        print(f"Frequency: {freq} [GHz]")
-        print(f"Resolved quantum numbers: {qns}")
-        print(f"Sij mu^2: {Sijmu_sq} [Debye]")
-        print(f"Einstein A coefficient (Aij): {Aij:5e} [1/s]")
-        print(f"Lower energy level: {lerg} [K]")
-        print(f"Upper energy level: {uerg} [K]")
+        print(f"Species ID: {species_id}")
+        print(f"Species: {data[0]}")
+        print(f"Chemical name: {data[1]}")
+        print(f"Frequency: {data[2]} +/- {data[3]} [GHz]")
+        print(f"Resolved QNs: {data[4]}")
+        if not np.isnan(data[5]) and data[5] != 0:
+            print(f"CDMS/JPL Intensity: {data[5]}")        
+        print(f"Sij mu2: {data[6]} [Debye2]")
+        print(f"Sij: {data[7]}")
+        print(f"Einstein A coefficient (Aij): {data[8]:.3e} [1/s]")
+        if not np.isnan(data[9]) and data[9] != 0:
+            print(f"Lovas/AST intensity: {data[9]}")
+        print(f"Lower energy level: {data[10]} [K]")
+        print(f"Upper energy level: {data[11]} [K]")
+        print(f"Upper state degeneracy (gu): {data[12]}")
+        if data[13] is not None:
+            print("Rotational constants:")
+            if data[13][0] is not None:
+                print(f"    A0 = {data[13][0]} [MHz]")
+            if data[13][1] is not None:
+                print(f"    B0 = {data[13][1]} [MHz]")
+            if data[13][2] is not None:
+                print(f"    C0 = {data[13][2]} [MHz]")
+        print(f"Source: {data[14]}")
         print(46*"#")
-        print()
+        if url is not None:
+            print(f"Link to species data: {url} \n")
     
     # return data
-    return species, chemical_name, freq, qns, Sijmu_sq, Aij, lerg, uerg
+    return tuple(data)
+
+
+def planck_function(v, T):
+    """
+    Public function to calculate the planck function value
+    Parameters:
+        v (float): frequency of source [GHz]
+        T (float): temperature [K]
+    Returns:
+        Planck function value [Jy]
+    """
+    # constants
+    h = const.h.cgs
+    clight = const.c.cgs
+    k = const.k_B.cgs
+    
+    # assign units
+    if not isinstance(v, u.Quantity):
+        v *= u.GHz
+    if not isinstance(T, u.Quantity):
+        T *= u.K
+    
+    # calculate
+    Bv = 2*h*v**3/clight**2 / (np.exp(h*v/k/T)-1)
+    
+    # return value
+    return Bv.to_value(u.Jy)
+
+
+def H2_column_density(continuum, T_dust, k_v):
+    """
+    Public function to calculate the H2 column density from continuum data.
+    Parameters:
+        continuum (Spatialmap): the continuum map
+        T_dust (float): dust temperature [K]
+        k_v (float): dust-mass opacity index [cm^2/g]
+    Returns:
+        H2_cd (Spatialmap): the H2 column density map [cm^-2]
+    """
+    # constants
+    m_p = const.m_p.cgs  # proton mass
+    mmw = 2.8            # mean molecular weight
+    
+    # convert continuum to brightness temperature
+    I_v = continuum.conv_bunit("Jy/sr")
+    if not isinstance(I_v.data, u.Quantity):
+        I_v *= u.Jy
+    v = continuum.restfreq * u.Hz
+    
+    # assign units:
+    if not isinstance(T_dust, u.Quantity):
+        T_dust *= u.K
+    if not isinstance(k_v, u.Quantity):
+        k_v *= u.cm**2 / u.g
+    
+    # start calculating
+    B_v = planck_function(v=v.to_value(u.GHz), T=T_dust)*u.Jy
+    H2_cd = (I_v / (k_v*B_v*mmw*m_p)).to_value(u.cm**-2)
+    return H2_cd
+
+
+def __Qrot_linear(T, B0):
+    """
+    Private function to calculate rotational partition function value of a linear molecule.
+    Source: https://doi.org/10.48550/arXiv.1501.01703
+    Parameters:
+        T: excitation temperature (K)
+        B0: rotational constant of the molecule (MHz)
+    Returns:
+        Value of rotational partition function.
+    """ 
+    # constants
+    k = const.k_B.cgs
+    h = const.h.cgs
+    
+    # assign units
+    if not isinstance(T, u.Quantity):
+        T *= u.K
+    if not isinstance(B0, u.Quantity):
+        B0 *= u.MHz
+        
+    # warning checking
+    if T <= 2.*u.K:
+        print("WARNING: Approximation error of partition function is greater than 1%.")
+    
+    # linear diatomic molecules
+    Qrot = k*T/h/B0 + 1/3 + 1/15*(h*B0/k/T) + 4/315*(h*B0/k/T)**2 + 1/315*(h*B0/k/T)**3
+    return Qrot.cgs.value
+
+
+def __Qrot_linear_polyatomic(T, B0):
+    """
+    Private function to calculate rotational partition function value of linear polyatomic molecule.
+    Source: https://doi.org/10.48550/arXiv.1501.01703
+    Parameters:
+        T: excitation temperature (K)
+        B0: rotational constant of the molecule (MHz)
+    Returns:
+        Value of rotational partition function.
+    """ 
+    # constants
+    k = const.k_B.cgs
+    h = const.h.cgs
+    
+    # assign units
+    if not isinstance(T, u.Quantity):
+        T *= u.K
+    if not isinstance(B0, u.Quantity):
+        B0 *= u.MHz
+        
+    # warning checking
+    if T <= 3.5*u.K:
+        print("WARNING: Approximation error of partition function is greater than 1%.")
+    
+    # linear diatomic molecules
+    Qrot = k*T/h/B0 * np.exp(h*B0/3/k/T)
+    return Qrot.cgs.value
+
+
+def J_v(v, T):
+    """
+    Public function to calculate the Rayleigh-Jeans equivalent temperature.
+    Parameters:
+        v (float): frequency (GHz)
+        T (float): temperature (K)
+    Returns:
+        Jv (float): Rayleigh-Jeans equivalent temperature (K)
+    """
+    # constants
+    k = const.k_B.cgs
+    h = const.h.cgs
+    
+    # assign unit
+    if not isinstance(v, u.Quantity):
+        v *= u.GHz
+    if not isinstance(T, u.Quantity):
+        T *= u.K
+    
+    # calculate R-J equivalent temperature
+    Jv = (h*v/k) / (np.exp(h*v/k/T)-1)
+    return Jv.to(u.K)
+
+
+def column_density_linear_optically_thin(moment0_map, T_ex, T_bg=2.726, R_i=1, f=1.):
+    """
+    Function to calculate the column density of a linear molecule using optically thin assumption.
+    Source: https://doi.org/10.48550/arXiv.1501.01703
+    Parameters:
+        moment0_map (Spatialmap): the moment 0 map
+        T_ex (float): the excitation temperature [K]
+        T_bg (float): background temperature [K]. 
+                      Default is to use cosmic microwave background (2.726 K).
+        R_i (float): Relative intensity of transition. 
+                     Default is to consider simplest case (= 1)
+        f (float): a correction factor accounting for source area being smaller than beam area.
+                   Default = 1 assumes source area is larger than beam area.
+    Returns:
+        cd_img (Spatialmap): the column density map
+    """
+    # constants
+    k = const.k_B.cgs
+    h = const.h.cgs
+    
+    # assign units
+    if not isinstance(T_ex, u.Quantity):
+        T_ex *= u.K
+    if not isinstance(T_bg, u.Quantity):
+        T_bg *= u.K
+    moment0_map = moment0_map.conv_bunit("K.km/s")
+    
+    # get info
+    line_data = moment0_map.line_info(printinfo=True)
+    v = line_data[2]*u.GHz  # rest frequency
+    S_mu2 = line_data[6]*(1e-18**2)*(u.cm**5*u.g/u.s**2)  # S mu^2 * g_i*g_j*g_k [debye2]
+    E_u = line_data[11]*u.K  # upper energy level 
+    B0 = line_data[13][1]*u.MHz  # rotational constant
+    Q_rot = __Qrot_linear(T=T_ex, B0=B0)  # partition function
+        
+    # error checking to make sure molecule is linear
+    if line_data[13][0] is not None or line_data[13][2] is not None:
+        raise Exception("The molecule is not linear.")
+        
+    # calculate column density
+    aa = 3*h/(8*np.pi**3*S_mu2*R_i)
+    bb = Q_rot
+    cc = np.exp(E_u/T_ex) / (np.exp(h*v/k/T_ex)-1)
+    dd = 1 / (J_v(v=v, T=T_ex)-J_v(v=v, T=T_bg))
+    constant = aa*bb*cc*dd/f
+    cd_img = constant*(moment0_map*u.K*u.km/u.s)
+    cd_img = cd_img.to_value(u.cm**-2)
+    return cd_img
+
+
+def column_density_linear_optically_thick(moment0_map, T_ex, tau, T_bg=2.726, R_i=1, f=1):
+    """
+    Function to calculate the column density of a linear molecule using optically thick assumption.
+    Source: https://doi.org/10.48550/arXiv.1501.01703
+    Parameters:
+        moment0_map (Spatialmap): the moment 0 map
+        T_ex (float): the excitation temperature [K]
+        tau (float): gas optical depth
+        T_bg (float): background temperature [K]. 
+                      Default is to use cosmic microwave background (2.726 K).
+        R_i (float): Relative intensity of transition. 
+                     Default is to consider simplest case (= 1)
+        f (float): a correction factor accounting for source area being smaller than beam area.
+                   Default = 1 assumes source area is larger than beam area.
+    Returns:
+        cd_img (Spatialmap): the column density map
+    """
+    # calculate using optically thin assumption
+    cd_opt_thin = column_density_linear_optically_thin(moment0_map=moment0_map,
+                                                       T_ex=T_ex,
+                                                       T_bg=T_bg,
+                                                       R_i=R_i,
+                                                       f=f)
+    # correction factor, relates optically thin to optically thick case
+    corr_factor = tau/(1-np.exp(-tau))
+    cd_img = corr_factor*cd_opt_thin
+    return cd_img
