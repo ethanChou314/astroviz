@@ -13,7 +13,7 @@ FITS files can be read using the 'importfits' function or via the constructors o
 ```python
 import astroviz as av
 
-# importing via 'importfits' function (adapts to whichever image type the FITS file contains):
+# importing via the 'importfits' function (adapts to whichever image type the FITS file contains):
 datacube = av.importfits("test_fitsfiles/datacube.fits")
 continuum = av.importfits("test_fitsfiles/continuum.fits")
 pv = av.importfits("test_fitsfiles/pvdiagram.fits")
@@ -190,7 +190,7 @@ All image objects can be manipulated intuitively via built-in python operators!
 ```python
 # plotting a pv diagram after doing some operations
 manipulated_pv = (pv*2 + 3) / 4
-manipulated_pv.imview(vsys=1.4)  # notice the intensity is now twice the value.
+manipulated_pv.imview(vsys=1.4)
 
 # works with two different image!
 mom8 = datacube.immoments(moments=8)
