@@ -78,6 +78,10 @@ Unit conversion is also really simple, supporting various equivalencies (e.g., i
 # convert intensity units:
 continuum_bt = continuum.conv_bunit("K")  # equivalencies of brightness temperature/pixel/beam is supported!
 
+# other units like integrated intensity also works.
+moment_map = moment_map.conv_bunit("K.km/s")  # now in K.km/s
+moment_map = moment_map.conv_bunit("Jy/sr.m/s")  # can directly convert as long as the units are equivalent!
+
 # convert spatial units:
 continuum_bt = continuum_bt.conv_unit("arcmin")
 
@@ -196,6 +200,6 @@ mom1_withunits.imview(vcenter=1400, vrange=3000)
 ```
 
 Saving the image back into a FITS file:
-```
+```python
 mom8.exportfits("test_fitsfiles/moment8_image.fits", overwrite=True)
 ```
