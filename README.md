@@ -3,7 +3,8 @@ The Python module, **astroviz**, is a comprehensive tool for data analysis and v
 
 **Requirements** 
 * numpy
-* astropy 
+* astropy
+* scipy
 * matplotlib
 * astroquery (only needed for .line_info() method)
 * urllib (only needed for .line_info() method)
