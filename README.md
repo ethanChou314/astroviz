@@ -137,11 +137,12 @@ shifted_continuum = continuum.imshift((3, 2))  # the coordinate (3, 2) is now (0
 shifted_continuum = continuum.peakshift()  # this shifts the pixel with the maximum value to the center
 
 # Rotating images:
-rotated_img = continuum.rotate(-45)
+rotated_img = continuum.rotate(-45) # in degrees
 
 # Regridding images:
-mom0_regrid = .imregrid(continuum)  # using continuum as template
 mom0_regrid = mom0.imregrid(continuum)  # using continuum as template
+mom0_regrid = mom0.imregrid(imsize=[1000, 1000])  # also works if you specify image size
+mom0_regrid = mom0.imregrid(dx=-0.01, dy=0.01)  # also works if you specify cell size
 ```
 
 Viewing molecular line info is extremely easy with .line_info(), which finds data from the Splatalogue database:
