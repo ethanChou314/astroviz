@@ -58,8 +58,21 @@ extracted_pv = datacube.pvextractor(line)  # extract the pv diagram
 circle = av.Region(center=(0, 0), radius=1)
 continuum.imfit(circle, plt_residual=True)  # it can help you plot the residual!
 
-# View statistics in that region such as extrema, RMS, total flux, etc.:
+# View statistics in that region such as extrema, RMS, etc.:
 continuum.imstat(circle)
+"""
+Example output:
+###############Imstat Info###############
+NumPixels: 562500 [pix]
+Sum: 1.256645e+02 [Jy/beam km/s]
+Mean: 2.234036e-04 [Jy/beam km/s]
+StdDev: 4.131228e-03 [Jy/beam km/s]
+Min: -1.862170e-02 [Jy/beam km/s]
+Max: 1.459576e-01 [Jy/beam km/s]
+RMS: 4.137264e-03 [Jy/beam km/s]
+SumSq: 9.628285e+00 [(Jy/beam km/s)^2]
+#########################################
+"""
 
 # extract spectral profiles from data cubes:
 aperture = av.Region(center=(0, 0), length=5, width=3, pa=15, shape="box")  # create a box
@@ -175,15 +188,13 @@ Link to species data: https://splatalogue.online/species_metadata_displayer.php?
 
 All image objects can be manipulated intuitively via built-in python operators!
 ```python
-# plotting a pv diagram after multipling it by two:
+# plotting a pv diagram after doing some operations
 manipulated_pv = (pv*2 + 3) / 4
 manipulated_pv.imview(vsys=1.4)  # notice the intensity is now twice the value.
 
 # works with two different image!
 mom8 = datacube.immoments(moments=8)
 combined_image = mom0 + mom8
-combined_image = combined_image.peakshift()
-combined_image.imview(fov=3)
 ```
 
 Image objects can also work with numpy arrays and astropy units!
