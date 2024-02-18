@@ -187,6 +187,9 @@ combined_image.imview(fov=3)
 
 Image objects can also work with numpy arrays and astropy units!
 ```python
+import numpy as np
+from astropy import units as u
+
 # works with numpy functions
 print(np.nanmax(mom1[0, 0]))
 print(np.nanargmin(mom1))
