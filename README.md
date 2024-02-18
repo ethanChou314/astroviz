@@ -78,7 +78,7 @@ Unit conversion is also really simple, supporting various equivalencies (e.g., i
 # convert intensity units:
 continuum_bt = continuum.conv_bunit("K")  # equivalencies of brightness temperature/pixel/beam is supported!
 
-# other units like integrated intensity also works.
+# other units like integrated intensity also work!
 moment_map = moment_map.conv_bunit("K.km/s")  # now in K.km/s
 moment_map = moment_map.conv_bunit("Jy/sr.m/s")  # can directly convert as long as the units are equivalent!
 
