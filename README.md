@@ -10,7 +10,7 @@ The Python module, **astroviz**, is a comprehensive tool for data analysis and v
 
 # Examples
 FITS files can be read using the 'importfits' function or via the constructors of the 'PVdiagram', 'Spatialmap,' and 'Datacube' classes. Astroviz is capable of reading data up to three dimensions (PV Diagrams, Continuum Maps, Moment Maps, and Data Cubes). Here are some different ways of importing a FITS file:
-```
+```python
 import astroviz as av
 
 # importing via 'importfits' function (adapts to whichever image type the FITS file contains):
@@ -28,13 +28,13 @@ pv = av.importfits("pvdiagram.fits")
 ```
 
 Then, you can do a lot with these instances. For example, you can view the header information:
-```
+```python
 header = datacube.header  # this returns a dictionary, which is a summary of the full header
 hdu_header = datacube.get_hduheader()  # this returns the full header
 ```
 
 Viewing images is extremely simple! Check the docstrings for complete documentation of the parameters.
-```
+```python
 # Fonts can be set globally via the 'set_font' function. The default is Times New Roman.
 av.set_font("Arial")
 
@@ -45,7 +45,7 @@ pv.imview(vsys=1.4, vlim=[0, 2.5])
 ```
 
 The 'Region' class allows users to import a region via its constructor, which can then be used in various methods of the other instances. Users can also specify a DS9 directory to be imported.
-```
+```python
 # View what the region on the map looks like:
 ellipse = av.Region(center=(1, 3), semimajor=0.3, semiminor=0.1)
 datacube.view_region(ellipse)
@@ -74,7 +74,7 @@ print(region.header)
 ```
 
 Unit conversion is also really simple, supporting various equivalencies (e.g., intensity to brightness temperature, Jy/pixel to Jy/beam, etc.):
-```
+```python
 # convert intensity units:
 continuum_bt = continuum.conv_bunit("K")  # equivalencies of brightness temperature/pixel/beam is supported!
 
@@ -86,7 +86,7 @@ pv_mps = pv.conv_specunit("m/s")
 ```
 
 Noise estimation (with iterative sigma clipping) works on all image objects:
-```
+```python
 # The .noise() method returns the RMS noise level:
 rms = continuum.noise(printstats=True,  # print out noise statistics
                       plthist=True,     # plot noise on a histogram (number of pixels VS intensity)
@@ -110,7 +110,7 @@ continuum.imview(continuum,
 ```
 
 You can also make moment maps and extract spectral profiles from data cubes!
-```
+```python
 # list of moment maps to be outputted (using CASA definition)
 mom_maps = datacube.immoments(moments=moments[-1, 0, 1, 2, 4, 9, 11], threshold=3*datacube.noise())  # returns a list
 mom0 = mom_maps[1]
@@ -122,7 +122,7 @@ mom0.imview()
 ```
 
 Here are other ways you can manipulate images (these work primarily on the classes 'Datacube' and 'Spatialmap'):
-```
+```python
 # Convolution:
 convolved_continuum = continuum.imsmooth(bmaj=0.8, bmin=0.5, bpa=45)  # elliptical Gaussian convolution
 convolved_continuum = continuum.imsmooth(width=3, kernel="box")  # box convolution
@@ -141,11 +141,12 @@ mom0_regrid = mom0.imregrid(continuum)  # using continuum as template
 ```
 
 Viewing molecular line info is extremely easy with .line_info(), which finds data from the Splatalogue database:
-```
+```python
 datacube.line_info()
 
 """
-Output:
+Below is the output after calling the method:
+
 ###############Line Information###############
 Species ID: 245
 Species: C18O
@@ -168,7 +169,7 @@ Link to species data: https://splatalogue.online/species_metadata_displayer.php?
 ```
 
 All image objects can be manipulated intuitively via built-in python operators!
-```
+```python
 # plotting a pv diagram after multipling it by two:
 manipulated_pv = (pv*2 + 3) / 4
 manipulated_pv.imview(vsys=1.4)  # notice the intensity is now twice the value.
@@ -181,7 +182,7 @@ combined_image.imview(fov=3)
 ```
 
 Image objects can also work with numpy arrays and astropy units!
-```
+```python
 # works with numpy functions
 print(np.nanmax(mom1[0, 0]))
 print(np.nanargmin(mom1))
