@@ -135,7 +135,7 @@ mom9 = mom_maps[5]
 
 # show the maps:
 mom0.imview()
-mom0.imview()
+mom9.imview()
 ```
 
 Here are other ways you can manipulate images (these work primarily on the classes 'Datacube' and 'Spatialmap'):
