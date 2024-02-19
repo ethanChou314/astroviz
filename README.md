@@ -130,7 +130,7 @@ continuum.imview(continuum,
 You can also make moment maps and extract spectral profiles from data cubes!
 ```python
 # list of moment maps to be outputted (using CASA definition)
-mom_maps = datacube.immoments(moments=moments[-1, 0, 1, 2, 4, 9, 11], threshold=3*datacube.noise())  # returns a list
+mom_maps = datacube.immoments(moments=[-1, 0, 1, 2, 4, 9, 11], threshold=3*datacube.noise())  # returns a list
 mom0 = mom_maps[1]
 mom9 = mom_maps[5]
 
