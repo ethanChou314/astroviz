@@ -97,9 +97,9 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 # clarify module's public interface
 __all__ = ["importfits", "Datacube", "Spatialmap", "PVdiagram", "Region", "plt_1ddata",
-           "search_molecular_line"]
+           "search_molecular_line", "set_font", "exportfits"]
 
-# variables to control all maps globally
+# variables to control all map fonts globally
 _fontfamily = "Times New Roman"
 _mathtext_fontset = "stix"
 _mathtext_tt = "Times New Roman"
@@ -292,10 +292,7 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
     if refx is not None and refy is not None:
         refcoord = SkyCoord(ra=u.Quantity(refx, spatialunit), dec=u.Quantity(refy, spatialunit)).to_string('hmsdms')
     
-    # set shape 
-    
-    
-    # determine image type
+    # determine image type and reshape data
     if nx > 1 and ny > 1 and nchan > 1:
         imagetype = "datacube"
         newshape = (nstokes, nchan, nx, ny)
@@ -494,8 +491,8 @@ def _get_hduheader(image):
         bpa = np.float64(image.bpa)
         updatedparams = {"BUNIT": image.header["bunit"],
                          "DATE": "%04d-%02d-%02d"%(dtnow.year, dtnow.month, dtnow.day),
-                         "BMAJ": bmin,
-                         "BMIN": bmaj,
+                         "BMAJ": bmaj,
+                         "BMIN": bmin,
                          "BPA": bpa, 
                          "DATAMAX": np.float64(np.nanmax(image.data)),
                          "DATAMIN": np.float64(np.nanmin(image.data)),
@@ -639,6 +636,22 @@ def _apu_to_str(unit):
                 newlst[3] = ele
         newstr = r"$\mathrm{" + ",".join(newlst) + r"}$"
         return newstr
+    elif unit.is_equivalent(u.K*u.km/u.s):
+        unitstr = unit.to_string(format='latex_inline')
+        unitlst = list(unitstr)
+        idx_left = unitlst.index("{")
+        units_lst = unitstr[idx_left+1:-2].split(",")
+        newlst = units_lst[:]     # copy the list
+        for i, ele in enumerate(units_lst):
+            cleanunitstr = ele.replace("\\", "").replace("{", "").replace("}", "")
+            if u.Unit(cleanunitstr).is_equivalent(u.K):
+                newlst[0] = ele
+            elif u.Unit(cleanunitstr).is_equivalent(u.km):
+                newlst[1] = ele
+            elif u.Unit(cleanunitstr).is_equivalent(1/u.s):
+                newlst[2] = ele
+        newstr = r"$\mathrm{" + ",".join(newlst) + r"}$"
+        return newstr
     else:
         return f"{unit:latex_inline}"
 
@@ -686,6 +699,19 @@ def _apu_to_headerstr(unit):
     if headerstr.startswith("/"):
         headerstr = "1" + headerstr
     return headerstr
+
+
+def _unit_plt_str(mathstr):
+    """
+    Private function that converts latex inline string to string for plotting 
+    (fixes font issue).
+    """
+    mathstr = mathstr.replace("math", "")
+    math_lst = mathstr[5:-2].split(r"\,")
+    for i, unit in enumerate(math_lst[:]):
+        math_lst[i] = unit.replace("^{", "$^{").replace("}", "}$")
+    mathstr = " ".join(math_lst)
+    return mathstr
 
 
 def _convert_Bunit(quantity, newunit, equivalencies, factors, max_depth=10):
@@ -760,32 +786,20 @@ def set_font(font):
         _fontfamily = "Georgia"
         _mathtext_fontset = "stix"
         _mathtext_tt = "Georgia"
-    elif font_case_insensitive == "garamond":
-        _fontfamily = "Garamond"
-        _mathtext_fontset = "stix"
-        _mathtext_tt = "Garamond"
     elif font_case_insensitive == "verdana":
         _fontfamily = "Verdana"
         _mathtext_fontset = "custom"
         _mathtext_tt = "Verdana"
-    elif font_case_insensitive == "calibri":
-        _fontfamily = "Calibri"
-        _mathtext_fontset = "custom"
-        _mathtext_tt = "Calibri"
-    elif font_case_insensitive == "roboto":
-        _fontfamily = "Roboto"
-        _mathtext_fontset = "custom"
-        _mathtext_tt = "Roboto"
     elif font_case_insensitive == "courier new":
         _fontfamily = "Courier New"
         _mathtext_fontset = "custom"
         _mathtext_tt = "Courier New"
-    elif font_case_insensitive == "consolas":
-        _fontfamily = "Consolas"
-        _mathtext_fontset = "custom"
-        _mathtext_tt = "Consolas"
     else:
-        raise ValueError("Unsupported font. Please choose a supported option.")
+        print("Unsupported font. Please manually enter the 'font.family', 'mathtext.fontset', " + \
+              "and 'mathtext.tt' attributes of matplotlib.")
+        _fontfamily = input("font.family: ")
+        _fontfamily = input("mathtext.fontset: ")
+        _fontfamily = input("mathtext.tt: ")
 
 
 class Datacube:
@@ -1357,24 +1371,25 @@ class Datacube:
         # return output
         return maps[0] if len(maps) == 1 else maps
         
-    def imview(self, contourmap=None, fov=None, ncol=5, nrow=None, cmap="inferno",
-               figsize=(11.69, 8.27), center=(0., 0.), vrange=None, nskip=1, vskip=None, 
+    def imview(self, contourmap=None, title=None, fov=None, ncol=5, nrow=None, cmap="inferno",
+               figsize=(11.69, 8.27), center=None, vrange=None, nskip=1, vskip=None, 
                tickscale=None, tickcolor="w", txtcolor='w', crosson=True, crosslw=0.5, 
-               crosscolor="w", crosssize=0.3, dpi=400, vmin=None, vmax=None, 
-               xlabel=None, ylabel=None, xlabelon=True, ylabelon=True, crms=None, 
-               clevels=np.arange(3, 21, 3), ccolor="w", clw=0.5, vsys=0., fontsize=12, 
+               crosscolor="w", crosssize=0.3, dpi=400, vmin=None, vmax=None, xlim=None,
+               ylim=None, xlabel=None, ylabel=None, xlabelon=True, ylabelon=True, crms=None, 
+               clevels=np.arange(3, 21, 3), ccolor="w", clw=0.5, vsys=None, fontsize=12, 
                decimals=2, vlabelon=True, cbarloc="right", cbarwidth="3%", cbarpad=0., 
                cbarlabel=None, cbarlabelon=True, addbeam=True, beamcolor="skyblue", 
-               nancolor="k", labelcolor="k", axiscolor="w", axeslw=0.8, labelsize=10, 
-               tickwidth=1., ticksize=3., tickdirection="in", vlabelsize=12, vlabelunit=False, 
-               cbaron=True, plot=True):
+               beamloc=(0.1225, 0.1225),nancolor="k", labelcolor="k", axiscolor="w", axeslw=0.8, 
+               labelsize=10, tickwidth=1., ticksize=3., tickdirection="in", vlabelsize=12, 
+               vlabelunit=False, cbaron=True, title_fontsize=14, grid=None, plot=True):
         """
         To plot the data cube's channel maps.
         Parameters:
             contourmap (Spatialmap/Datacube): The contour map to be drawn. Default is to not plot contour.
             fov (float): the field of view of the image in the same spaital unit as the data cube.
             ncol (int): the number of columns to be drawn. 
-            nrow (int): the number of rows to be drawn. Default is the minimum rows needed to plot all specified channels.
+            nrow (int): the number of rows to be drawn. 
+                        Default is the minimum rows needed to plot all specified channels.
             cmap (str): the color map of the color image.
             figsize (tuple(float)): the size of the figure
             center (tuple(float)): the center coordinate of the channel maps
@@ -1430,21 +1445,45 @@ class Datacube:
             The image grid with the channel maps.
         """
         # initialize parameters:
-        if center != (0, 0):
-            raise Exception("Center parameter not implemented yet.")
-        fov = self.widestfov if fov is None else fov
+        if vsys is None:
+            vsys = 0.
+        if fov is None:
+            fov = self.widestfov
+        if fov < 0:
+            fov = -fov
+        if center is None:
+            center = [0., 0.]
+        if xlim is None:
+            xlim = [center[0]+fov, center[0]-fov]
+        else:
+            if xlim[0] < xlim[1]:
+                xlim[0], xlim[1] = xlim[1], xlim[0]
+            center[0] = (xlim[0]+xlim[1])/2
+        if ylim is None:
+            ylim = [center[1]-fov, center[1]+fov]
+        else:
+            if ylim[1] < ylim[0]:
+                ylim[0], ylim[1] = ylim[1], ylim[0]
+            center[1] = (ylim[0]+ylim[1])/2
         if tickscale is not None:
             ticklist = np.arange(0, fov, tickscale) 
             ticklist = np.append(-ticklist, ticklist)
-        xlabel = f"Relative RA ({self.unit})" if xlabel is None else xlabel
-        ylabel = f"Relative Dec ({self.unit})" if ylabel is None else ylabel
-        clevels = np.array(clevels) if not isinstance(clevels, np.ndarray) else clevels
-        cbarlabel = f"({(u.Unit(self.bunit)):latex_inline})" if cbarlabel is None else cbarlabel
+        if xlabel is None:
+            xlabel = f"Relative RA ({self.unit})"
+        if ylabel is None:
+            ylabel = f"Relative Dec ({self.unit})"
+        if not isinstance(clevels, np.ndarray):
+            clevels = np.array(clevels)
+        if cbarlabel is None:
+            cbarlabel = "(" + _unit_plt_str(_apu_to_str(_to_apu(self.bunit))) + ")"
         vaxis = self.vaxis - vsys
-        vrange = [vaxis.min(), vaxis.max()] if vrange is None else vrange
+        if vrange is None:
+            vrange = [vaxis.min(), vaxis.max()]
         velmin, velmax = vrange
-        nskip = int(vskip/self.dv) if vskip is not None else nskip
-        vskip = self.dv*nskip if vskip is None else vskip
+        if vskip is None:
+            vskip = self.dv*nskip
+        else:
+            nskip = int(vskip/self.dv)
         cmap = copy.deepcopy(mpl.colormaps[cmap]) 
         cmap.set_bad(color=nancolor) 
         if crms is None and contourmap is not None:
@@ -1463,26 +1502,38 @@ class Datacube:
         trimmed_vaxis = vaxis[vmask][::nskip]
             
         # trim data along xyaxes for plotting:
-        if fov != self.widestfov:
-            xmask = (-fov<=self.xaxis) & (self.xaxis<=fov)
-            ymask = (-fov<=self.yaxis) & (self.yaxis<=fov)
+        if xlim != [self.widestfov, -self.widestfov] \
+           or ylim != [self.widestfov, -self.widestfov]:
+            xmask = (xlim[1]<=self.xaxis) & (self.xaxis<=xlim[0])
+            ymask = (ylim[0]<=self.yaxis) & (self.yaxis<=ylim[1])
             trimmed_data = trimmed_data[:, :, xmask, :]
             trimmed_data = trimmed_data[:, :, :, ymask]
-        imextent = [fov-0.5*self.dx, -fov+0.5*self.dx, 
-                    -fov-0.5*self.dy, fov+0.5*self.dy]
-            
+        imextent = [xlim[0]-0.5*self.dx, xlim[1]+0.5*self.dx, 
+                    ylim[0]-0.5*self.dy, ylim[1]+0.5*self.dy]
+        
         # modify contour map to fit the same channels:
         if contourmap is not None:
             contmap = contourmap.copy()
+            
+            # make the image conditions the same if necessary:
+            if contmap.refcoord != self.refcoord:  # same reference coordinates
+                contmap = contmap.imshift(self.refcoord, printcc=False)
+            if contmap.unit != self.unit:  # same spatial units
+                contmap = contmap.conv_unit(self.unit)
+            
             contmap_isdatacube = (contmap.header["imagetype"] == "datacube")
             if contmap_isdatacube:
                 cvaxis = contmap.vaxis - vsys
-            cxmask = (-fov<=contmap.xaxis) & (contmap.xaxis<=fov)
-            cymask = (-fov<=contmap.yaxis) & (contmap.yaxis<=fov)
-            trimmed_cdata = contmap.data[:, :, cxmask, :]
-            trimmed_cdata = trimmed_cdata[:, :, :, cymask]
-            contextent = [fov-0.5*contmap.dx, -fov+0.5*contmap.dx, 
-                         -fov-0.5*contmap.dy, fov+0.5*contmap.dy]
+            if xlim != [contmap.widestfov, -contmap.widestfov] \
+               or ylim != [-contmap.widestfov, contmap.widestfov]:
+                cxmask = (xlim[1]<=contmap.xaxis) & (contmap.xaxis<=xlim[0])
+                cymask = (ylim[0]<=contmap.yaxis) & (contmap.yaxis<=ylim[1])
+                trimmed_cdata = contmap.data[:, :, cxmask, :]
+                trimmed_cdata = trimmed_cdata[:, :, :, cymask]
+            else:
+                trimmed_cdata = contmap.data
+            contextent = [xlim[0]-0.5*contmap.dx, xlim[1]+0.5*contmap.dx, 
+                          ylim[0]-0.5*contmap.dy, ylim[1]+0.5*contmap.dy]
         
         # figure out the number of images per row/column to plot:
         nchan = trimmed_vaxis.size
@@ -1516,12 +1567,13 @@ class Datacube:
         rcParams.update(params)
         
         # plotting preparation:
-        fig = plt.figure(figsize=figsize)
-        grid = ImageGrid(fig, rect=111, nrows_ncols=(nrow, ncol),
-                         axes_pad=0., share_all=True, cbar_mode='single',
-                         cbar_location=cbarloc, cbar_size=cbarwidth,
-                         cbar_pad=cbarpad, label_mode='1')
-        
+        if grid is None:
+            fig = plt.figure(figsize=figsize)
+            grid = ImageGrid(fig, rect=111, nrows_ncols=(nrow, ncol),
+                             axes_pad=0., share_all=True, cbar_mode='single',
+                             cbar_location=cbarloc, cbar_size=cbarwidth,
+                             cbar_pad=cbarpad, label_mode='1')
+
         # start plotting:
         if contourmap is not None and not contmap_isdatacube:
             thiscdata = trimmed_cdata[0, 0]
@@ -1559,9 +1611,11 @@ class Datacube:
                 
                 # plot central cross
                 if crosson:
-                    ax.plot([crosssize*fov, -crosssize*fov], [0., 0.], 
+                    xfov = (xlim[0]-xlim[1])/2
+                    yfov = (ylim[1]-ylim[0])/2
+                    ax.plot([center[0]-crosssize*xfov, center[0]+crosssize*xfov], [center[1], center[1]], 
                              color=crosscolor, lw=crosslw, zorder=99)   # horizontal line
-                    ax.plot([0., 0.], [-crosssize*fov, crosssize*fov], 
+                    ax.plot([center[0], center[0]], [center[1]-crosssize*yfov, center[1]+crosssize*yfov], 
                             color=crosscolor, lw=crosslw, zorder=99)    # vertical line
                 
                 # plot the axis borders
@@ -1577,8 +1631,8 @@ class Datacube:
                 ax.spines["right"].set_color('none')
                 ax.axis('off')
             # set field of view
-            ax.set_xlim(fov, -fov)
-            ax.set_ylim(-fov, fov)
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
                 
         # axis labels
         if xlabelon or ylabelon or addbeam:
@@ -1592,10 +1646,8 @@ class Datacube:
         
         # add beam
         if addbeam:
-            bmin_plot, bmaj_plot = ax.transLimits.transform((self.bmin, self.bmaj)) - ax.transLimits.transform((0, 0))
-            beam = patches.Ellipse(xy=(0.1, 0.11), width=bmin_plot, height=bmaj_plot, 
-                                   fc=beamcolor, angle=self.bpa, transform=ax.transAxes)
-            bottomleft_ax.add_patch(beam)
+            bottomleft_ax = self.__addbeam(bottomleft_ax, xlim=xlim, ylim=ylim,
+                                           beamcolor=beamcolor, beamloc=beamloc)
 
         # colorbar 
         if cbaron:
@@ -1614,10 +1666,41 @@ class Datacube:
         self.__pltnax = nrow*ncol
         self.__pltnchan = nchan
         
+        # add title at the center
+        if title is not None:
+            if ncol % 2 == 0:  # even number of columns
+                middle_right_ax = grid[ncol//2]
+                middle_right_ax.set_title(title, fontsize=title_fontsize, x=0.)
+            else:  # odd number of columns
+                middle_ax = grid[ncol//2]
+                middle_ax.set_title(title, fontsize=title_fontsize)
+        
         # show image
         if plot:
             plt.show()
         return grid
+    
+    def __addbeam(self, ax, xlim, ylim, beamcolor, beamloc=(0.1225, 0.1225)):
+        """
+        This method adds an ellipse representing the beam size to the specified ax.
+        """
+        # get axes limits
+        xrange = xlim[1] - xlim[0]
+        yrange = ylim[1] - ylim[0]
+        
+        # coordinate of ellipse center 
+        centerx = xlim[0] + beamloc[0]*xrange
+        centery = ylim[0] + beamloc[1]*yrange
+        coords = (centerx, centery)
+        
+        # beam size
+        bmaj, bmin = self.bmaj, self.bmin
+        
+        # add patch to ax
+        beam = patches.Ellipse(xy=coords, width=bmin, height=bmaj, fc=beamcolor,
+                               angle=-self.bpa, alpha=1, zorder=10)
+        ax.add_patch(beam)
+        return ax
         
     def trim(self, vrange, nskip=1, vskip=None, inplace=False):
         """
@@ -1815,7 +1898,7 @@ class Datacube:
             area = area.to_value(unit)
         return area
     
-    def conv_unit(self, unit, inplace=False):
+    def conv_unit(self, unit, distance=None, inplace=False):
         """
         This method converts the axis unit of the image into the desired unit.
         Parameters:
@@ -3698,19 +3781,19 @@ class Spatialmap:
             return rms, mask
         return rms
             
-    def imview(self, contourmap=None, title="", fov=None, vmin=None, vmax=None, 
+    def imview(self, contourmap=None, title=None, fov=None, vmin=None, vmax=None, 
                scale="linear", gamma=1.5, crms=None, clevels=np.arange(3, 21, 3), tickscale=None, 
                scalebaron=True, distance=None, cbarlabelon=True, cbarlabel=None, xlabelon=True,
-               ylabelon=True, center=(0., 0.), dpi=500, ha="left", va="top", titlepos=0.85, 
+               ylabelon=True, center=(0., 0.), dpi=500, ha="left", va="top", titleloc=(0.1, 0.9), 
                cmap=None, fontsize=12, cbarwidth="5%", width=330, height=300,
                smooth=None, scalebarsize=None, nancolor=None, beamcolor=None,
                ccolors=None, clw=0.8, txtcolor=None, cbaron=True, cbarpad=0., tickson=False, 
                labelcolor="k", tickcolor="k", labelsize=10., ticklabelsize=10., 
                cbartick_length=3., cbartick_width=1., beamon=True, scalebar_fontsize=10,
                axeslw=1., scalecolor=None, scalelw=1., orientation="vertical", 
-               xlim=None, ylim=None, cbarticks=None, beamloc=(0.1, 0.1), vcenter=None, 
+               xlim=None, ylim=None, cbarticks=None, beamloc=(0.1225, 0.1225), vcenter=None, 
                vrange=None, aspect_ratio=1, barloc=(0.85, 0.15), barlabelloc=(0.85, 0.075),
-               plot=True):
+               decimals=2, ax=None, plot=True):
         """
         Method to plot the 2D image.
         Parameters:
@@ -3734,7 +3817,7 @@ class Spatialmap:
             dpi (int): the dots per inch value of the image
             ha (str): horizontal alignment of title
             va (str): vertical alignment of title
-            titlepos (float): position of title (x, y) = (titlepos*fov, titlepos*fov)
+            titleloc (float): relative position of title (x, y)
             cmap (str): the colormap of the image
             fontsize (int): the font size of the title
             cbarwidth (str): the width of the colorbar
@@ -3838,6 +3921,10 @@ class Spatialmap:
         # create a copy of the contour map
         if isinstance(contourmap, Spatialmap):
             contourmap = contourmap.copy()
+            if contourmap.refcoord != self.refcoord:
+                contourmap = contourmap.imshift(self.refcoord, printcc=False)
+            if contourmap.unit != self.unit:
+                contourmap = contourmap.conv_unit(self.unit)
             
         if vcenter is not None:
             if vrange is None:
@@ -3892,8 +3979,9 @@ class Spatialmap:
         my_cmap = copy.deepcopy(mpl.colormaps[cmap]) 
         my_cmap.set_bad(color=nancolor) 
         
-        fig, ax = plt.subplots(nrows=1, ncols=1, sharex=False, sharey=False)
-        plt.subplots_adjust(wspace=0.4)
+        if ax is None:
+            fig, ax = plt.subplots(nrows=1, ncols=1, sharex=False, sharey=False)
+            plt.subplots_adjust(wspace=0.4)
         
         if contourmap is not None and crms is None:
             try:
@@ -3909,7 +3997,7 @@ class Spatialmap:
         if scale.lower() == "linear":
             climage = ax.imshow(data[0, 0], cmap=my_cmap, extent=self.imextent, 
                                 vmin=vmin, vmax=vmax, origin='lower')
-        elif scale.lower() in ["log", "logscale"]:
+        elif scale.lower() in ("log", "logscale", "logarithm"):
             if vmin is None:
                 vmin = 3*self.noise()
             if vmax is None:
@@ -3930,7 +4018,7 @@ class Spatialmap:
         if cbaron:
             if cbarlabelon:
                 if cbarlabel is None:
-                    cbarlabel = f"({_apu_to_str(_to_apu(self.bunit))})"
+                    cbarlabel = "(" + _unit_plt_str(_apu_to_str(_to_apu(self.bunit))) + ")"
                 else:
                     cbarlabel = ""
             ticklocation = "right"
@@ -3940,8 +4028,8 @@ class Spatialmap:
                               ticklocation=ticklocation)
             if len(cbarticks) > 0:
                 cb.set_ticks(cbarticks)
-                if scale.lower() in ["log", "logscale"]:
-                    labels = ("%.2s"%label for label in cbarticks)  # generator object
+                if scale.lower() in ("log", "logscale", "logarithm"):
+                    labels = (f"%.{decimals}f"%label for label in cbarticks)  # generator object
                     labels = [label[:-1] if label.endswith(".") else label for label in labels]
                     cb.set_ticklabels(labels)
             cb.set_label(cbarlabel, fontsize=labelsize)
@@ -3955,8 +4043,11 @@ class Spatialmap:
             ax.contour(contour_data, extent=contourmap.imextent, 
                        levels=crms*clevels, colors=ccolors, linewidths=clw, origin='lower')
             
-        if title:
-            titlex, titley = fov*titlepos, fov*titlepos
+        if title is not None:
+            xrange = xlim[1]-xlim[0]
+            yrange = ylim[1]-ylim[0]
+            titlex = xlim[0] + titleloc[0]*xrange
+            titley = ylim[0] + titleloc[1]*yrange
             ax.text(x=titlex, y=titley, s=title, ha=ha, va=va, color=txtcolor, fontsize=fontsize)
         
         # set field of view
@@ -4069,7 +4160,7 @@ class Spatialmap:
         
         return ax
         
-    def __addbeam(self, ax, xlim, ylim, beamcolor, beamloc=(0.1, 0.1)):
+    def __addbeam(self, ax, xlim, ylim, beamcolor, beamloc=(0.1225, 0.1225)):
         """
         This method adds an ellipse representing the beam size to the specified ax.
         """
@@ -4752,7 +4843,7 @@ class PVdiagram:
                plotres=True, xlabelon=True, vlabelon=True, xlabel=None, vlabel=None, offset_as_hor=False, 
                aspect_ratio=1.1, axeslw=1.3, tickwidth=1.3, tickdirection="in", ticksize=5., 
                xticks=None, vticks=None, title=None, titlepos=0.85, ha="left", va="top", txtcolor="w", 
-               refline_color="w", pa=None, refline_width=None, subtract_vsys=False, plot=True):
+               refline_color="w", pa=None, refline_width=None, subtract_vsys=False, ax=None, plot=True):
         """
         Display a Position-Velocity (PV) diagram.
 
@@ -4838,7 +4929,7 @@ class PVdiagram:
         if xlabel is None:
             xlabel = f'Offset ({self.unit})'
         if cbarlabel is None:
-            cbarlabel = f"({u.Unit(self.bunit):latex_inline})"
+            cbarlabel = "(" + _unit_plt_str(_apu_to_str(_to_apu(self.bunit))) + ")"
         if refline_width is None:
             refline_width = clw
         vres, xres = self.dv, self.__get_offset_resolution(pa=pa)
@@ -4869,8 +4960,9 @@ class PVdiagram:
                   }
         rcParams.update(params)
         
-        fig = plt.figure(figsize=figsize)
-        ax  = fig.add_subplot(111)
+        if ax is None:
+            fig = plt.figure(figsize=figsize)
+            ax  = fig.add_subplot(111)
         
         # plot image
         if offset_as_hor:
@@ -5356,6 +5448,7 @@ def plt_1ddata(xdata=None, ydata=None, xlim=[], ylim=[], mean_center=False, titl
     
     fontsize = labelsize if fontsize is None else fontsize
     # Get this from LaTeX using \showthe\columnwidth
+    
     params = {'axes.labelsize': labelsize,
               'axes.titlesize': labelsize,
               'font.size': fontsize,
@@ -5364,9 +5457,9 @@ def plt_1ddata(xdata=None, ydata=None, xlim=[], ylim=[], mean_center=False, titl
               'ytick.labelsize': ticklabelsize,
               'figure.figsize': figsize,
               'figure.dpi': dpi,
-              'font.family': 'Times New Roman',
-              "mathtext.fontset": 'stix', #"Times New Roman"
-              'mathtext.tt':' Times New Roman',
+              'font.family': _fontfamily,
+              "mathtext.fontset": _mathtext_fontset, #"Times New Roman"
+              'mathtext.tt': _mathtext_tt,
               'axes.linewidth': borderwidth,
               'xtick.major.width': borderwidth,
               'ytick.major.width': borderwidth,
@@ -5535,9 +5628,9 @@ def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=[], ylim=[],
               'legend.fontsize': legendsize,
               'xtick.labelsize': ticklabelsize,
               'ytick.labelsize': ticklabelsize,
-              'font.family': 'Times New Roman',
-              "mathtext.fontset": 'stix', #"Times New Roman"
-              'mathtext.tt':' Times New Roman',
+              'font.family': _fontfamily,
+              "mathtext.fontset": _mathtext_fontset, #"Times New Roman"
+              'mathtext.tt': _mathtext_tt,
               'axes.linewidth': borderwidth,
               'xtick.major.width': borderwidth,
               'ytick.major.width': borderwidth,
@@ -5893,7 +5986,7 @@ def J_v(v, T):
 
 def column_density_linear_optically_thin(moment0_map, T_ex, T_bg=2.726, R_i=1, f=1.):
     """
-    Function to calculate the column density of a linear molecule using optically thin assumption.
+    Public function to calculate the column density of a linear molecule using optically thin assumption.
     Source: https://doi.org/10.48550/arXiv.1501.01703
     Parameters:
         moment0_map (Spatialmap): the moment 0 map
