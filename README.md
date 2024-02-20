@@ -77,7 +77,7 @@ SumSq: 9.628285e+00 [(Jy/beam km/s)^2]
 
 # extract spectral profiles from data cubes:
 aperture = av.Region(center=(0, 0), length=5, width=3, pa=15, shape="box")  # create a box
-datacube.view_region(aperture, dpi=100, fov=5, ncol=10, nskip=3)  # see what it looks like on the map
+datacube.get_spectrum(aperture)  # extract the spectrum
 
 # Masking regions on 'Spatialmaps' and 'Datacube' instances:
 ellipse = av.Region(center=(0, 0), semimajor=1, semiminor=0.1)
