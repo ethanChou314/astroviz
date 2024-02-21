@@ -312,7 +312,7 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
     # beam size
     bmaj = hdu_header.get("BMAJ", np.nan)
     bmin = hdu_header.get("BMIN", np.nan)
-    bpa =  hdu_header.get("BPA", np.nan)
+    bpa =  hdu_header.get("BPA", np.nan)  # deg
     
     if spatialunit != "deg":  # convert beam size unit if necessary
         if not np.isnan(bmaj):
@@ -1379,7 +1379,7 @@ class Datacube:
                clevels=np.arange(3, 21, 3), ccolor="w", clw=0.5, vsys=None, fontsize=12, 
                decimals=2, vlabelon=True, cbarloc="right", cbarwidth="3%", cbarpad=0., 
                cbarlabel=None, cbarlabelon=True, addbeam=True, beamcolor="skyblue", 
-               beamloc=(0.1225, 0.1225),nancolor="k", labelcolor="k", axiscolor="w", axeslw=0.8, 
+               beamloc=(0.1225, 0.1225), nancolor="k", labelcolor="k", axiscolor="w", axeslw=0.8, 
                labelsize=10, tickwidth=1., ticksize=3., tickdirection="in", vlabelsize=12, 
                vlabelunit=False, cbaron=True, title_fontsize=14, grid=None, plot=True):
         """
@@ -3787,10 +3787,10 @@ class Spatialmap:
                ylabelon=True, center=(0., 0.), dpi=500, ha="left", va="top", titleloc=(0.1, 0.9), 
                cmap=None, fontsize=12, cbarwidth="5%", width=330, height=300,
                smooth=None, scalebarsize=None, nancolor=None, beamcolor=None,
-               ccolors=None, clw=0.8, txtcolor=None, cbaron=True, cbarpad=0., tickson=False, 
+               ccolors=None, clw=0.8, txtcolor=None, cbaron=True, cbarpad=0., tickson=True, 
                labelcolor="k", tickcolor="k", labelsize=10., ticklabelsize=10., 
                cbartick_length=3., cbartick_width=1., beamon=True, scalebar_fontsize=10,
-               axeslw=1., scalecolor=None, scalelw=1., orientation="vertical", 
+               axeslw=1., scalecolor=None, scalelw=1., cbarloc="right", 
                xlim=None, ylim=None, cbarticks=None, beamloc=(0.1225, 0.1225), vcenter=None, 
                vrange=None, aspect_ratio=1, barloc=(0.85, 0.15), barlabelloc=(0.85, 0.075),
                decimals=2, ax=None, plot=True):
@@ -3940,7 +3940,6 @@ class Spatialmap:
             vmax = vcenter + vrange/2
             
         # change default parameters
-        letterratio = 1.294
         ncols, nrows = 1, 1
         fig_width_pt  = width*ncols
         fig_height_pt = height*nrows
@@ -4021,11 +4020,18 @@ class Spatialmap:
                     cbarlabel = "(" + _unit_plt_str(_apu_to_str(_to_apu(self.bunit))) + ")"
                 else:
                     cbarlabel = ""
-            ticklocation = "right"
+            
+            # determine orientation from color bar location
+            if cbarloc.lower() == "right":
+                orientation = "vertical"
+            elif cbarloc.lower() == "top":
+                orientation = "horizontal"
+            else:
+                raise ValueError("'cbarloc' parameter must be eitehr 'right' or 'top'.")
+                
             divider = make_axes_locatable(ax)
-            ax_cb = divider.append_axes(ticklocation, size=cbarwidth, pad=cbarpad)
-            cb = plt.colorbar(climage, cax=ax_cb, orientation=orientation, 
-                              ticklocation=ticklocation)
+            ax_cb = divider.append_axes(cbarloc, size=cbarwidth, pad=cbarpad)
+            cb = plt.colorbar(climage, cax=ax_cb, orientation=orientation, ticklocation=cbarloc)
             if len(cbarticks) > 0:
                 cb.set_ticks(cbarticks)
                 if scale.lower() in ("log", "logscale", "logarithm"):
@@ -4839,11 +4845,12 @@ class PVdiagram:
     def imview(self, contourmap=None, cmap="inferno", vmin=None, vmax=None, nancolor="k", crms=None, 
                clevels=np.arange(3, 21, 3), ccolor="w", clw=1., dpi=500, cbaron=True, cbarloc="right", 
                cbarpad="0%", vsys=None, xlim=None, vlim=None, xcenter=0., vlineon=True, xlineon=True, 
-               cbarlabelon=True, cbarwidth='5%', cbarlabel=None, fontsize=18, labelsize=18, figsize=(11.69, 8.27), 
+               cbarlabelon=True, cbarwidth='5%', cbarlabel=None, fontsize=12, labelsize=10, width=330, height=300, 
                plotres=True, xlabelon=True, vlabelon=True, xlabel=None, vlabel=None, offset_as_hor=False, 
-               aspect_ratio=1.1, axeslw=1.3, tickwidth=1.3, tickdirection="in", ticksize=5., 
-               xticks=None, vticks=None, title=None, titlepos=0.85, ha="left", va="top", txtcolor="w", 
-               refline_color="w", pa=None, refline_width=None, subtract_vsys=False, ax=None, plot=True):
+               aspect_ratio=1.15, axeslw=1., tickson=True, tickwidth=1., tickdirection="in", ticksize=3., ticklabelsize=10,
+               cbartick_width=1, cbartick_length=3, xticks=None, vticks=None, title=None, titleloc=(0.05, 0.985), 
+               ha="left", va="top", txtcolor="w", refline_color="w", pa=None, refline_width=None, 
+               subtract_vsys=False, errbarloc=(0.1, 0.1225), ax=None, plot=True):
         """
         Display a Position-Velocity (PV) diagram.
 
@@ -4924,7 +4931,7 @@ class PVdiagram:
             if subtract_vsys:
                 vlabel = r"$v_{\rm obs}-v_{\rm sys}$ " + "(" + _apu_to_str(u.Unit(self.specunit)) + ")"
             else:
-                vlabel = "LSR velocity " + "(" + _apu_to_str(u.Unit(self.specunit)) + ")"
+                vlabel = "LSR velocity " + "(" + _unit_plt_str(_apu_to_str(u.Unit(self.specunit))) + ")"
         
         if xlabel is None:
             xlabel = f'Offset ({self.unit})'
@@ -4937,6 +4944,13 @@ class PVdiagram:
         cmap.set_bad(color=nancolor)
                 
         # change default matplotlib parameters
+        ncols, nrows = 1, 1
+        fig_width_pt  = width*ncols
+        fig_height_pt = height*nrows
+        inches_per_pt = 1.0/72.27                     # Convert pt to inch
+        fig_width     = fig_width_pt * inches_per_pt  # width in inches
+        fig_height    = fig_height_pt * inches_per_pt # height in inches
+        fig_size      = [fig_width, fig_height]
         params = {'axes.labelsize': labelsize,
                   'axes.titlesize': labelsize,
                   'font.size': fontsize,
@@ -4945,7 +4959,7 @@ class PVdiagram:
                   'ytick.labelsize': labelsize,
                   'xtick.top': True,   # draw ticks on the top side
                   'xtick.major.top': True,
-                  'figure.figsize': figsize,
+                  'figure.figsize': fig_size,
                   'figure.dpi': dpi,
                   'font.family': _fontfamily,
                   'mathtext.fontset': _mathtext_fontset,
@@ -4961,8 +4975,8 @@ class PVdiagram:
         rcParams.update(params)
         
         if ax is None:
-            fig = plt.figure(figsize=figsize)
-            ax  = fig.add_subplot(111)
+            fig = plt.figure(figsize=fig_size)
+            ax = fig.add_subplot(111)
         
         # plot image
         if offset_as_hor:
@@ -5027,39 +5041,64 @@ class PVdiagram:
                 ax.plot([vlim[0], vlim[1]], [xcenter, xcenter], color=refline_color, 
                         ls='dashed', lw=refline_width)
         # tick parameters
-        ax.tick_params(which='both', direction=tickdirection, bottom=True, top=True, left=True, right=True,
-                       pad=9, labelsize=labelsize)
+        if tickson:
+            ax.tick_params(which='both', direction=tickdirection, bottom=True, top=True, left=True, right=True,
+                           pad=9, labelsize=labelsize)
+        else:
+            ax.tick_params(which='both', direction=tickdirection, bottom=False, top=False, left=False, right=False,
+                           pad=9, labelsize=labelsize)
         
-        # set aspect ratio
-        aspect = (1/aspect_ratio)*(ax.get_xlim()[1]-ax.get_xlim()[0])/(ax.get_ylim()[1]-ax.get_ylim()[0])
-        ax.set_aspect(float(np.abs(aspect)))
+        # define horizontal and vertical limits
+        if offset_as_hor:
+            horlim = xlim
+            vertlim = vlim
+        else:
+            horlim = vlim
+            vertlim = xlim
         
         # color bar
         if cbaron:
-            axin_cb = inset_axes(ax, width=cbarwidth, height='100%',
-                                 loc='lower left', bbox_to_anchor=(1.0 + float(cbarpad.strip('%'))*0.01, 0., 1., 1.),
-                                 bbox_transform=ax.transAxes, borderpad=0)
-            cbar = fig.colorbar(climage, cax=axin_cb, pad=cbarpad)
+            # determine orientation based on color bar location
+            if cbarloc.lower() == "right":
+                orientation = "vertical"
+                ax_cb = inset_axes(ax, width=cbarwidth, height='100%', loc='lower left',
+                               bbox_to_anchor=(1.0 + float(cbarpad.strip('%'))*0.01, 0., 1., 1.),
+                               bbox_transform=ax.transAxes, borderpad=0)
+            elif cbarloc.lower() == "top":
+                orientation = "horizontal"
+                ax_cb = inset_axes(ax, width='100%', height=cbarwidth, loc='lower left',
+                       bbox_to_anchor=(0., 1.0 + float(cbarpad.strip('%'))*0.01, 1., 1.),
+                       bbox_transform=ax.transAxes, borderpad=0)
+            else:
+                raise ValueError("'cbarloc' parameter must be eitehr 'right' or 'top'.")
+                
+            cbar = fig.colorbar(climage, cax=ax_cb, pad=cbarpad, 
+                                orientation=orientation, ticklocation=cbarloc.lower())
             cbar.set_label(cbarlabel)
+            cbar.ax.tick_params(labelsize=ticklabelsize, width=cbartick_width, 
+                                length=cbartick_length, direction="in")
+            
+         # set aspect ratio
+        if aspect_ratio is not None:
+            hor_range = horlim[1]-horlim[0]
+            vert_range = vertlim[1]-vertlim[0]    
+            real_ar = float(np.abs(1/aspect_ratio*hor_range/vert_range))
+            ax.set_aspect(real_ar)
         
         # plot resolution
         if plotres:
             res_x, res_y = (xres, vres) if offset_as_hor else (vres, xres)
             res_x_plt, res_y_plt = ax.transLimits.transform((res_x*0.5, res_y*0.5))-ax.transLimits.transform((0, 0))
-            ax.errorbar(0.1, 0.1, xerr=res_x_plt, yerr=res_y_plt, color=ccolor, capsize=3, 
+            ax.errorbar(errbarloc[0], errbarloc[1], xerr=res_x_plt, yerr=res_y_plt, color=ccolor, capsize=3, 
                         capthick=1., elinewidth=1., transform=ax.transAxes)
-            
+           
         # plot title, if necessary
         if title is not None:
-            hormin, hormax = ax.get_xlim()
-            xfov = (hormax - hormin)/2
-            xmidpt = (hormin + hormax)/2
-            vertmin, vertmax = ax.get_ylim()
-            yfov = (vertmax - vertmin)/2
-            ymidpt = (vertmax + vertmin)/2
-            titlex, titley = xmidpt-xfov*titlepos, ymidpt+yfov*titlepos
-            ax.text(x=titlex, y=titley, s=title, ha=ha, va=va, color=txtcolor, fontsize=fontsize)
-
+            titlex = horlim[0] + titleloc[0]*hor_range
+            titley = horlim[0] + titleloc[1]*vert_range
+            ax.text(x=titlex, y=titley, s=title, ha=ha, va=va, 
+                    color=txtcolor, fontsize=fontsize)
+        
         if plot:
             plt.show()
         
