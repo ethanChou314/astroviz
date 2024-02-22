@@ -159,7 +159,8 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
                     print("Below are the readable HDUs and their corresponding 'hduindex' parameters:")
                     for i in range(len(good_hdu)):
                         print(f"[{i}] {good_hdu[i]}")
-            hduindex = int(hduindex) if not isinstance(hduindex, int) else hduindex
+            if not isinstance(hduindex, int):
+                hduindex = int(hduindex)
             data = good_hdu[hduindex].data
             hdu_header = dict(good_hdu[hduindex].header)
     
@@ -208,11 +209,11 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
     else:
         vunit = hdu_header.get(f"CUNIT{freq_axis_num}", ("km/s" if is_vel else "Hz"))
         vrefpix = hdu_header.get(f"CRPIX{freq_axis_num}", 1)
-        vrefval = hdu_header.get(f"CRVAL{freq_axis_num}")
-        dv = hdu_header.get(f"CDELT{freq_axis_num}")
+        vrefval = hdu_header.get(f"CRVAL{freq_axis_num}", np.nan)
+        dv = hdu_header.get(f"CDELT{freq_axis_num}", np.nan)
         startv = dv*(vrefpix-1) + vrefval
         endv = dv*(vrefpix+nchan-2) + vrefval
-        if u.Unit(vunit) != u.Unit(specunit):
+        if _to_apu(vunit) != _to_apu(specunit):
             equiv = u.doppler_radio(restfreq*u.Hz)
             startv = u.Quantity(startv, vunit).to_value(specunit, equivalencies=equiv)
             endv = u.Quantity(endv, vunit).to_value(specunit, equivalencies=equiv)
@@ -351,9 +352,9 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
                 "refcoord": refcoord,
                 "restfreq": restfreq,
                 "beam": (bmaj, bmin, bpa),
-                "specframe": hdu_header.get("RADESYS", ""),
+                "specframe": hdu_header.get("RADESYS", "ICRS"),
                 "unit": spatialunit,
-                "specunit": _apu_to_headerstr(u.Unit(specunit)),
+                "specunit": _apu_to_headerstr(_to_apu(specunit)),
                 "bunit": hdu_header.get("BUNIT", ""),
                 "projection": projection,
                 "object": hdu_header.get("OBJECT", ""),
@@ -383,11 +384,14 @@ def _get_hduheader(image):
         header (astropy.io.fits.header.Header): the extracted header information.
     """
     # get fitsfile from name 
-    fitsfile = fits.open(image.header["name"])[0]
-    hdu_header = copy.deepcopy(fitsfile.header)
-    dx = u.Quantity(image.dx, image.unit).to_value(u.deg)
+    if image.header["name"]:
+        fitsfile = fits.open(image.header["name"])[0]
+        hdu_header = copy.deepcopy(fitsfile.header)
+    else:
+        hdu_header = fits.Header()  # create empty header if file path cannot be located
     
     # get info from current image object
+    dx = u.Quantity(image.dx, image.unit).to_value(u.deg)
     if image.header["dy"] is not None:
         dy = u.Quantity(image.dy, image.unit).to_value(u.deg)
     if image.refcoord is not None:
@@ -396,7 +400,7 @@ def _get_hduheader(image):
     else:
         centerx, centery = None, None
     projection = image.header["projection"]
-    dtnow = dt.datetime.now()
+    dtnow = str(dt.datetime.now()).replace(" ", "T")
     
     # start reading header information
     if image.header["imagetype"] == "pvdiagram":
@@ -476,7 +480,7 @@ def _get_hduheader(image):
     # other information    
     if np.isnan(image.bmaj) or np.isnan(image.bmin) or np.isnan(image.bpa):
         updatedparams = {"BUNIT": image.header["bunit"],
-                         "DATE": "%04d-%02d-%02d"%(dtnow.year, dtnow.month, dtnow.day),
+                         "DATE": dtnow,
                          "DATAMAX": np.float64(np.nanmax(image.data)),
                          "DATAMIN": np.float64(np.nanmin(image.data)),
                          "BSCALE": np.float64(1.),
@@ -492,7 +496,7 @@ def _get_hduheader(image):
         bmin = np.float64(u.Quantity(image.bmin, image.unit).to_value(u.deg))
         bpa = np.float64(image.bpa)
         updatedparams = {"BUNIT": image.header["bunit"],
-                         "DATE": "%04d-%02d-%02d"%(dtnow.year, dtnow.month, dtnow.day),
+                         "DATE": dtnow,
                          "BMAJ": bmaj,
                          "BMIN": bmin,
                          "BPA": bpa, 
@@ -1119,7 +1123,7 @@ class Datacube:
         """
         image = self.copy()
         image.data = image.data.to_value(unit, *args, **kwargs)
-        image.bunit = image.header["bunit"] = _apu_to_headerstr(u.Unit(unit))
+        image.bunit = image.header["bunit"] = _apu_to_headerstr(_to_apu(unit))
         return image
     
     def copy(self):
@@ -1164,11 +1168,8 @@ class Datacube:
         Returns:
             vaxis (ndarray): the spectral axis of the data cube.
         """
-        vaxis = self.vrange[0] + np.arange(self.nchan)*self.dv
+        vaxis = np.linspace(self.vrange[0], self.vrange[1], self.nchan)
         if specunit is None:
-            if u.Unit(self.specunit).is_equivalent(u.km/u.s):
-                round_mask = np.isclose(vaxis, np.round(vaxis, 10))
-                vaxis[round_mask] = np.round(vaxis, 10)
             return vaxis
         try:
             # attempt direct conversion
@@ -1177,7 +1178,7 @@ class Datacube:
             # if that fails, try using equivalencies
             equiv = u.doppler_radio(self.restfreq*u.Hz)
             vaxis = u.Quantity(vaxis, self.specunit).to_value(specunit, equivalencies=equiv)
-        if u.Unit(specunit).is_equivalent(u.km/u.s):
+        if _to_apu(specunit).is_equivalent(u.km/u.s):
             round_mask = np.isclose(vaxis, np.round(vaxis, 10))
             vaxis[round_mask] = np.round(vaxis, 10)
             return vaxis
@@ -1191,7 +1192,7 @@ class Datacube:
         vaxis = image.get_vaxis(specunit=specunit)
         image.fileinfo["dv"] = vaxis[1]-vaxis[0]
         image.fileinfo["vrange"] = vaxis[[0, -1]].tolist()
-        image.fileinfo["specunit"] = _apu_to_headerstr(u.Unit(specunit))
+        image.fileinfo["specunit"] = _apu_to_headerstr(_to_apu(specunit))
         image.__updateparams()
         return image
 
@@ -1327,7 +1328,7 @@ class Datacube:
                                   Default is to use the entire velocity range.
             chans (list[float]): a list of [minimum channel, maximum channel] using 1-based indexing.
                                  Default is to use all channels.
-            threshold (float): a threshold to be applied to data cube. None to not use a threshold.
+            threshold (float): a threshold to be applied to data cube. Default is not to use a threshold.
         Returns:
             A list of moment maps (Spatialmap objects).
         -------
@@ -1416,6 +1417,22 @@ class Datacube:
         # return output
         return maps[0] if len(maps) == 1 else maps
         
+    def sum_over_chans(self, vrange=None, chans=None, threshold=None):
+        """
+        Method to sum over all channels at each pixel.
+        Parameters:
+            vrange (list[float]): a list of [minimum velocity, maximum velocity] in km/s. 
+                                  Default is to use the entire velocity range.
+            chans (list[float]): a list of [minimum channel, maximum channel] using 1-based indexing.
+                                 Default is to use all channels.
+            threshold (float): a threshold to be applied to data cube. Default is not to use a threshold.
+        Returns:
+            sum_img (Spatialmap): a map with pixels being the sum of the entire spectrum 
+        """
+        sum_img = self.immoments(moments=0, vrange=vrange, chans=chans, threshold=threshold) / self.dv
+        sum_img = (sum_img * _to_apu(self.bunit)).value
+        return sum_img
+    
     def imview(self, contourmap=None, title=None, fov=None, ncol=5, nrow=None, cmap="inferno",
                figsize=(11.69, 8.27), center=None, vrange=None, nskip=1, vskip=None, 
                tickscale=None, tickcolor="w", txtcolor='w', crosson=True, crosslw=0.5, 
@@ -1548,7 +1565,7 @@ class Datacube:
             
         # trim data along xyaxes for plotting:
         if xlim != [self.widestfov, -self.widestfov] \
-           or ylim != [self.widestfov, -self.widestfov]:
+           or ylim != [-self.widestfov, self.widestfov]:
             xmask = (xlim[1]<=self.xaxis) & (self.xaxis<=xlim[0])
             ymask = (ylim[0]<=self.yaxis) & (self.yaxis<=ylim[1])
             trimmed_data = trimmed_data[:, :, xmask, :]
@@ -1649,7 +1666,7 @@ class Datacube:
                 
                 # plot channel labels
                 if vlabelon:
-                    vlabel = f"%.{decimals}f "%thisvel + _apu_to_str(u.Unit(self.specunit)) \
+                    vlabel = f"%.{decimals}f "%thisvel + _unit_plt_str(_apu_to_str(_to_apu(self.specunit))) \
                              if vlabelunit else f"%.{decimals}f"%thisvel
                     ax.text(0.1, 0.9, vlabel, color=txtcolor, size=vlabelsize,
                             ha='left', va='top', transform=ax.transAxes)
@@ -1825,7 +1842,7 @@ class Datacube:
                                  equivalencies=equiv, factors=factors)
         
         if newdata is None:
-            raise UnitConversionError(f"Failure to convert intensity unit to {bunit.to_string()}")
+            raise UnitConversionError(f"Failure to convert intensity unit to {_apu_to_headerstr(bunit)}")
 
         # return and set values
         if not isinstance(self.data, u.Quantity):
@@ -1960,14 +1977,14 @@ class Datacube:
             self.header["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
             self.header["dy"] = u.Quantity(self.dy, self.unit).to_value(unit)
             self.header["beam"] = newbeam
-            self.header["unit"] = u.Unit(unit).to_string()
+            self.header["unit"] = _apu_to_headerstr(_to_apu(unit))
             self.__updateparams()
             return self
         newfileinfo = copy.deepcopy(self.fileinfo)
         newfileinfo["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
         newfileinfo["dy"] = u.Quantity(self.dy, self.unit).to_value(unit)
         newfileinfo["beam"] = newbeam
-        newfileinfo["unit"] = u.Unit(unit).to_string()
+        newfileinfo["unit"] = _apu_to_headerstr(_to_apu(unit))
         return Datacube(fileinfo=newfileinfo, data=self.data)
     
     def set_data(self, data, inplace=False):
@@ -2053,7 +2070,7 @@ class Datacube:
             print()
             
         if plthist:
-            q = u.Unit(self.bunit)
+            q = _to_apu(self.bunit)
             flatdata = clipped_data[~np.isnan(clipped_data)]
             ax = plt_1ddata(flatdata, hist=True, 
                             xlabel=f"Intensity ({q:latex_inline})", ylabel="Pixels",
@@ -2349,7 +2366,7 @@ class Datacube:
         """
         # initialize parameters
         xlabel = r'Radio Velocity ($\rm km~s^{-1}$)' if xlabel is None else xlabel
-        ylabel = f'Intensity ({(u.Unit(self.bunit)):latex_inline})' if ylabel is None else ylabel
+        ylabel = f'Intensity ({(_unit_plt_str(_apu_to_str(_to_apu(self.bunit))))})' if ylabel is None else ylabel
         trimmed_image = self if region is None else self.mask_region(region, preview=False)
         
         # generate the data
@@ -2480,7 +2497,7 @@ class Datacube:
         new_header['nx'] = new_nx
         new_header['ny'] = new_ny
 
-        # create new Spatialmap instance
+        # create new Datacube instance
         regridded_map = Datacube(fileinfo=new_header, data=new_data)
 
         # modify the current image in-place if requested
@@ -2526,7 +2543,7 @@ class Datacube:
             Image after shifting
         """
         unit = self.unit if unit is None else unit
-        if isinstance(coord, Spatialmap) or isinstance(coord, Datacube) or isinstance(coord, PVdiagram):
+        if isinstance(coord, (Spatialmap, Datacube, PVdiagram)):
             coord = coord.header["refcoord"]
         image = self if inplace else self.copy()
         # convert J2000 to arcsec
@@ -2907,7 +2924,7 @@ class Spatialmap:
         """
         image = self.copy()
         image.data = image.data.to_value(unit, *args, **kwargs)
-        image.bunit = image.header["bunit"] = _apu_to_headerstr(u.Unit(unit))
+        image.bunit = image.header["bunit"] = _apu_to_headerstr(_to_apu(unit))
         return image
     
     def copy(self):
@@ -3012,7 +3029,7 @@ class Spatialmap:
             Image after shifting
         """
         unit = self.unit if unit is None else unit
-        if isinstance(coord, Spatialmap) or isinstance(coord, Datacube) or isinstance(coord, PVdiagram):
+        if isinstance(coord, (Spatialmap, Datacube, PVdiagram)):
             coord = coord.header["refcoord"]
         image = self if inplace else self.copy()
         # convert J2000 to arcsec
@@ -3599,14 +3616,14 @@ class Spatialmap:
             self.header["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
             self.header["dy"] = u.Quantity(self.dy, self.unit).to_value(unit)
             self.header["beam"] = newbeam
-            self.header["unit"] = u.Unit(unit).to_string()
+            self.header["unit"] = _apu_to_headerstr(_to_apu(unit))
             self.__updateparams()
             return self
         newfileinfo = copy.deepcopy(self.fileinfo)
         newfileinfo["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
         newfileinfo["dy"] = u.Quantity(self.dy, self.unit).to_value(unit)
         newfileinfo["beam"] = newbeam
-        newfileinfo["unit"] = u.Unit(unit).to_string()
+        newfileinfo["unit"] = _apu_to_headerstr(_to_apu(unit))
         return Spatialmap(fileinfo=newfileinfo, data=self.data)
     
     def conv_bunit(self, bunit, inplace=False):
@@ -3649,7 +3666,7 @@ class Spatialmap:
                                  equivalencies=equiv, factors=factors)
         
         if newdata is None:
-            raise UnitConversionError(f"Failure to convert intensity unit to {bunit.to_string()}")
+            raise UnitConversionError(f"Failure to convert intensity unit to {_apu_to_headerstr(bunit)}")
 
         # return and set values
         if not isinstance(self.data, u.Quantity):
@@ -3756,7 +3773,7 @@ class Spatialmap:
         
         # plot data
         xlabel = f"Offset ({self.unit})" if xlabel is None else xlabel
-        ylabel = f"Intensity ({_apu_to_str(_to_apu(self.bunit)):latex_inline})" if ylabel is None else ylabel
+        ylabel = f"Intensity ({_unit_plt_str(_apu_to_str(_to_apu(self.bunit)))})" if ylabel is None else ylabel
         ax = plt_1ddata(xdata, ydata, xlabel=xlabel, ylabel=ylabel, **kwargs)
         
         # returning
@@ -3849,7 +3866,7 @@ class Spatialmap:
             print()
             
         if plthist:
-            q = u.Unit(self.bunit)
+            q = _to_apu(self.bunit)
             flatdata = clipped_data[~np.isnan(clipped_data)]
             ax = plt_1ddata(flatdata, hist=True, 
                             xlabel=f"Intensity ({q:latex_inline})", ylabel="Pixels",
@@ -3940,8 +3957,8 @@ class Spatialmap:
         """
         # set parameters to default values
         if cmap is None:
-            if u.Unit(self.bunit).is_equivalent(u.Hz) or \
-               u.Unit(self.bunit).is_equivalent(u.km/u.s):
+            if _to_apu(self.bunit).is_equivalent(u.Hz) or \
+               _to_apu(self.bunit).is_equivalent(u.km/u.s):
                 cmap = 'RdBu_r'
             else:
                 cmap = "inferno"
@@ -4647,7 +4664,7 @@ class PVdiagram:
         """
         image = self.copy()
         image.data = image.data.to_value(unit, *args, **kwargs)
-        image.bunit = image.header["bunit"] = _apu_to_headerstr(u.Unit(unit))
+        image.bunit = image.header["bunit"] = _apu_to_headerstr(_to_apu(unit))
         return image
         
     def copy(self):
@@ -4683,11 +4700,8 @@ class PVdiagram:
         Returns:
             vaxis (ndarray): the spectral axis of the data cube.
         """
-        vaxis = self.vrange[0] + np.arange(self.nchan)*self.dv
+        vaxis = np.linspace(self.vrange[0], self.vrange[1], self.nchan)
         if specunit is None:
-            if u.Unit(self.specunit).is_equivalent(u.km/u.s):
-                round_mask = np.isclose(vaxis, np.round(vaxis, 10))
-                vaxis[round_mask] = np.round(vaxis, 10)
             return vaxis
         try:
             # attempt direct conversion
@@ -4696,7 +4710,7 @@ class PVdiagram:
             # if that fails, try using equivalencies
             equiv = u.doppler_radio(self.restfreq*u.Hz)
             vaxis = u.Quantity(vaxis, self.specunit).to_value(specunit, equivalencies=equiv)
-        if u.Unit(specunit).is_equivalent(u.km/u.s):
+        if _to_apu(specunit).is_equivalent(u.km/u.s):
             round_mask = np.isclose(vaxis, np.round(vaxis, 5))
             vaxis[round_mask] = np.round(vaxis, 5)
             return vaxis
@@ -4710,7 +4724,7 @@ class PVdiagram:
         vaxis = image.get_vaxis(specunit=specunit)
         image.fileinfo["dv"] = vaxis[1]-vaxis[0]
         image.fileinfo["vrange"] = vaxis[[0, -1]].tolist()
-        image.fileinfo["specunit"] = _apu_to_headerstr(u.Unit(specunit))
+        image.fileinfo["specunit"] = _apu_to_headerstr(_to_apu(specunit))
         image.__updateparams()
         return image
     
@@ -4822,7 +4836,7 @@ class PVdiagram:
             print()
             
         if plthist:
-            q = u.Unit(self.bunit)
+            q = _to_apu(self.bunit)
             flatdata = clipped_data[~np.isnan(clipped_data)]
             ax = plt_1ddata(flatdata, hist=True, 
                             xlabel=f"Intensity ({q:latex_inline})", ylabel="Pixels",
@@ -4858,13 +4872,13 @@ class PVdiagram:
         if inplace:
             self.header["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
             self.header["beam"] = newbeam
-            self.header["unit"] = _apu_to_headerstr(u.Unit(unit))
+            self.header["unit"] = _apu_to_headerstr(_to_apu(unit))
             self.__updateparams()
             return self
         newfileinfo = copy.deepcopy(self.fileinfo)
         newfileinfo["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
         newfileinfo["beam"] = newbeam
-        newfileinfo["unit"] = _apu_to_headerstr(u.Unit(unit).to_string())
+        newfileinfo["unit"] = _apu_to_headerstr(_to_apu(unit))
         return PVdiagram(fileinfo=newfileinfo, data=self.data)
     
     def conv_bunit(self, bunit, inplace=False):
@@ -4907,7 +4921,7 @@ class PVdiagram:
                                  equivalencies=equiv, factors=factors)
         
         if newdata is None:
-            raise UnitConversionError(f"Failed to convert intensity unit to {bunit.to_string()}")
+            raise UnitConversionError(f"Failed to convert intensity unit to {_apu_to_headerstr(bunit)}")
 
         # return and set values
         if not isinstance(self.data, u.Quantity):
@@ -4967,7 +4981,7 @@ class PVdiagram:
     
     def __get_offset_resolution(self, pa=None):
         if pa is None:
-            return np.sqrt(self.bmaj*self.bmin)  # simply take average if pa is not specified
+            return np.sqrt(self.bmaj*self.bmin)  # simply take geometric mean if pa is not specified
         angle = np.deg2rad(pa-self.bpa)
         aa = np.square(np.sin(angle)/self.bmin)
         bb = np.square(np.cos(angle)/self.bmaj)
@@ -5060,9 +5074,9 @@ class PVdiagram:
                 vlim = self.maxvlim
         if vlabel is None:
             if subtract_vsys:
-                vlabel = r"$v_{\rm obs}-v_{\rm sys}$ " + "(" + _apu_to_str(u.Unit(self.specunit)) + ")"
+                vlabel = r"$v_{\rm obs}-v_{\rm sys}$ " + "(" + _unit_plt_str(_apu_to_str(_to_apu(self.specunit))) + ")"
             else:
-                vlabel = "LSR velocity " + "(" + _unit_plt_str(_apu_to_str(u.Unit(self.specunit))) + ")"
+                vlabel = "LSR velocity " + "(" + _unit_plt_str(_apu_to_str(_to_apu(self.specunit))) + ")"
         
         if xlabel is None:
             xlabel = f'Offset ({self.unit})'
@@ -5608,7 +5622,7 @@ class Region:
         raise Exception("Not implemented yet.")
 
 
-def plt_1ddata(xdata=None, ydata=None, xlim=[], ylim=[], mean_center=False, title=None,
+def plt_1ddata(xdata=None, ydata=None, xlim=None, ylim=None, mean_center=False, title=None,
                legendon=True, xlabel="", ylabel="", threshold=None, linewidth=0.8,
                xtick_spacing=None, ytick_spacing=None, ticklabelsize=7, borderwidth=0.7,
                labelsize=7, fontsize=8, ticksize=3, legendsize=6, title_position=0.92,
@@ -5617,7 +5631,11 @@ def plt_1ddata(xdata=None, ydata=None, xlim=[], ylim=[], mean_center=False, titl
                dpi=500, plot=True, **kwargs):
     
     fontsize = labelsize if fontsize is None else fontsize
-    # Get this from LaTeX using \showthe\columnwidth
+    
+    if xlim is None:
+        xlim = (np.nanmin(xdata), np.nanmax(xdata))
+    if ylim is None:
+        ylim = []
     
     params = {'axes.labelsize': labelsize,
               'axes.titlesize': labelsize,
@@ -5695,7 +5713,7 @@ def plt_1ddata(xdata=None, ydata=None, xlim=[], ylim=[], mean_center=False, titl
     return ax
 
 
-def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=[], ylim=[], 
+def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=None, ylim=None, 
                   gaussfit=True, mean_center=True, title=None, legendon=True,
                   xlabel=r"Velocity offset ($\rm km~s^{-1}$)", ylabel=r"Intensity ($\rm K$)", 
                   threshold=None, linewidth=0.8, figsize=(2.76, 2.76), xtick_spacing=None,
@@ -5733,6 +5751,10 @@ def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=[], ylim=[],
         dpi (int, optional): Resolution of the figure.
         threshold_color (str, optional): Color for the threshold line.
     """
+    if xlim is None:
+        xlim = (np.nanmin(xdata), np.nanmax(xdata))
+    if ylim is None:
+        ylim = []
     
     def gauss(x, amp, mean, fwhm):
         sigma = fwhm / 2.355
@@ -5748,7 +5770,7 @@ def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=[], ylim=[],
             xdata = xdata[mask]
             ydata = ydata[mask]
 
-        if threshold is not None and (isinstance(threshold, float) or isinstance(threshold, int)):
+        if threshold is not None and isinstance(threshold, (float, int)):
             mask = ydata > threshold
             xdata = xdata[mask]
             ydata = ydata[mask]
@@ -5871,6 +5893,17 @@ def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=[], ylim=[],
 # duplicate function
 def exportfits(image, *args, **kwargs):
     return image.exportfits(*args, **kwargs)
+
+
+# deuplicate function to quickly plot a FITS file if directory is known
+def imview(image, *args, **kwargs):
+    if isinstance(image, (Datacube, Spatialmap, PVdiagram)):
+        return image.imview(*args, **kwargs)
+    elif isinstance(image, *args, **kwargs):
+        image = importfits(image)
+        return image.imview(*args, **kwargs)
+    else:
+        raise ValueError("'image' parameter must be a direcotry to a FITS file or an image instance.")
 
 
 def search_molecular_line(restfreq, unit="GHz", printinfo=True):
@@ -6154,12 +6187,12 @@ def J_v(v, T):
     return Jv.to(u.K)
 
 
-def column_density_linear_optically_thin(moment0_map, T_ex, T_bg=2.726, R_i=1, f=1.):
+def column_density_linear_optically_thin(image, T_ex, T_bg=2.726, R_i=1, f=1.):
     """
     Public function to calculate the column density of a linear molecule using optically thin assumption.
     Source: https://doi.org/10.48550/arXiv.1501.01703
     Parameters:
-        moment0_map (Spatialmap): the moment 0 map
+        image (Spatialmap/Datacube): the moment 0 / datacube map
         T_ex (float): the excitation temperature [K]
         T_bg (float): background temperature [K]. 
                       Default is to use cosmic microwave background (2.726 K).
@@ -6168,7 +6201,7 @@ def column_density_linear_optically_thin(moment0_map, T_ex, T_bg=2.726, R_i=1, f
         f (float): a correction factor accounting for source area being smaller than beam area.
                    Default = 1 assumes source area is larger than beam area.
     Returns:
-        cd_img (Spatialmap): the column density map
+        cd_img (Spatialmap/Datacube): the column density map
     """
     # constants
     k = const.k_B.cgs
@@ -6179,10 +6212,20 @@ def column_density_linear_optically_thin(moment0_map, T_ex, T_bg=2.726, R_i=1, f
         T_ex *= u.K
     if not isinstance(T_bg, u.Quantity):
         T_bg *= u.K
-    moment0_map = moment0_map.conv_bunit("K.km/s")
+    
+    # convert units 
+    if isinstance(image, Spatialmap):
+        image = image.conv_bunit("K.km/s")*u.K*u.km/u.s
+    elif isinstance(image, Datacube):
+        image = image.conv_bunit("K")
+        image = image.conv_specunit("km/s")
+        dv = image.header["dv"]
+        image = image*dv*(u.K*u.km/u.s)
+    else:
+        raise ValueError(f"Invalid data type for image: {type(image)}")
     
     # get info
-    line_data = moment0_map.line_info(printinfo=True)
+    line_data = image.line_info(printinfo=True)
     v = line_data[2]*u.GHz  # rest frequency
     S_mu2 = line_data[6]*(1e-18**2)*(u.cm**5*u.g/u.s**2)  # S mu^2 * g_i*g_j*g_k [debye2]
     E_u = line_data[11]*u.K  # upper energy level 
@@ -6199,7 +6242,7 @@ def column_density_linear_optically_thin(moment0_map, T_ex, T_bg=2.726, R_i=1, f
     cc = np.exp(E_u/T_ex) / (np.exp(h*v/k/T_ex)-1)
     dd = 1 / (J_v(v=v, T=T_ex)-J_v(v=v, T=T_bg))
     constant = aa*bb*cc*dd/f
-    cd_img = constant*(moment0_map*u.K*u.km/u.s)
+    cd_img = constant*image
     cd_img = cd_img.to_value(u.cm**-2)
     return cd_img
 
