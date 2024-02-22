@@ -8,6 +8,8 @@ The Python module, **astroviz**, is a comprehensive tool for data analysis and v
 * matplotlib
 * astroquery (only needed for .line_info() method)
 * urllib (only needed for .line_info() method)
+  
+* This module only works in Python 3.
 
 # Examples
 FITS files can be read using the 'importfits' function or via the constructors of the 'PVdiagram', 'Spatialmap,' and 'Datacube' classes. Astroviz is capable of reading data up to three dimensions (PV Diagrams, Continuum Maps, Moment Maps, and Data Cubes). Here are some different ways of importing a FITS file:
