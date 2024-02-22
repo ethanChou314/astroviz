@@ -205,24 +205,26 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         vrange = None
         vtype = None
         vunit = None
-    else:   
-        vunit = hdu_header.get(f"CUNIT{freq_axis_num}", "km/s" if is_vel else "Hz")
+    else:
+        vunit = hdu_header.get(f"CUNIT{freq_axis_num}", ("km/s" if is_vel else "Hz"))
+        vrefpix = hdu_header.get(f"CRPIX{freq_axis_num}", 1)
+        vrefval = hdu_header.get(f"CRVAL{freq_axis_num}")
         dv = hdu_header.get(f"CDELT{freq_axis_num}")
-        startv = hdu_header.get(f"CRVAL{freq_axis_num}")
-        endv = startv+dv*(nchan-1)
+        startv = dv*(vrefpix-1) + vrefval
+        endv = dv*(vrefpix+nchan-2) + vrefval
         if u.Unit(vunit) != u.Unit(specunit):
             equiv = u.doppler_radio(restfreq*u.Hz)
             startv = u.Quantity(startv, vunit).to_value(specunit, equivalencies=equiv)
             endv = u.Quantity(endv, vunit).to_value(specunit, equivalencies=equiv)
             dv = (endv-startv)/(nchan-1)
             if specunit == "km/s":
-                rounded_startv = round(startv, 5)
+                rounded_startv = round(startv, 7)
                 if np.isclose(startv, rounded_startv):
                     start = rounded_startv
-                rounded_endv = round(endv, 5)
+                rounded_endv = round(endv, 7)
                 if np.isclose(endv, rounded_endv):
                     endv = rounded_endv
-                rounded_dv = round(dv, 5)
+                rounded_dv = round(dv, 7)
                 if np.isclose(dv, rounded_dv):
                     dv = rounded_dv
         vrange = [startv, endv]
@@ -883,7 +885,7 @@ class Datacube:
         self.nv = self.nchan = self.fileinfo["nchan"]        
         self.vaxis = self.get_vaxis()
         
-    # magic methods to define operators
+        # magic methods to define operators
     def __add__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
@@ -893,6 +895,16 @@ class Datacube:
                 print("WARNING: operation performed on two images with different units.")
             return Datacube(fileinfo=self.fileinfo, data=self.data+other.data)
         return Datacube(fileinfo=self.fileinfo, data=self.data+other)
+    
+    def __radd__(self, other):
+        if isinstance(other, Datacube):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
+            return Datacube(fileinfo=self.fileinfo, data=other.data+self.data)
+        return Datacube(fileinfo=self.fileinfo, data=other+self.data)
         
     def __sub__(self, other):
         if isinstance(other, Datacube):
@@ -903,6 +915,16 @@ class Datacube:
                 print("WARNING: operation performed on two images with different units.")
             return Datacube(fileinfo=self.fileinfo, data=self.data-other.data)
         return Datacube(fileinfo=self.fileinfo, data=self.data-other)
+    
+    def __rsub__(self, other):
+        if isinstance(other, Datacube):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
+            return Datacube(fileinfo=self.fileinfo, data=other.data-self.data)
+        return Datacube(fileinfo=self.fileinfo, data=other-self.data)
         
     def __mul__(self, other):
         if isinstance(other, Datacube):
@@ -911,6 +933,14 @@ class Datacube:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             return Datacube(fileinfo=self.fileinfo, data=self.data*other.data)
         return Datacube(fileinfo=self.fileinfo, data=self.data*other)
+    
+    def __rmul__(self, other):
+        if isinstance(other, Datacube):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return Datacube(fileinfo=self.fileinfo, data=other.data*self.data)
+        return Datacube(fileinfo=self.fileinfo, data=other*self.data)
     
     def __pow__(self, other):
         if isinstance(other, Datacube):
@@ -925,8 +955,8 @@ class Datacube:
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data**other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data**other)
+            return Datacube(fileinfo=self.fileinfo, data=other.data**self.data)
+        return Datacube(fileinfo=self.fileinfo, data=other**self.data)
         
     def __truediv__(self, other):
         if isinstance(other, Datacube):
@@ -935,6 +965,14 @@ class Datacube:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             return Datacube(fileinfo=self.fileinfo, data=self.data/other.data)
         return Datacube(fileinfo=self.fileinfo, data=self.data/other)
+    
+    def __rtruediv__(self, other):
+        if isinstance(other, Datacube):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return Datacube(fileinfo=self.fileinfo, data=other.data/self.data)
+        return Datacube(fileinfo=self.fileinfo, data=other/self.data)
         
     def __floordiv__(self, other):
         if isinstance(other, Datacube):
@@ -944,6 +982,14 @@ class Datacube:
             return Datacube(fileinfo=self.fileinfo, data=self.data//other.data)
         return Datacube(fileinfo=self.fileinfo, data=self.data//other)
     
+    def __rfloordiv__(self, other):
+        if isinstance(other, Datacube):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return Datacube(fileinfo=self.fileinfo, data=other.data//self.data)
+        return Datacube(fileinfo=self.fileinfo, data=other//self.data)
+    
     def __mod__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
@@ -951,6 +997,14 @@ class Datacube:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             return Datacube(fileinfo=self.fileinfo, data=self.data%other.data)
         return Datacube(fileinfo=self.fileinfo, data=self.data%other)
+    
+    def __rmod__(self, other):
+        if isinstance(other, Datacube):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return Datacube(fileinfo=self.fileinfo, data=other.data%self.data)
+        return Datacube(fileinfo=self.fileinfo, data=other%self.data)
     
     def __lt__(self, other):
         if isinstance(other, Datacube):
@@ -1009,15 +1063,6 @@ class Datacube:
     def __neg__(self):
         return Datacube(fileinfo=self.fileinfo, data=-self.data)
     
-    def __round__(self, n):
-        return Datacube(fileinfo=self.fileinfo, data=np.round(self.data, n))
-    
-    def round(self, decimals):
-        """
-        This is a method alias for the round function, round(Datacube).
-        """
-        return Datacube(fileinfo=self.fileinfo, data=np.round(self.data, decimals))
-    
     def __invert__(self):
         return Datacube(fileinfo=self.fileinfo, data=~self.data)
     
@@ -1026,8 +1071,8 @@ class Datacube:
             try:
                 return Datacube(fileinfo=self.fileinfo, data=self.data[indices])
             except:
-                print("WARNING: Returning value after reshaping image data to 3 dimensions.")
-                return self.data.copy[0][indices]
+                print("WARNING: Returning value after reshaping image data to 2 dimensions.")
+                return self.data.copy[:, indices[0], indices[1]]
         except:
             return self.data[indices]
     
@@ -1059,8 +1104,8 @@ class Datacube:
         else:
             return result
         
-    def __array__(self, *inputs, **kwargs):
-        return np.array(self.data, *inputs, **kwargs)
+    def __array__(self, *args, **kwargs):
+        return np.array(self.data, *args, **kwargs)
     
     def to(self, unit, *args, **kwargs):
         """
@@ -1119,11 +1164,11 @@ class Datacube:
         Returns:
             vaxis (ndarray): the spectral axis of the data cube.
         """
-        vaxis = np.arange(self.vrange[0], self.vrange[-1]+self.dv, self.dv)
+        vaxis = self.vrange[0] + np.arange(self.nchan)*self.dv
         if specunit is None:
             if u.Unit(self.specunit).is_equivalent(u.km/u.s):
-                round_mask = np.isclose(vaxis, np.round(vaxis, 5))
-                vaxis[round_mask] = np.round(vaxis, 5)
+                round_mask = np.isclose(vaxis, np.round(vaxis, 10))
+                vaxis[round_mask] = np.round(vaxis, 10)
             return vaxis
         try:
             # attempt direct conversion
@@ -1133,8 +1178,8 @@ class Datacube:
             equiv = u.doppler_radio(self.restfreq*u.Hz)
             vaxis = u.Quantity(vaxis, self.specunit).to_value(specunit, equivalencies=equiv)
         if u.Unit(specunit).is_equivalent(u.km/u.s):
-            round_mask = np.isclose(vaxis, np.round(vaxis, 5))
-            vaxis[round_mask] = np.round(vaxis, 5)
+            round_mask = np.isclose(vaxis, np.round(vaxis, 10))
+            vaxis[round_mask] = np.round(vaxis, 10)
             return vaxis
         return vaxis
     
@@ -2638,6 +2683,16 @@ class Spatialmap:
                 print("WARNING: operation performed on two images with different units.")
             return Spatialmap(fileinfo=self.fileinfo, data=self.data+other.data)
         return Spatialmap(fileinfo=self.fileinfo, data=self.data+other)
+    
+    def __radd__(self, other):
+        if isinstance(other, Spatialmap):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
+            return Spatialmap(fileinfo=self.fileinfo, data=other.data+self.data)
+        return Spatialmap(fileinfo=self.fileinfo, data=other+self.data)
         
     def __sub__(self, other):
         if isinstance(other, Spatialmap):
@@ -2648,6 +2703,16 @@ class Spatialmap:
                 print("WARNING: operation performed on two images with different units.")
             return Spatialmap(fileinfo=self.fileinfo, data=self.data-other.data)
         return Spatialmap(fileinfo=self.fileinfo, data=self.data-other)
+    
+    def __rsub__(self, other):
+        if isinstance(other, Spatialmap):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
+            return Spatialmap(fileinfo=self.fileinfo, data=other.data-self.data)
+        return Spatialmap(fileinfo=self.fileinfo, data=other-self.data)
         
     def __mul__(self, other):
         if isinstance(other, Spatialmap):
@@ -2656,6 +2721,14 @@ class Spatialmap:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             return Spatialmap(fileinfo=self.fileinfo, data=self.data*other.data)
         return Spatialmap(fileinfo=self.fileinfo, data=self.data*other)
+    
+    def __rmul__(self, other):
+        if isinstance(other, Spatialmap):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return Spatialmap(fileinfo=self.fileinfo, data=other.data*self.data)
+        return Spatialmap(fileinfo=self.fileinfo, data=other*self.data)
     
     def __pow__(self, other):
         if isinstance(other, Spatialmap):
@@ -2670,8 +2743,8 @@ class Spatialmap:
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data**other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data**other)
+            return Spatialmap(fileinfo=self.fileinfo, data=other.data**self.data)
+        return Spatialmap(fileinfo=self.fileinfo, data=other.data**self.data)
         
     def __truediv__(self, other):
         if isinstance(other, Spatialmap):
@@ -2680,6 +2753,14 @@ class Spatialmap:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             return Spatialmap(fileinfo=self.fileinfo, data=self.data/other.data)
         return Spatialmap(fileinfo=self.fileinfo, data=self.data/other)
+    
+    def __rtruediv__(self, other):
+        if isinstance(other, Spatialmap):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return Spatialmap(fileinfo=self.fileinfo, data=other.data/self.data)
+        return Spatialmap(fileinfo=self.fileinfo, data=other/self.data)
         
     def __floordiv__(self, other):
         if isinstance(other, Spatialmap):
@@ -2689,6 +2770,14 @@ class Spatialmap:
             return Spatialmap(fileinfo=self.fileinfo, data=self.data//other.data)
         return Spatialmap(fileinfo=self.fileinfo, data=self.data//other)
     
+    def __rfloordiv__(self, other):
+        if isinstance(other, Spatialmap):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return Spatialmap(fileinfo=self.fileinfo, data=other.data//self.data)
+        return Spatialmap(fileinfo=self.fileinfo, data=other//self.data)
+    
     def __mod__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
@@ -2696,6 +2785,14 @@ class Spatialmap:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             return Spatialmap(fileinfo=self.fileinfo, data=self.data%other.data)
         return Spatialmap(fileinfo=self.fileinfo, data=self.data%other)
+    
+    def __rmod__(self, other):
+        if isinstance(other, Spatialmap):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return Spatialmap(fileinfo=self.fileinfo, data=other.data%self.data)
+        return Spatialmap(fileinfo=self.fileinfo, data=other%self.data)
     
     def __lt__(self, other):
         if isinstance(other, Spatialmap):
@@ -2754,15 +2851,6 @@ class Spatialmap:
     def __neg__(self):
         return Spatialmap(fileinfo=self.fileinfo, data=-self.data)
     
-    def __round__(self, n):
-        return Spatialmap(fileinfo=self.fileinfo, data=np.round(self.data, n))
-    
-    def round(self, decimals):
-        """
-        This is a method alias for the round function, round(Spatialmap).
-        """
-        return Spatialmap(fileinfo=self.fileinfo, data=np.round(self.data, decimals))
-    
     def __invert__(self):
         return Spatialmap(fileinfo=self.fileinfo, data=~self.data)
     
@@ -2772,7 +2860,7 @@ class Spatialmap:
                 return Spatialmap(fileinfo=self.fileinfo, data=self.data[indices])
             except:
                 print("WARNING: Returning value after reshaping image data to 2 dimensions.")
-                return self.data.copy[0, 0][indices]
+                return self.data.copy[:, indices[0], indices[1]]
         except:
             return self.data[indices]
     
@@ -2804,8 +2892,8 @@ class Spatialmap:
         else:
             return result
         
-    def __array__(self, *inputs, **kwargs):
-        return np.array(self.data, *inputs, **kwargs)
+    def __array__(self, *args, **kwargs):
+        return np.array(self.data, *args, **kwargs)
     
     def to(self, unit, *args, **kwargs):
         """
@@ -4335,6 +4423,16 @@ class PVdiagram:
                 print("WARNING: operation performed on two images with different units.")
             return PVdiagram(fileinfo=self.fileinfo, data=self.data+other.data)
         return PVdiagram(fileinfo=self.fileinfo, data=self.data+other)
+    
+    def __radd__(self, other):
+        if isinstance(other, PVdiagram):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
+            return PVdiagram(fileinfo=self.fileinfo, data=other.data+self.data)
+        return PVdiagram(fileinfo=self.fileinfo, data=other+self.data)
         
     def __sub__(self, other):
         if isinstance(other, PVdiagram):
@@ -4345,6 +4443,16 @@ class PVdiagram:
                 print("WARNING: operation performed on two images with different units.")
             return PVdiagram(fileinfo=self.fileinfo, data=self.data-other.data)
         return PVdiagram(fileinfo=self.fileinfo, data=self.data-other)
+    
+    def __rsub__(self, other):
+        if isinstance(other, PVdiagram):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            if self.bunit != other.bunit:
+                print("WARNING: operation performed on two images with different units.")
+            return PVdiagram(fileinfo=self.fileinfo, data=other.data-self.data)
+        return PVdiagram(fileinfo=self.fileinfo, data=other-self.data)
         
     def __mul__(self, other):
         if isinstance(other, PVdiagram):
@@ -4353,6 +4461,14 @@ class PVdiagram:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             return PVdiagram(fileinfo=self.fileinfo, data=self.data*other.data)
         return PVdiagram(fileinfo=self.fileinfo, data=self.data*other)
+    
+    def __rmul__(self, other):
+        if isinstance(other, PVdiagram):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return PVdiagram(fileinfo=self.fileinfo, data=other.data*self.data)
+        return PVdiagram(fileinfo=self.fileinfo, data=other*self.data)
     
     def __pow__(self, other):
         if isinstance(other, PVdiagram):
@@ -4367,8 +4483,8 @@ class PVdiagram:
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data**other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data**other)
+            return PVdiagram(fileinfo=self.fileinfo, data=other.data**self.data)
+        return PVdiagram(fileinfo=self.fileinfo, data=other**self.data)
         
     def __truediv__(self, other):
         if isinstance(other, PVdiagram):
@@ -4377,6 +4493,14 @@ class PVdiagram:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             return PVdiagram(fileinfo=self.fileinfo, data=self.data/other.data)
         return PVdiagram(fileinfo=self.fileinfo, data=self.data/other)
+    
+    def __rtruediv__(self, other):
+        if isinstance(other, PVdiagram):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return PVdiagram(fileinfo=self.fileinfo, data=other.data/self.data)
+        return PVdiagram(fileinfo=self.fileinfo, data=other/self.data)
         
     def __floordiv__(self, other):
         if isinstance(other, PVdiagram):
@@ -4386,6 +4510,14 @@ class PVdiagram:
             return PVdiagram(fileinfo=self.fileinfo, data=self.data//other.data)
         return PVdiagram(fileinfo=self.fileinfo, data=self.data//other)
     
+    def __rfloordiv__(self, other):
+        if isinstance(other, PVdiagram):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return PVdiagram(fileinfo=self.fileinfo, data=other.data//self.data)
+        return PVdiagram(fileinfo=self.fileinfo, data=other//self.data)
+    
     def __mod__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
@@ -4393,6 +4525,14 @@ class PVdiagram:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             return PVdiagram(fileinfo=self.fileinfo, data=self.data%other.data)
         return PVdiagram(fileinfo=self.fileinfo, data=self.data%other)
+    
+    def __rmod__(self, other):
+        if isinstance(other, PVdiagram):
+            if self.resolution is not None and other.resolution is not None:
+                if np.round(self.resolution, 1) != np.round(other.resolution, 1):
+                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+            return PVdiagram(fileinfo=self.fileinfo, data=other.data%self.data)
+        return PVdiagram(fileinfo=self.fileinfo, data=other%self.data)
     
     def __lt__(self, other):
         if isinstance(other, PVdiagram):
@@ -4451,15 +4591,6 @@ class PVdiagram:
     def __neg__(self):
         return PVdiagram(fileinfo=self.fileinfo, data=-self.data)
     
-    def __round__(self, n):
-        return PVdiagram(fileinfo=self.fileinfo, data=np.round(self.data, n))
-    
-    def round(self, decimals):
-        """
-        This is a method alias for the round function, round(PVdiagram).
-        """
-        return PVdiagram(fileinfo=self.fileinfo, data=np.round(self.data, decimals))
-    
     def __invert__(self):
         return PVdiagram(fileinfo=self.fileinfo, data=~self.data)
     
@@ -4501,8 +4632,8 @@ class PVdiagram:
         else:
             return result
         
-    def __array__(self, *inputs, **kwargs):
-        return np.array(self.data, *inputs, **kwargs)
+    def __array__(self, *args, **kwargs):
+        return np.array(self.data, *args, **kwargs)
     
     def to(self, unit, *args, **kwargs):
         """
@@ -4552,11 +4683,11 @@ class PVdiagram:
         Returns:
             vaxis (ndarray): the spectral axis of the data cube.
         """
-        vaxis = np.arange(self.vrange[0], self.vrange[-1]+self.dv, self.dv)
+        vaxis = self.vrange[0] + np.arange(self.nchan)*self.dv
         if specunit is None:
             if u.Unit(self.specunit).is_equivalent(u.km/u.s):
-                round_mask = np.isclose(vaxis, np.round(vaxis, 5))
-                vaxis[round_mask] = np.round(vaxis, 5)
+                round_mask = np.isclose(vaxis, np.round(vaxis, 10))
+                vaxis[round_mask] = np.round(vaxis, 10)
             return vaxis
         try:
             # attempt direct conversion
