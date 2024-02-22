@@ -55,7 +55,7 @@ datacube.view_region(ellipse)
 line = av.Region("test_fitsfiles/line")  # supports reading of DS9 regions.
 extracted_pv = datacube.pvextractor(line)  # extract the pv diagram
 
-# Performing 2D ellipcial Gaussian fitting is really simple with the 'imfit' method:
+# Performing 2D ellipcial Gaussian fitting with the 'imfit' method:
 circle = av.Region(center=(0, 0), radius=1)
 continuum.imfit(circle, plt_residual=True)  # it can help you plot the residual!
 
