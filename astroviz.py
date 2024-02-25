@@ -75,6 +75,8 @@ import numpy as np
 import copy
 import os
 import sys
+# import string
+# import inspect
 import datetime as dt
 
 # scientific packages
@@ -155,7 +157,8 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         else:
             if len(good_hdu) >= 2:
                 if not quiet:
-                    print(f"Found {len(good_hdu)} readable HDUs. Change 'hduindex' parameter to read a different HDU.")
+                    print(f"Found {len(good_hdu)} readable HDUs." +  
+                          "Change 'hduindex' parameter to read a different HDU.")
                     print("Below are the readable HDUs and their corresponding 'hduindex' parameters:")
                     for i in range(len(good_hdu)):
                         print(f"[{i}] {good_hdu[i]}")
@@ -164,8 +167,8 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
             data = good_hdu[hduindex].data
             hdu_header = dict(good_hdu[hduindex].header)
     
-    # start reading and exporting header
-    ctype = [hdu_header.get(f"CTYPE{i}", "") for i in range(1, data.ndim+1)] # store ctypes as list, 1-based indexing
+    # store ctypes as list, 1-based indexing
+    ctype = [hdu_header.get(f"CTYPE{i}", "") for i in range(1, data.ndim+1)] 
     
     # get rest frequency
     if "RESTFRQ" in hdu_header:
@@ -175,10 +178,11 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
     elif "FREQ" in hdu_header:
         restfreq = hdu_header["FREQ"]
     else:
-        raise Exception("Failed to read rest frequnecy.")
+        restfreq = np.nan
+        print("WARNING: Failed to read rest frequnecy.")
     
     # stokes axis
-    nstokes = hdu_header.get(f"NAXIS{ctype.index('STOKES')+1}") if "STOKES" in ctype else 1
+    nstokes = hdu_header.get(f"NAXIS{ctype.index('STOKES')+1}", 1) if "STOKES" in ctype else 1
 
     # frequency axis
     if "FREQ" in ctype:
@@ -243,7 +247,7 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         refx = hdu_header.get(f"CRVAL{xaxis_num}")
         nx = hdu_header.get(f"NAXIS{xaxis_num}")
         dx = hdu_header.get(f"CDELT{xaxis_num}")
-        refnx = hdu_header.get(f"CRPIX{xaxis_num}")
+        refnx = int(hdu_header.get(f"CRPIX{xaxis_num}"))
         if xunit != spatialunit:
             if dx is not None:
                 dx = u.Quantity(dx, xunit).to_value(spatialunit)
@@ -255,7 +259,7 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         refx = hdu_header.get(f"CRVAL{xaxis_num}")
         nx = hdu_header.get(f"NAXIS{xaxis_num}")
         dx = hdu_header.get(f"CDELT{xaxis_num}")
-        refnx = hdu_header.get(f"CRPIX{xaxis_num}")
+        refnx = int(hdu_header.get(f"CRPIX{xaxis_num}"))
         if xunit != spatialunit:
             if dx is not None:
                 dx = u.Quantity(dx, xunit).to_value(spatialunit)
@@ -266,6 +270,7 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         refx = None
         dx = None
         refnx = None
+        print("WARNING: Failed to read right ascension / offset axis information.")
     
     # declination axis
     dec_mask = ["DEC" in item for item in ctype]
@@ -278,7 +283,7 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         refy = hdu_header.get(f"CRVAL{yaxis_num}")
         ny = hdu_header.get(f"NAXIS{yaxis_num}")
         dy = hdu_header.get(f"CDELT{yaxis_num}")
-        refny = hdu_header.get(f"CRPIX{yaxis_num}")
+        refny = int(hdu_header.get(f"CRPIX{yaxis_num}"))
         if yunit != spatialunit:
             if dy is not None:
                 dy = u.Quantity(dy, yunit).to_value(spatialunit)
@@ -291,9 +296,11 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         refny = None
         
     # set reference coordinates
-    refcoord = None     # initialize
     if refx is not None and refy is not None:
-        refcoord = SkyCoord(ra=u.Quantity(refx, spatialunit), dec=u.Quantity(refy, spatialunit)).to_string('hmsdms')
+        refcoord = SkyCoord(ra=u.Quantity(refx, spatialunit), 
+                            dec=u.Quantity(refy, spatialunit)).to_string('hmsdms')
+    else:
+        refcoord = None
     
     # determine image type and reshape data
     if nx > 1 and ny > 1 and nchan > 1:
@@ -307,17 +314,21 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
     elif nchan > 1 and nx > 1 and ny == 1:
         imagetype = "pvdiagram"
         newshape = (nstokes, nchan, nx)
-        if data.shape == (nstokes, nx, nchan):
-            data = data[0].T[None, :, :]  # transpose if necessary
+        if data.shape != newshape:
+            if data.shape == (nstokes, nx, nchan):
+                data = data[0].T[None, :, :]  # transpose if necessary
+            else:
+                data = data.reshape(newshape)
+                print("WARNING: Data of PV diagram will be reshaped.")
     else:
-        raise Exception("Image cannot be read as 'datacube', 'spatialmap', or 'pvdiagram'")
+        raise Exception("Image cannot be read as 'datacube', 'spatialmap', or 'pvdiagram'.")
     
     # beam size
-    bmaj = hdu_header.get("BMAJ", np.nan)
-    bmin = hdu_header.get("BMIN", np.nan)
+    bmaj = hdu_header.get("BMAJ", np.nan) # deg
+    bmin = hdu_header.get("BMIN", np.nan) # deg
     bpa =  hdu_header.get("BPA", np.nan)  # deg
     
-    if spatialunit != "deg":  # convert beam size unit if necessary
+    if spatialunit not in ("deg", "degrees", "degree"):  # convert beam size unit if necessary
         if not np.isnan(bmaj):
             bmaj = u.Quantity(bmaj, u.deg).to_value(spatialunit)
         if not np.isnan(bmin):
@@ -325,53 +336,53 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
     
     # eliminate rounding error due to float64
     if dx is not None:
-        dx = float(str(np.float32(dx)))
+        dx = round(dx, 7)
     if dy is not None:
-        dy = float(str(np.float32(dy)))
+        dy = round(dy, 7)
     if not np.isnan(bmaj):
-        bmaj = float(str(np.float32(bmaj)))
+        bmaj = round(bmaj, 7)
     if not np.isnan(bmin):
-        bmin = float(str(np.float32(bmin)))
+        bmin = round(bmin, 7)
     if not np.isnan(bpa):
-        bpa = float(str(np.float32(bpa)))
+        bpa = round(bpa, 7)
             
     # input information into dictionary as header information of image
-    fileinfo = {"name": fitsfile,
-                "shape": newshape,
-                "imagetype": imagetype,
-                "nstokes": nstokes,
-                "vrange": vrange,
-                "dv": dv,
-                "nchan": nchan,
-                "dx": dx, 
-                "nx": nx,
-                "refnx": refnx,
-                "dy": dy,
-                "ny": ny,
-                "refny": refny,
-                "refcoord": refcoord,
-                "restfreq": restfreq,
-                "beam": (bmaj, bmin, bpa),
-                "specframe": hdu_header.get("RADESYS", "ICRS"),
-                "unit": spatialunit,
-                "specunit": _apu_to_headerstr(_to_apu(specunit)),
-                "bunit": hdu_header.get("BUNIT", ""),
-                "projection": projection,
-                "object": hdu_header.get("OBJECT", ""),
-                "instrument": hdu_header.get("INSTRUME", ""),
-                "observer": hdu_header.get("OBSERVER", ""),
-                "obsdate": hdu_header.get("DATE-OBS", ""),
-                "date": hdu_header.get("DATE", ""),
-                "origin": hdu_header.get("ORIGIN", ""),
-                }
+    header = {"filepath": fitsfile,
+              "shape": newshape,
+              "imagetype": imagetype,
+              "nstokes": nstokes,
+              "vrange": vrange,
+              "dv": dv,
+              "nchan": nchan,
+              "dx": dx, 
+              "nx": nx,
+              "refnx": refnx,
+              "dy": dy,
+              "ny": ny,
+              "refny": refny,
+              "refcoord": refcoord,
+              "restfreq": restfreq,
+              "beam": (bmaj, bmin, bpa),
+              "specframe": hdu_header.get("RADESYS", "ICRS"),
+              "unit": spatialunit,
+              "specunit": '' if imagetype == "spatialmap" else _apu_to_headerstr(_to_apu(specunit)),
+              "bunit": hdu_header.get("BUNIT", ""),
+              "projection": projection,
+              "object": hdu_header.get("OBJECT", ""),
+              "instrument": hdu_header.get("INSTRUME", ""),
+              "observer": hdu_header.get("OBSERVER", ""),
+              "obsdate": hdu_header.get("DATE-OBS", ""),
+              "date": hdu_header.get("DATE", ""),
+              "origin": hdu_header.get("ORIGIN", ""),
+              }
 
     # return image
     if imagetype == "datacube":
-        return Datacube(fileinfo=fileinfo, data=data)
+        return Datacube(header=header, data=data)
     elif imagetype == "spatialmap":
-        return Spatialmap(fileinfo=fileinfo, data=data)
+        return Spatialmap(header=header, data=data)
     elif imagetype == "pvdiagram":
-        return PVdiagram(fileinfo=fileinfo, data=data)
+        return PVdiagram(header=header, data=data)
 
 
 def _get_hduheader(image):
@@ -384,8 +395,8 @@ def _get_hduheader(image):
         header (astropy.io.fits.header.Header): the extracted header information.
     """
     # get fitsfile from name 
-    if image.header["name"]:
-        fitsfile = fits.open(image.header["name"])[0]
+    if image.header["filepath"]:
+        fitsfile = fits.open(image.header["filepath"])[0]
         hdu_header = copy.deepcopy(fitsfile.header)
     else:
         hdu_header = fits.Header()  # create empty header if file path cannot be located
@@ -704,6 +715,8 @@ def _apu_to_headerstr(unit):
                 headerstr += "." + ustr
     if headerstr.startswith("/"):
         headerstr = "1" + headerstr
+    # deal with special case (having solar mass/luminosity as unit)
+    headerstr = headerstr.replace("_{\\odot}", "sun")
     return headerstr
 
 
@@ -717,6 +730,7 @@ def _unit_plt_str(mathstr):
     for i, unit in enumerate(math_lst[:]):
         math_lst[i] = unit.replace("^{", "$^{").replace("}", "}$")
     mathstr = " ".join(math_lst)
+    mathstr = mathstr.replace(r"_{\odot}$", r"$_{\odot}$")
     return mathstr
 
 
@@ -822,71 +836,70 @@ class Datacube:
         is in the correct format. It can handle FITS files with different configurations and
         is designed to be flexible for various data shapes and sizes.
     """
-    def __init__(self, fitsfile=None, fileinfo=None, data=None, hduindex=0, 
+    def __init__(self, fitsfile=None, header=None, data=None, hduindex=0, 
                  spatialunit="arcsec", specunit="km/s", quiet=False):
         if fitsfile is not None:
             fits = importfits(fitsfile, hduindex=hduindex, spatialunit=spatialunit, 
                               specunit=specunit, quiet=False)
-            self.fileinfo = fits.fileinfo
+            self.header = fits.header
             self.data = fits.data
-        elif fileinfo is not None:
-            self.fileinfo = fileinfo
+        elif header is not None:
+            self.header = header
             self.data = data
-        if self.fileinfo["imagetype"] != "datacube":
+        if self.header["imagetype"] != "datacube":
             raise TypeError("The given FITS file cannot be read as a data cube.")
         self.__updateparams()
         
         if isinstance(self.data, u.quantity.Quantity):
-            self.value = Datacube(fileinfo=self.fileinfo, data=self.data.value)
+            self.value = Datacube(header=self.header, data=self.data.value)
         
         self._peakshifted = False
         self.__pltnax = 0
         self.__pltnchan = 0
         
     def __updateparams(self):
-        self.header = self.fileinfo
-        self.spatialunit = self.unit = self.axisunit = self.fileinfo["unit"]
-        nx = self.nx = self.fileinfo["nx"]
-        dx = self.dx = self.fileinfo["dx"]
-        refnx = self.refnx = self.fileinfo["refnx"]
-        ny = self.ny = self.fileinfo["ny"]
-        dy = self.dy = self.fileinfo["dy"]
-        refny = self.refny = self.fileinfo["refny"]
+        self.spatialunit = self.unit = self.axisunit = self.header["unit"]
+        nx = self.nx = self.header["nx"]
+        dx = self.dx = self.header["dx"]
+        refnx = self.refnx = self.header["refnx"]
+        ny = self.ny = self.header["ny"]
+        dy = self.dy = self.header["dy"]
+        refny = self.refny = self.header["refny"]
         self.xaxis, self.yaxis = self.get_xyaxes()
-        self.shape = self.fileinfo["shape"]
+        self.shape = self.header["shape"]
         self.size = self.data.size
-        self.restfreq = self.fileinfo["restfreq"]
-        self.bmaj, self.bmin, self.bpa = self.beam = self.fileinfo["beam"]
+        self.restfreq = self.header["restfreq"]
+        self.bmaj, self.bmin, self.bpa = self.beam = self.header["beam"]
         self.resolution = np.sqrt(self.beam[0]*self.beam[1]) if self.beam is not None else None
-        self.refcoord = self.fileinfo["refcoord"]
+        self.refcoord = self.header["refcoord"]
         if isinstance(self.data, u.Quantity):
-            self.bunit = self.fileinfo["bunit"] = _apu_to_headerstr(self.data.unit)
+            self.bunit = self.header["bunit"] = _apu_to_headerstr(self.data.unit)
         else:
-            self.bunit = self.fileinfo["bunit"]
+            self.bunit = self.header["bunit"]
         xmin, xmax = self.xaxis[[0, -1]]
         ymin, ymax = self.yaxis[[0, -1]]
         self.imextent = [xmin-0.5*dx, xmax+0.5*dx, 
                          ymin-0.5*dy, ymax+0.5*dy]
         self.widestfov = max(self.xaxis[0], self.yaxis[-1])
-        self.specunit = self.fileinfo["specunit"]
+        self.specunit = self.header["specunit"]
         if self.specunit == "km/s":
-            rounded_dv = round(self.fileinfo["dv"], 5)
-            if np.isclose(self.fileinfo["dv"], rounded_dv):
-                self.dv = self.fileinfo["dv"] = rounded_dv
+            rounded_dv = round(self.header["dv"], 5)
+            if np.isclose(self.header["dv"], rounded_dv):
+                self.dv = self.header["dv"] = rounded_dv
             else:
-                self.dv = self.fileinfo["dv"]
-            specmin, specmax = self.fileinfo["vrange"]
+                self.dv = self.header["dv"]
+            specmin, specmax = self.header["vrange"]
             rounded_specmin = round(specmin, 5)
             rounded_specmax = round(specmax, 5)
             if np.isclose(specmin, rounded_specmin):
                 specmin = rounded_specmin
             if np.isclose(specmax, rounded_specmax):
                 specmax = rounded_specmax
-            self.vrange = self.fileinfo["vrange"] = [specmin, specmax]
+            self.vrange = self.header["vrange"] = [specmin, specmax]
         else:
-            self.dv = self.fileinfo["dv"]
-            self.vrange = self.fileinfo["vrange"]
-        self.nv = self.nchan = self.fileinfo["nchan"]        
+            self.dv = self.header["dv"]
+            self.vrange = self.header["vrange"]
+        self.nv = self.nchan = self.header["nchan"]        
         self.vaxis = self.get_vaxis()
         
         # magic methods to define operators
@@ -897,8 +910,8 @@ class Datacube:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data+other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data+other)
+            return Datacube(header=self.header, data=self.data+other.data)
+        return Datacube(header=self.header, data=self.data+other)
     
     def __radd__(self, other):
         if isinstance(other, Datacube):
@@ -907,8 +920,8 @@ class Datacube:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return Datacube(fileinfo=self.fileinfo, data=other.data+self.data)
-        return Datacube(fileinfo=self.fileinfo, data=other+self.data)
+            return Datacube(header=self.header, data=other.data+self.data)
+        return Datacube(header=self.header, data=other+self.data)
         
     def __sub__(self, other):
         if isinstance(other, Datacube):
@@ -917,8 +930,8 @@ class Datacube:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data-other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data-other)
+            return Datacube(header=self.header, data=self.data-other.data)
+        return Datacube(header=self.header, data=self.data-other)
     
     def __rsub__(self, other):
         if isinstance(other, Datacube):
@@ -927,153 +940,153 @@ class Datacube:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return Datacube(fileinfo=self.fileinfo, data=other.data-self.data)
-        return Datacube(fileinfo=self.fileinfo, data=other-self.data)
+            return Datacube(header=self.header, data=other.data-self.data)
+        return Datacube(header=self.header, data=other-self.data)
         
     def __mul__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data*other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data*other)
+            return Datacube(header=self.header, data=self.data*other.data)
+        return Datacube(header=self.header, data=self.data*other)
     
     def __rmul__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=other.data*self.data)
-        return Datacube(fileinfo=self.fileinfo, data=other*self.data)
+            return Datacube(header=self.header, data=other.data*self.data)
+        return Datacube(header=self.header, data=other*self.data)
     
     def __pow__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data**other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data**other)
+            return Datacube(header=self.header, data=self.data**other.data)
+        return Datacube(header=self.header, data=self.data**other)
         
     def __rpow__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=other.data**self.data)
-        return Datacube(fileinfo=self.fileinfo, data=other**self.data)
+            return Datacube(header=self.header, data=other.data**self.data)
+        return Datacube(header=self.header, data=other**self.data)
         
     def __truediv__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data/other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data/other)
+            return Datacube(header=self.header, data=self.data/other.data)
+        return Datacube(header=self.header, data=self.data/other)
     
     def __rtruediv__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=other.data/self.data)
-        return Datacube(fileinfo=self.fileinfo, data=other/self.data)
+            return Datacube(header=self.header, data=other.data/self.data)
+        return Datacube(header=self.header, data=other/self.data)
         
     def __floordiv__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data//other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data//other)
+            return Datacube(header=self.header, data=self.data//other.data)
+        return Datacube(header=self.header, data=self.data//other)
     
     def __rfloordiv__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=other.data//self.data)
-        return Datacube(fileinfo=self.fileinfo, data=other//self.data)
+            return Datacube(header=self.header, data=other.data//self.data)
+        return Datacube(header=self.header, data=other//self.data)
     
     def __mod__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data%other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data%other)
+            return Datacube(header=self.header, data=self.data%other.data)
+        return Datacube(header=self.header, data=self.data%other)
     
     def __rmod__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=other.data%self.data)
-        return Datacube(fileinfo=self.fileinfo, data=other%self.data)
+            return Datacube(header=self.header, data=other.data%self.data)
+        return Datacube(header=self.header, data=other%self.data)
     
     def __lt__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data<other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data<other)
+            return Datacube(header=self.header, data=self.data<other.data)
+        return Datacube(header=self.header, data=self.data<other)
     
     def __le__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data<=other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data<=other)
+            return Datacube(header=self.header, data=self.data<=other.data)
+        return Datacube(header=self.header, data=self.data<=other)
     
     def __eq__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data==other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data==other)
+            return Datacube(header=self.header, data=self.data==other.data)
+        return Datacube(header=self.header, data=self.data==other)
         
     def __ne__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data!=other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data!=other)
+            return Datacube(header=self.header, data=self.data!=other.data)
+        return Datacube(header=self.header, data=self.data!=other)
 
     def __gt__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data>other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data>other)
+            return Datacube(header=self.header, data=self.data>other.data)
+        return Datacube(header=self.header, data=self.data>other)
         
     def __ge__(self, other):
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Datacube(fileinfo=self.fileinfo, data=self.data>=other.data)
-        return Datacube(fileinfo=self.fileinfo, data=self.data>=other)
+            return Datacube(header=self.header, data=self.data>=other.data)
+        return Datacube(header=self.header, data=self.data>=other)
 
     def __abs__(self):
-        return Datacube(fileinfo=self.fileinfo, data=np.abs(self.data))
+        return Datacube(header=self.header, data=np.abs(self.data))
     
     def __pos__(self):
         return self
     
     def __neg__(self):
-        return Datacube(fileinfo=self.fileinfo, data=-self.data)
+        return Datacube(header=self.header, data=-self.data)
     
     def __invert__(self):
-        return Datacube(fileinfo=self.fileinfo, data=~self.data)
+        return Datacube(header=self.header, data=~self.data)
     
     def __getitem__(self, indices):
         try:
             try:
-                return Datacube(fileinfo=self.fileinfo, data=self.data[indices])
+                return Datacube(header=self.header, data=self.data[indices])
             except:
                 print("WARNING: Returning value after reshaping image data to 2 dimensions.")
                 return self.data.copy[:, indices[0], indices[1]]
@@ -1083,7 +1096,7 @@ class Datacube:
     def __setitem__(self, indices, value):
         newdata = self.data.copy()
         newdata[indices] = value
-        return Datacube(fileinfo=self.fileinfo, data=newdata)
+        return Datacube(header=self.header, data=newdata)
     
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         # Extract the Datacube object from inputs
@@ -1097,14 +1110,14 @@ class Datacube:
                 decimals = inputs[1]
             else:
                 decimals = 0  # Default value for decimals
-            return Datacube(fileinfo=self.fileinfo, data=np.round(self.data, decimals))
+            return Datacube(header=self.header, data=np.round(self.data, decimals))
         
         # Apply the numpy ufunc to the data
         result = getattr(ufunc, method)(*inputs, **kwargs)
 
         # Return a new Datacube instance with the result if the ufunc operation was successful
         if method == '__call__' and isinstance(result, np.ndarray):
-            return Datacube(fileinfo=self.fileinfo, data=result)
+            return Datacube(header=self.header, data=result)
         else:
             return result
         
@@ -1115,7 +1128,7 @@ class Datacube:
         """
         This method converts the intensity unit of original image to the specified unit.
         """
-        return Datacube(fileinfo=self.fileinfo, data=self.data.to(unit, *args, **kwargs))
+        return Datacube(header=self.header, data=self.data.to(unit, *args, **kwargs))
     
     def to_value(self, unit, *args, **kwargs):
         """
@@ -1190,9 +1203,9 @@ class Datacube:
         """
         image = self if inplace else self.copy()
         vaxis = image.get_vaxis(specunit=specunit)
-        image.fileinfo["dv"] = vaxis[1]-vaxis[0]
-        image.fileinfo["vrange"] = vaxis[[0, -1]].tolist()
-        image.fileinfo["specunit"] = _apu_to_headerstr(_to_apu(specunit))
+        image.header["dv"] = vaxis[1]-vaxis[0]
+        image.header["vrange"] = vaxis[[0, -1]].tolist()
+        image.header["specunit"] = _apu_to_headerstr(_to_apu(specunit))
         image.__updateparams()
         return image
 
@@ -1223,7 +1236,7 @@ class Datacube:
         if inplace:
             self.data = newdata
             return self
-        return Datacube(fileinfo=self.fileinfo, data=newdata.reshape(self.shape))
+        return Datacube(header=self.header, data=newdata.reshape(self.shape))
    
     def __get_momentdata(self, moment, data=None, vaxis=None):
         """
@@ -1412,7 +1425,7 @@ class Datacube:
             newheader["nchan"] = 1
             newheader["dv"] = None
             newheader["bunit"] = bunit
-            maps.append(Spatialmap(fileinfo=newheader, data=momdata))
+            maps.append(Spatialmap(header=newheader, data=momdata))
             
         # return output
         return maps[0] if len(maps) == 1 else maps
@@ -1557,7 +1570,9 @@ class Datacube:
                 contourmap = None
                 print("Failed to estimate RMS noise level of contour map.")
                 print("Please specify base contour level using 'crms' parameter.")
-            
+                
+        data = self.data.value if isinstance(self.data, u.Quantity) else self.data.copy()
+           
         # trim data along vaxis for plotting:
         vmask = (velmin <= vaxis) & (vaxis <= velmax)
         trimmed_data = self.data[:, vmask, :, :][:, ::nskip, :, :]
@@ -1575,7 +1590,10 @@ class Datacube:
         
         # modify contour map to fit the same channels:
         if contourmap is not None:
-            contmap = contourmap.copy()
+            if isinstance(contourmap.data, u.Quantity):
+                contmap = contourmap.copy()
+            else:
+                contmap = contourmap.value.copy()
             
             # make the image conditions the same if necessary:
             if contmap.refcoord != self.refcoord:  # same reference coordinates
@@ -1789,18 +1807,18 @@ class Datacube:
         trimmed_vaxis = vaxis[vmask][::nskip]
         
         # update header information
-        newfileinfo = copy.deepcopy(self.fileinfo)
-        newfileinfo["dv"] = nskip*self.dv
-        newfileinfo["vrange"] = [trimmed_vaxis.min(), trimmed_vaxis.max()]
-        newfileinfo["nchan"] = int(np.round((velmax-velmin)/self.dv + 1))
+        newheader = copy.deepcopy(self.header)
+        newheader["dv"] = nskip*self.dv
+        newheader["vrange"] = [trimmed_vaxis.min(), trimmed_vaxis.max()]
+        newheader["nchan"] = int(np.round((velmax-velmin)/self.dv + 1))
         
         # return trimmed image or modify image in-place
         if inplace:
             self.data = trimmed_data
-            self.fileinfo = newfileinfo
+            self.header = newheader
             self.__updateparams()
             return self
-        return Datacube(fileinfo=newfileinfo, data=trimmed_data)
+        return Datacube(header=newheader, data=trimmed_data)
         
     def conv_bunit(self, bunit, inplace=False):
         """
@@ -1889,16 +1907,16 @@ class Datacube:
             chans = [chans, chans] 
             
         # create new header info
-        new_fileinfo = copy.deepcopy(self.fileinfo)
-        new_fileinfo["dv"] = None
-        new_fileinfo["nchan"] = 1
-        new_fileinfo["shape"] = (1, 1, self.nx, self.ny)
-        new_fileinfo["imagetype"] = "spatialmap"
+        new_header = copy.deepcopy(self.header)
+        new_header["dv"] = None
+        new_header["nchan"] = 1
+        new_header["shape"] = (1, 1, self.nx, self.ny)
+        new_header["imagetype"] = "spatialmap"
         
         # start extracting and adding maps
         for i in range(chans[0], chans[1]+1, 1):
-            new_fileinfo["vrange"] = [vaxis[i], vaxis[i]]
-            maps.append(Spatialmap(fileinfo=copy.deepcopy(new_fileinfo), 
+            new_header["vrange"] = [vaxis[i], vaxis[i]]
+            maps.append(Spatialmap(header=copy.deepcopy(new_header), 
                                    data=self.data[0, i].reshape(1, 1, self.nx, self.ny)))
             
         # return maps as list or as inidividual object.
@@ -1925,8 +1943,8 @@ class Datacube:
                 self.data = np.where(self.data<threshold, self.data, np.nan)
             return self
         if minimum:
-            return Datacube(fileinfo=self.fileinfo, data=np.where(self.data<threshold, np.nan, self.data))
-        return Datacube(fileinfo=self.fileinfo, data=np.where(self.data<threshold, self.data, np.nan))
+            return Datacube(header=self.header, data=np.where(self.data<threshold, np.nan, self.data))
+        return Datacube(header=self.header, data=np.where(self.data<threshold, self.data, np.nan))
     
     def beam_area(self, unit=None):
         """
@@ -1980,12 +1998,12 @@ class Datacube:
             self.header["unit"] = _apu_to_headerstr(_to_apu(unit))
             self.__updateparams()
             return self
-        newfileinfo = copy.deepcopy(self.fileinfo)
-        newfileinfo["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
-        newfileinfo["dy"] = u.Quantity(self.dy, self.unit).to_value(unit)
-        newfileinfo["beam"] = newbeam
-        newfileinfo["unit"] = _apu_to_headerstr(_to_apu(unit))
-        return Datacube(fileinfo=newfileinfo, data=self.data)
+        newheader = copy.deepcopy(self.header)
+        newheader["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
+        newheader["dy"] = u.Quantity(self.dy, self.unit).to_value(unit)
+        newheader["beam"] = newbeam
+        newheader["unit"] = _apu_to_headerstr(_to_apu(unit))
+        return Datacube(header=newheader, data=self.data)
     
     def set_data(self, data, inplace=False):
         """
@@ -2212,7 +2230,7 @@ class Datacube:
         masked_data = np.where(mask, data[0], np.nan)
         newshape =  (1, masked_data.shape[0],  masked_data.shape[1], masked_data.shape[2])
         masked_data = masked_data.reshape(newshape)
-        masked_image = Datacube(fileinfo=self.fileinfo, data=masked_data)
+        masked_image = Datacube(header=self.header, data=masked_data)
         if preview: 
             masked_image.view_region(region, **kwargs)
         if inplace:
@@ -2329,22 +2347,22 @@ class Datacube:
         pv_data = pv_data[None, :, :]
 
         # export as pv data
-        newfileinfo = copy.deepcopy(self.fileinfo)
-        newfileinfo["shape"] = pv_data.shape
-        newfileinfo["imagetype"] = "pvdiagram"
-        newfileinfo["vrange"] = [pv_vaxis.min(), pv_vaxis.max()]
-        newfileinfo["dv"] = np.round(pv_vaxis[1] - pv_vaxis[0], 7)
-        newfileinfo["nchan"] = pv_vaxis.size
-        newfileinfo["dx"] = np.round(pv_xaxis[1] - pv_xaxis[0], 7)
-        newfileinfo["nx"] = pv_xaxis.size
-        newfileinfo["refnx"] = pv_xaxis.size//2 + 1
-        newfileinfo["dy"] = None
-        newfileinfo["ny"] = None
-        newfileinfo["refny"] = None
-        newfileinfo["refcoord"] = _relative2icrs(center, ref=self.refcoord, unit=self.unit)
+        newheader = copy.deepcopy(self.header)
+        newheader["shape"] = pv_data.shape
+        newheader["imagetype"] = "pvdiagram"
+        newheader["vrange"] = [pv_vaxis.min(), pv_vaxis.max()]
+        newheader["dv"] = np.round(pv_vaxis[1] - pv_vaxis[0], 7)
+        newheader["nchan"] = pv_vaxis.size
+        newheader["dx"] = np.round(pv_xaxis[1] - pv_xaxis[0], 7)
+        newheader["nx"] = pv_xaxis.size
+        newheader["refnx"] = pv_xaxis.size//2 + 1
+        newheader["dy"] = None
+        newheader["ny"] = None
+        newheader["refny"] = None
+        newheader["refcoord"] = _relative2icrs(center, ref=self.refcoord, unit=self.unit)
         
         # new image
-        pv = PVdiagram(fileinfo=newfileinfo, data=pv_data)
+        pv = PVdiagram(header=newheader, data=pv_data)
         pv.pa = pa
         
         if preview:
@@ -2429,7 +2447,7 @@ class Datacube:
             self.header = new_header
             self.__updateparams()
         
-        convolved_image = Datacube(data=newimage, fileinfo=new_header)
+        convolved_image = Datacube(data=newimage, header=new_header)
         
         if preview:
             convolved_image.imview(**kwargs)
@@ -2488,7 +2506,7 @@ class Datacube:
                                                  for i in range(self.nchan)]])
 
         # update header information
-        new_header = copy.deepcopy(self.fileinfo)
+        new_header = copy.deepcopy(self.header)
         new_header['shape'] = new_data.shape
         new_header['refnx'] = new_nx/2 + 1
         new_header['refnx'] = new_ny/2 + 1
@@ -2498,12 +2516,12 @@ class Datacube:
         new_header['ny'] = new_ny
 
         # create new Datacube instance
-        regridded_map = Datacube(fileinfo=new_header, data=new_data)
+        regridded_map = Datacube(header=new_header, data=new_data)
 
         # modify the current image in-place if requested
         if inplace:
             self.data = new_data
-            self.fileinfo = new_header
+            self.header = new_header
             self.__updateparams()  # Update parameters based on new header
             return self
         return regridded_map
@@ -2529,7 +2547,7 @@ class Datacube:
         if inplace:
             self.data = normalized_data
             return self
-        return Datacube(fileinfo=self.fileinfo, data=normalized_data)
+        return Datacube(header=self.header, data=normalized_data)
         
     def imshift(self, coord, unit=None, printcc=True, inplace=False):
         """
@@ -2606,6 +2624,8 @@ class Datacube:
         """
         This method searches for the molecular line data from the Splatalogue database
         """
+        if np.isnan(self.restfreq):
+            raise Exception("Failed to find molecular line as rest frequency cannot be read.")
         return search_molecular_line(self.restfreq, unit="Hz", **kwargs)
     
     def get_hduheader(self):
@@ -2674,21 +2694,21 @@ class Spatialmap:
         is in the correct format. It can handle FITS files with different configurations and
         is designed to be flexible for various data shapes and sizes.
     """
-    def __init__(self, fitsfile=None, fileinfo=None, data=None, hduindex=0, 
+    def __init__(self, fitsfile=None, header=None, data=None, hduindex=0, 
                  spatialunit="arcsec", quiet=False):
         if fitsfile is not None:
             fits = importfits(fitsfile, hduindex=hduindex, spatialunit=spatialunit, quiet=False)
-            self.fileinfo = fits.fileinfo
+            self.header = fits.header
             self.data = fits.data
-        elif fileinfo is not None:
-            self.fileinfo = fileinfo
+        elif header is not None:
+            self.header = header
             self.data = data
-        if self.fileinfo["imagetype"] != "spatialmap":
+        if self.header["imagetype"] != "spatialmap":
             raise TypeError("The given FITS file is not a spatial map.")
         self.__updateparams()
         self._peakshifted = False
         if isinstance(self.data, u.quantity.Quantity):
-            self.value = Spatialmap(fileinfo=self.fileinfo, data=self.data.value)
+            self.value = Spatialmap(header=self.header, data=self.data.value)
     
     # magic methods to define operators
     def __add__(self, other):
@@ -2698,8 +2718,8 @@ class Spatialmap:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data+other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data+other)
+            return Spatialmap(header=self.header, data=self.data+other.data)
+        return Spatialmap(header=self.header, data=self.data+other)
     
     def __radd__(self, other):
         if isinstance(other, Spatialmap):
@@ -2708,8 +2728,8 @@ class Spatialmap:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return Spatialmap(fileinfo=self.fileinfo, data=other.data+self.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=other+self.data)
+            return Spatialmap(header=self.header, data=other.data+self.data)
+        return Spatialmap(header=self.header, data=other+self.data)
         
     def __sub__(self, other):
         if isinstance(other, Spatialmap):
@@ -2718,8 +2738,8 @@ class Spatialmap:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data-other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data-other)
+            return Spatialmap(header=self.header, data=self.data-other.data)
+        return Spatialmap(header=self.header, data=self.data-other)
     
     def __rsub__(self, other):
         if isinstance(other, Spatialmap):
@@ -2728,153 +2748,153 @@ class Spatialmap:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return Spatialmap(fileinfo=self.fileinfo, data=other.data-self.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=other-self.data)
+            return Spatialmap(header=self.header, data=other.data-self.data)
+        return Spatialmap(header=self.header, data=other-self.data)
         
     def __mul__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data*other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data*other)
+            return Spatialmap(header=self.header, data=self.data*other.data)
+        return Spatialmap(header=self.header, data=self.data*other)
     
     def __rmul__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=other.data*self.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=other*self.data)
+            return Spatialmap(header=self.header, data=other.data*self.data)
+        return Spatialmap(header=self.header, data=other*self.data)
     
     def __pow__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data**other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data**other)
+            return Spatialmap(header=self.header, data=self.data**other.data)
+        return Spatialmap(header=self.header, data=self.data**other)
         
     def __rpow__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=other.data**self.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=other.data**self.data)
+            return Spatialmap(header=self.header, data=other.data**self.data)
+        return Spatialmap(header=self.header, data=other.data**self.data)
         
     def __truediv__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data/other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data/other)
+            return Spatialmap(header=self.header, data=self.data/other.data)
+        return Spatialmap(header=self.header, data=self.data/other)
     
     def __rtruediv__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=other.data/self.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=other/self.data)
+            return Spatialmap(header=self.header, data=other.data/self.data)
+        return Spatialmap(header=self.header, data=other/self.data)
         
     def __floordiv__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data//other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data//other)
+            return Spatialmap(header=self.header, data=self.data//other.data)
+        return Spatialmap(header=self.header, data=self.data//other)
     
     def __rfloordiv__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=other.data//self.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=other//self.data)
+            return Spatialmap(header=self.header, data=other.data//self.data)
+        return Spatialmap(header=self.header, data=other//self.data)
     
     def __mod__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data%other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data%other)
+            return Spatialmap(header=self.header, data=self.data%other.data)
+        return Spatialmap(header=self.header, data=self.data%other)
     
     def __rmod__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=other.data%self.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=other%self.data)
+            return Spatialmap(header=self.header, data=other.data%self.data)
+        return Spatialmap(header=self.header, data=other%self.data)
     
     def __lt__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data<other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data<other)
+            return Spatialmap(header=self.header, data=self.data<other.data)
+        return Spatialmap(header=self.header, data=self.data<other)
     
     def __le__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data<=other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data<=other)
+            return Spatialmap(header=self.header, data=self.data<=other.data)
+        return Spatialmap(header=self.header, data=self.data<=other)
     
     def __eq__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data==other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data==other)
+            return Spatialmap(header=self.header, data=self.data==other.data)
+        return Spatialmap(header=self.header, data=self.data==other)
         
     def __ne__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data!=other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data!=other)
+            return Spatialmap(header=self.header, data=self.data!=other.data)
+        return Spatialmap(header=self.header, data=self.data!=other)
 
     def __gt__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data>other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data>other)
+            return Spatialmap(header=self.header, data=self.data>other.data)
+        return Spatialmap(header=self.header, data=self.data>other)
         
     def __ge__(self, other):
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return Spatialmap(fileinfo=self.fileinfo, data=self.data>=other.data)
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data>=other)
+            return Spatialmap(header=self.header, data=self.data>=other.data)
+        return Spatialmap(header=self.header, data=self.data>=other)
 
     def __abs__(self):
-        return Spatialmap(fileinfo=self.fileinfo, data=np.abs(self.data))
+        return Spatialmap(header=self.header, data=np.abs(self.data))
     
     def __pos__(self):
         return self
     
     def __neg__(self):
-        return Spatialmap(fileinfo=self.fileinfo, data=-self.data)
+        return Spatialmap(header=self.header, data=-self.data)
     
     def __invert__(self):
-        return Spatialmap(fileinfo=self.fileinfo, data=~self.data)
+        return Spatialmap(header=self.header, data=~self.data)
     
     def __getitem__(self, indices):
         try:
             try:
-                return Spatialmap(fileinfo=self.fileinfo, data=self.data[indices])
+                return Spatialmap(header=self.header, data=self.data[indices])
             except:
                 print("WARNING: Returning value after reshaping image data to 2 dimensions.")
                 return self.data.copy[:, indices[0], indices[1]]
@@ -2884,7 +2904,7 @@ class Spatialmap:
     def __setitem__(self, indices, value):
         newdata = self.data.copy()
         newdata[indices] = value
-        return Spatialmap(fileinfo=self.fileinfo, data=newdata)
+        return Spatialmap(header=self.header, data=newdata)
     
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         # Extract the Spatialmap object from inputs
@@ -2898,14 +2918,14 @@ class Spatialmap:
                 decimals = inputs[1]
             else:
                 decimals = 0  # Default value for decimals
-            return Spatialmap(fileinfo=self.fileinfo, data=np.round(self.data, decimals))
+            return Spatialmap(header=self.header, data=np.round(self.data, decimals))
         
         # Apply the numpy ufunc to the data
         result = getattr(ufunc, method)(*inputs, **kwargs)
 
         # Return a new Spatialmap instance with the result if the ufunc operation was successful
         if method == '__call__' and isinstance(result, np.ndarray):
-            return Spatialmap(fileinfo=self.fileinfo, data=result)
+            return Spatialmap(header=self.header, data=result)
         else:
             return result
         
@@ -2916,7 +2936,7 @@ class Spatialmap:
         """
         This method converts the intensity unit of original image to the specified unit.
         """
-        return Spatialmap(fileinfo=self.fileinfo, data=self.data.to(unit, *args, **kwargs))
+        return Spatialmap(header=self.header, data=self.data.to(unit, *args, **kwargs))
     
     def to_value(self, unit, *args, **kwargs):
         """
@@ -2935,25 +2955,24 @@ class Spatialmap:
         
     def __updateparams(self):
         # make axes
-        self.header = self.fileinfo
-        self.spatialunit = self.unit = self.axisunit = self.fileinfo["unit"]
-        nx = self.nx = self.fileinfo["nx"]
-        dx = self.dx = self.fileinfo["dx"]
-        refnx = self.refnx = self.fileinfo["refnx"]
-        ny = self.ny = self.fileinfo["ny"]
-        dy = self.dy = self.fileinfo["dy"]
-        refny = self.refny = self.fileinfo["refny"]
+        self.spatialunit = self.unit = self.axisunit = self.header["unit"]
+        nx = self.nx = self.header["nx"]
+        dx = self.dx = self.header["dx"]
+        refnx = self.refnx = self.header["refnx"]
+        ny = self.ny = self.header["ny"]
+        dy = self.dy = self.header["dy"]
+        refny = self.refny = self.header["refny"]
         self.xaxis, self.yaxis = self.get_xyaxes()
-        self.shape = self.fileinfo["shape"]
+        self.shape = self.header["shape"]
         self.size = self.data.size
-        self.restfreq = self.fileinfo["restfreq"]
-        self.bmaj, self.bmin, self.bpa = self.beam = self.fileinfo["beam"]
+        self.restfreq = self.header["restfreq"]
+        self.bmaj, self.bmin, self.bpa = self.beam = self.header["beam"]
         self.resolution = np.sqrt(self.beam[0]*self.beam[1]) if self.beam is not None else None
-        self.refcoord = self.fileinfo["refcoord"]
+        self.refcoord = self.header["refcoord"]
         if isinstance(self.data, u.Quantity):
-            self.bunit = self.fileinfo["bunit"] = _apu_to_headerstr(self.data.unit)
+            self.bunit = self.header["bunit"] = _apu_to_headerstr(self.data.unit)
         else:
-            self.bunit = self.fileinfo["bunit"]
+            self.bunit = self.header["bunit"]
         xmin, xmax = self.xaxis[[0, -1]]
         ymin, ymax = self.yaxis[[0, -1]]
         self.imextent = [xmin-0.5*self.dx, xmax+0.5*self.dx, 
@@ -3015,7 +3034,7 @@ class Spatialmap:
         if inplace:
             self.data = newdata
             return self
-        return Spatialmap(fileinfo=self.fileinfo, data=newdata.reshape(self.shape))
+        return Spatialmap(header=self.header, data=newdata.reshape(self.shape))
         
     def imshift(self, coord, unit=None, printcc=True, inplace=False, order=0):
         """
@@ -3138,7 +3157,7 @@ class Spatialmap:
 
         masked_data = np.where(mask, data[0, 0], np.nan)
         masked_data = masked_data.reshape(1, 1, masked_data.shape[0], masked_data.shape[1])
-        masked_image = Spatialmap(fileinfo=self.fileinfo, data=masked_data)
+        masked_image = Spatialmap(header=self.header, data=masked_data)
         if preview: 
             masked_image.view_region(region, **kwargs)
         if inplace:
@@ -3246,7 +3265,7 @@ class Spatialmap:
         new_data = new_data.reshape((1, 1, new_data.shape[0], new_data.shape[1]))
 
         # Update header information
-        new_header = copy.deepcopy(self.fileinfo)
+        new_header = copy.deepcopy(self.header)
         new_header['shape'] = new_data.shape
         new_header['refnx'] = new_nx/2 + 1
         new_header['refnx'] = new_ny/2 + 1
@@ -3256,12 +3275,12 @@ class Spatialmap:
         new_header['ny'] = new_ny
 
         # Create new Spatialmap instance
-        regridded_map = Spatialmap(fileinfo=new_header, data=new_data)
+        regridded_map = Spatialmap(header=new_header, data=new_data)
 
         # Modify the current image in-place if requested
         if inplace:
             self.data = new_data
-            self.fileinfo = new_header
+            self.header = new_header
             self.__updateparams()  # Update parameters based on new data
             return self
         return regridded_map
@@ -3287,7 +3306,7 @@ class Spatialmap:
         if inplace:
             self.data = normalized_data
             return self
-        return Spatialmap(fileinfo=self.fileinfo, data=normalized_data)
+        return Spatialmap(header=self.header, data=normalized_data)
     
     def imsmooth(self, bmaj=None, bmin=None, bpa=0, width=None, unit=None, kernel="gauss",
                  fft=True, preview=True, inplace=False, **kwargs):
@@ -3345,7 +3364,7 @@ class Spatialmap:
             self.__updateparams()
         
         # create new object with the new header and data
-        convolved_image = Spatialmap(data=newimage.reshape((1, 1, self.nx, self.ny)), fileinfo=new_header)
+        convolved_image = Spatialmap(data=newimage.reshape((1, 1, self.nx, self.ny)), header=new_header)
         if preview:
             convolved_image.imview(title="Convolved image", **kwargs)
         
@@ -3429,7 +3448,7 @@ class Spatialmap:
         
         # Calculate the fitted model
         fitted_model = g(xx, yy).reshape(1, 1, self.nx, self.ny)     
-        model_image = Spatialmap(fileinfo=self.fileinfo, data=fitted_model)
+        model_image = Spatialmap(header=self.header, data=fitted_model)
         
         # Print results
         coord = _relative2icrs(coord=(popt[0], popt[1]), ref=self.refcoord, unit=self.unit)
@@ -3478,7 +3497,7 @@ class Spatialmap:
         
         # residual
         residual_data = fitting_data - fitted_model
-        residual_image = Spatialmap(fileinfo=self.fileinfo, data=residual_data)
+        residual_image = Spatialmap(header=self.header, data=residual_data)
         effective_radius = np.sqrt(popt[3]*popt[4])
         if shiftcenter:
             residual_image = residual_image.imshift(center_J2000, printcc=False)
@@ -3564,8 +3583,8 @@ class Spatialmap:
                 self.data = np.where(self.data<threshold, self.data, np.nan)
             return self
         if minimum:
-            return Spatialmap(fileinfo=self.fileinfo, data=np.where(self.data<threshold, np.nan, self.data))
-        return Spatialmap(fileinfo=self.fileinfo, data=np.where(self.data<threshold, self.data, np.nan))
+            return Spatialmap(header=self.header, data=np.where(self.data<threshold, np.nan, self.data))
+        return Spatialmap(header=self.header, data=np.where(self.data<threshold, self.data, np.nan))
     
     def beam_area(self, unit=None):
         """
@@ -3619,12 +3638,12 @@ class Spatialmap:
             self.header["unit"] = _apu_to_headerstr(_to_apu(unit))
             self.__updateparams()
             return self
-        newfileinfo = copy.deepcopy(self.fileinfo)
-        newfileinfo["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
-        newfileinfo["dy"] = u.Quantity(self.dy, self.unit).to_value(unit)
-        newfileinfo["beam"] = newbeam
-        newfileinfo["unit"] = _apu_to_headerstr(_to_apu(unit))
-        return Spatialmap(fileinfo=newfileinfo, data=self.data)
+        newheader = copy.deepcopy(self.header)
+        newheader["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
+        newheader["dy"] = u.Quantity(self.dy, self.unit).to_value(unit)
+        newheader["beam"] = newbeam
+        newheader["unit"] = _apu_to_headerstr(_to_apu(unit))
+        return Spatialmap(header=newheader, data=self.data)
     
     def conv_bunit(self, bunit, inplace=False):
         """
@@ -3886,19 +3905,17 @@ class Spatialmap:
             return rms, mask
         return rms
             
-    def imview(self, contourmap=None, title=None, fov=None, vmin=None, vmax=None, 
+    def imview(self, contourmap=None, title=None, fov=None, vmin=None, vmax=None, percentile=None,
                scale="linear", gamma=1.5, crms=None, clevels=np.arange(3, 21, 3), tickscale=None, 
                scalebaron=True, distance=None, cbarlabelon=True, cbarlabel=None, xlabelon=True,
-               ylabelon=True, center=(0., 0.), dpi=500, ha="left", va="top", titleloc=(0.1, 0.9), 
-               cmap=None, fontsize=12, cbarwidth="5%", width=330, height=300,
-               smooth=None, scalebarsize=None, nancolor=None, beamcolor=None,
-               ccolors=None, clw=0.8, txtcolor=None, cbaron=True, cbarpad=0., tickson=True, 
-               labelcolor="k", tickcolor="k", labelsize=10., ticklabelsize=10., 
+               ylabelon=True, center=(0., 0.), dpi=600, ha="left", va="top", titleloc=(0.1, 0.9), 
+               cmap=None, fontsize=10, cbarwidth="5%", width=330, height=300, smooth=None, scalebarsize=None, 
+               nancolor=None, beamcolor=None, ccolors=None, clw=0.8, txtcolor=None, cbaron=True, cbarpad=0., 
+               tickson=True, labelcolor="k", tickcolor="k", labelsize=10., ticksize=3., title_fontsize=12, 
                cbartick_length=3., cbartick_width=1., beamon=True, scalebar_fontsize=10,
-               axeslw=1., scalecolor=None, scalelw=1., cbarloc="right", 
-               xlim=None, ylim=None, cbarticks=None, beamloc=(0.1225, 0.1225), vcenter=None, 
-               vrange=None, aspect_ratio=1, barloc=(0.85, 0.15), barlabelloc=(0.85, 0.075),
-               decimals=2, ax=None, plot=True):
+               axeslw=1., scalecolor=None, scalelw=1., cbarloc="right", xlim=None, ylim=None, 
+               cbarticks=None, beamloc=(0.1225, 0.1225), vcenter=None, vrange=None, aspect_ratio=1, 
+               barloc=(0.85, 0.15), barlabelloc=(0.85, 0.075), decimals=2, ax=None, plot=True):
         """
         Method to plot the 2D image.
         Parameters:
@@ -3931,7 +3948,6 @@ class Spatialmap:
             imsmooth (float): the Gaussian filter parameter to be added to smooth out the contour
             scalebarsize (float): the scale of the size bar in arcsec
             nancolor (str): the color of nan values represented in the colormap
-            onsource (float): the onsource radius (useful to estimate crms if it was set to None)
             beamcolor (str): the color of the ellipse representing the beam dimensions
             ccolors (str): the colors of the contour lines
             clw (float): the line width of the contour 
@@ -3942,7 +3958,6 @@ class Spatialmap:
             labelcolor (str): the font color of the labels
             tickcolor (str): the color of the ticks
             labelsize (float): the font size of the axis labels
-            ticklabelsize (float): the font size of the tick labels
             cbartick_length (float): the length of the color bar ticks
             cbartick_width (float): the width of the color bar 
             beamon (bool): True to add an ellipse that represents the beam dimensions
@@ -4003,8 +4018,6 @@ class Spatialmap:
         if scalebarsize is None:
             # default value of scale bar size
             xrange = np.abs(xlim[1]-xlim[0])
-            
-            
             order_of_magnitude = int(np.log10(xrange))
             scalebarsize = 10**order_of_magnitude / 10
             scalebarsize = np.clip(scalebarsize, 0.1, 10)
@@ -4043,6 +4056,11 @@ class Spatialmap:
             vcenter = (np.nanmax(data) + np.nanmin(data))/2
             vmin = vcenter - vrange/2
             vmax = vcenter + vrange/2
+        
+        # determine vmin and vmax using percentile if still not specified
+        if vmin is None and vmax is None and percentile is not None:
+            clipped_data = self.__trim_data(xlim=xlim, ylim=ylim)
+            vmin, vmax = clip_percentile(data=clipped_data, area=percentile, plot=False)
             
         # change default parameters
         ncols, nrows = 1, 1
@@ -4052,12 +4070,12 @@ class Spatialmap:
         fig_width     = fig_width_pt * inches_per_pt  # width in inches
         fig_height    = fig_height_pt * inches_per_pt # height in inches
         fig_size      = [fig_width, fig_height]
-        params = {'axes.labelsize': labelsize,
+        params = {'axes.labelsize': fontsize,
                   'axes.titlesize': fontsize,
                   'font.size' : fontsize,
                   'legend.fontsize': fontsize,
-                  'xtick.labelsize': ticklabelsize,
-                  'ytick.labelsize': ticklabelsize,
+                  'xtick.labelsize': labelsize,
+                  'ytick.labelsize': labelsize,
                   'xtick.top': True,   # draw ticks on the top side
                   'xtick.major.top' : True,
                   'figure.figsize': fig_size,
@@ -4078,7 +4096,7 @@ class Spatialmap:
                   'figure.dpi': dpi,
                 }
         rcParams.update(params)
-        
+
         # set colorbar
         my_cmap = copy.deepcopy(mpl.colormaps[cmap]) 
         my_cmap.set_bad(color=nancolor) 
@@ -4099,7 +4117,7 @@ class Spatialmap:
         
         # add image
         if scale.lower() == "linear":
-            climage = ax.imshow(data[0, 0], cmap=my_cmap, extent=self.imextent, 
+            climage = ax.imshow(self.data[0, 0], cmap=my_cmap, extent=self.imextent, 
                                 vmin=vmin, vmax=vmax, origin='lower')
         elif scale.lower() in ("log", "logscale", "logarithm"):
             if vmin is None:
@@ -4108,13 +4126,13 @@ class Spatialmap:
                 vmax = np.nanmax(data)
                 if vmax <= 0:
                     raise Exception("The data only contains negative values. Log scale is not suitable.")
-            climage = ax.imshow(data[0, 0], cmap=my_cmap, extent=self.imextent,
+            climage = ax.imshow(self.data[0, 0], cmap=my_cmap, extent=self.imextent,
                                 norm=colors.LogNorm(vmin=vmin, vmax=vmax), 
                                 origin="lower")
             if len(cbarticks) == 0:
                 cbarticks = np.linspace(vmin, vmax, 7)[1:-1]
         elif scale.lower() == "gamma":
-            climage = ax.imshow(data[0, 0], cmap=my_cmap, extent=self.imextent, origin="lower",
+            climage = ax.imshow(self.data[0, 0], cmap=my_cmap, extent=self.imextent, origin="lower",
                                 norm=colors.PowerNorm(gamma=gamma, vmin=vmin, vmax=vmax))
         else:
             raise ValueError("Scale must be 'linear', 'log', or 'gamma'.")
@@ -4132,7 +4150,7 @@ class Spatialmap:
             elif cbarloc.lower() == "top":
                 orientation = "horizontal"
             else:
-                raise ValueError("'cbarloc' parameter must be eitehr 'right' or 'top'.")
+                raise ValueError("'cbarloc' parameter must be either 'right' or 'top'.")
                 
             divider = make_axes_locatable(ax)
             ax_cb = divider.append_axes(cbarloc, size=cbarwidth, pad=cbarpad)
@@ -4143,8 +4161,8 @@ class Spatialmap:
                     labels = (f"%.{decimals}f"%label for label in cbarticks)  # generator object
                     labels = [label[:-1] if label.endswith(".") else label for label in labels]
                     cb.set_ticklabels(labels)
-            cb.set_label(cbarlabel, fontsize=labelsize)
-            cb.ax.tick_params(labelsize=ticklabelsize, width=cbartick_width, 
+            cb.set_label(cbarlabel, fontsize=fontsize)
+            cb.ax.tick_params(labelsize=labelsize, width=cbartick_width, 
                               length=cbartick_length, direction='in')
         
         if contourmap is not None:
@@ -4159,7 +4177,8 @@ class Spatialmap:
             yrange = ylim[1]-ylim[0]
             titlex = xlim[0] + titleloc[0]*xrange
             titley = ylim[0] + titleloc[1]*yrange
-            ax.text(x=titlex, y=titley, s=title, ha=ha, va=va, color=txtcolor, fontsize=fontsize)
+            ax.text(x=titlex, y=titley, s=title, ha=ha, va=va, 
+                    color=txtcolor, fontsize=title_fontsize)
         
         # set field of view
         ax.set_xlim(xlim)
@@ -4193,16 +4212,17 @@ class Spatialmap:
             
         if tickson:
             ax.tick_params(which='both', direction='in', bottom=True, top=True, left=True, right=True,
-                           colors=tickcolor, labelrotation=0, labelcolor=labelcolor)
+                           length=ticksize, colors=tickcolor, labelrotation=0, labelcolor=labelcolor, 
+                           labelsize=labelsize)
         else:
             ax.tick_params(which='both', direction='in',bottom=False, top=False, left=False, right=False,
-                           colors=tickcolor, labelrotation=0, labelcolor=labelcolor)
+                           colors=tickcolor, labelrotation=0, labelcolor=labelcolor, labelsize=labelsize)
             
         # set labels
         if xlabelon:
-            ax.set_xlabel(f"Relative RA ({self.unit})", fontsize=labelsize)
+            ax.set_xlabel(f"Relative RA ({self.unit})", fontsize=fontsize)
         if ylabelon:
-            ax.set_ylabel(f"Relative Dec ({self.unit})", fontsize=labelsize)
+            ax.set_ylabel(f"Relative Dec ({self.unit})", fontsize=fontsize)
         
         # add beam
         if beamon:
@@ -4227,7 +4247,16 @@ class Spatialmap:
             
         return ax
     
-    # need error checking.
+    def __trim_data(self, xlim, ylim):
+        if list(xlim) == [self.widestfov, -self.widestfov] \
+           and list(ylim) == [-self.widestfov, self.widestfov]:
+            return self.data[0, 0]
+        
+        xmask = (min(xlim) <= self.xaxis) & (self.xaxis <= max(xlim))
+        ymask = (min(ylim) <= self.yaxis) & (self.yaxis <= max(ylim))
+        trimmed_data = self.data[0, 0][xmask, :][:, ymask]
+        return trimmed_data
+
     def __add_scalebar(self, ax, xlim, ylim, distance, size=0.1, barloc=(0.85, 0.15), 
                        txtloc=(0.85, 0.075), scalecolor="w", scalelw=1., fontsize=10.):
         """
@@ -4297,6 +4326,8 @@ class Spatialmap:
         """
         This method searches for the molecular line data from the Splatalogue database
         """
+        if np.isnan(self.restfreq):
+            raise Exception("Failed to find molecular line as rest frequency cannot be read.")
         return search_molecular_line(self.restfreq, unit="Hz", **kwargs)
     
     def get_hduheader(self):
@@ -4350,6 +4381,7 @@ class Spatialmap:
         print(f"File saved as '{outname}'.")
 
 
+# +
 class PVdiagram:
     """
     A class for handling FITS position-velocity diagrams in astronomical imaging.
@@ -4364,58 +4396,57 @@ class PVdiagram:
         is in the correct format. It can handle FITS files with different configurations and
         is designed to be flexible for various data shapes and sizes.
     """
-    def __init__(self, fitsfile=None, fileinfo=None, data=None, hduindex=0, 
+    def __init__(self, fitsfile=None, header=None, data=None, hduindex=0, 
                  spatialunit="arcsec", specunit="km/s", quiet=False):
         if fitsfile is not None:
             fits = importfits(fitsfile, hduindex=hduindex, spatialunit=spatialunit, 
                               specunit=specunit, quiet=False)
-            self.fileinfo = fits.fileinfo
+            self.header = fits.header
             self.data = fits.data
-        elif fileinfo is not None:
-            self.fileinfo = fileinfo
+        elif header is not None:
+            self.header = header
             self.data = data
-        if self.fileinfo["imagetype"] != "pvdiagram":
+        if self.header["imagetype"] != "pvdiagram":
             raise TypeError("The given FITS file is not a PV diagram.")
         self.__updateparams()
         self.pa = None  # position angle at which the PV diagram was cut (to calculate offset resolution)
         
         if isinstance(self.data, u.quantity.Quantity):
-            self.value = PVdiagram(fileinfo=self.fileinfo, data=self.data.value)
+            self.value = PVdiagram(header=self.header, data=self.data.value)
         
     def __updateparams(self):
-        self.header = self.fileinfo
-        self.spatialunit = self.unit = self.axisunit = self.fileinfo["unit"]
-        self.nx = self.fileinfo["nx"]
-        self.dx = self.fileinfo["dx"]
-        refnx = self.refnx = self.fileinfo["refnx"]
-        self.ny = self.fileinfo["ny"]
+        self.spatialunit = self.unit = self.axisunit = self.header["unit"]
+        self.nx = self.header["nx"]
+        self.dx = self.header["dx"]
+        refnx = self.refnx = self.header["refnx"]
+        self.ny = self.header["ny"]
         self.xaxis = self.get_xaxis()
-        self.shape = self.fileinfo["shape"]
+        self.shape = self.header["shape"]
         self.size = self.data.size
-        self.restfreq = self.fileinfo["restfreq"]
-        self.bmaj, self.bmin, self.bpa = self.beam = self.fileinfo["beam"]
+        self.restfreq = self.header["restfreq"]
+        self.bmaj, self.bmin, self.bpa = self.beam = self.header["beam"]
         self.resolution = np.sqrt(self.beam[0]*self.beam[1]) if self.beam is not None else None
-        self.refcoord = self.fileinfo["refcoord"]
+        self.refcoord = self.header["refcoord"]
         if isinstance(self.data, u.Quantity):
-            self.bunit = self.fileinfo["bunit"] = _apu_to_headerstr(self.data.unit)
+            self.bunit = self.header["bunit"] = _apu_to_headerstr(self.data.unit)
         else:
-            self.bunit = self.fileinfo["bunit"]
-        self.specunit = self.fileinfo["specunit"]
-        self.vrange = self.fileinfo["vrange"]
-        self.dv = self.fileinfo["dv"]
-        self.nv = self.nchan = self.fileinfo["nchan"]
+            self.bunit = self.header["bunit"]
+        self.specunit = self.header["specunit"]
+        self.vrange = self.header["vrange"]
+        self.dv = self.header["dv"]
+        self.nv = self.nchan = self.header["nchan"]
         if self.specunit == "km/s":
-            rounded_dv = round(self.fileinfo["dv"], 5)
-            vmin, vmax = self.fileinfo["vrange"]
+            rounded_dv = round(self.header["dv"], 5)
+            vmin, vmax = self.header["vrange"]
             rounded_vmin = round(vmin, 5)
             rounded_vmax = round(vmax, 5)
-            if np.isclose(rounded_dv, self.fileinfo["dv"]):
-                self.dv = self.fileinfo["dv"] = rounded_dv
+            if np.isclose(rounded_dv, self.header["dv"]):
+                self.dv = self.header["dv"] = rounded_dv
             if np.isclose(vmin, rounded_vmin):
                 vmin = rounded_vmin
             if np.isclose(vmax, rounded_vmax):
                 vmax = rounded_vmax
-            self.vrange = self.fileinfo["vrange"] = [vmin, vmax]
+            self.vrange = self.header["vrange"] = [vmin, vmax]
         self.vaxis = self.get_vaxis()
         vmin, vmax = self.vaxis[[0, -1]]
         xmin, xmax = self.xaxis[[0, -1]]
@@ -4438,8 +4469,8 @@ class PVdiagram:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data+other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data+other)
+            return PVdiagram(header=self.header, data=self.data+other.data)
+        return PVdiagram(header=self.header, data=self.data+other)
     
     def __radd__(self, other):
         if isinstance(other, PVdiagram):
@@ -4448,8 +4479,8 @@ class PVdiagram:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return PVdiagram(fileinfo=self.fileinfo, data=other.data+self.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=other+self.data)
+            return PVdiagram(header=self.header, data=other.data+self.data)
+        return PVdiagram(header=self.header, data=other+self.data)
         
     def __sub__(self, other):
         if isinstance(other, PVdiagram):
@@ -4458,8 +4489,8 @@ class PVdiagram:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data-other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data-other)
+            return PVdiagram(header=self.header, data=self.data-other.data)
+        return PVdiagram(header=self.header, data=self.data-other)
     
     def __rsub__(self, other):
         if isinstance(other, PVdiagram):
@@ -4468,153 +4499,153 @@ class PVdiagram:
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
                 print("WARNING: operation performed on two images with different units.")
-            return PVdiagram(fileinfo=self.fileinfo, data=other.data-self.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=other-self.data)
+            return PVdiagram(header=self.header, data=other.data-self.data)
+        return PVdiagram(header=self.header, data=other-self.data)
         
     def __mul__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data*other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data*other)
+            return PVdiagram(header=self.header, data=self.data*other.data)
+        return PVdiagram(header=self.header, data=self.data*other)
     
     def __rmul__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=other.data*self.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=other*self.data)
+            return PVdiagram(header=self.header, data=other.data*self.data)
+        return PVdiagram(header=self.header, data=other*self.data)
     
     def __pow__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data**other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data**other)
+            return PVdiagram(header=self.header, data=self.data**other.data)
+        return PVdiagram(header=self.header, data=self.data**other)
         
     def __rpow__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=other.data**self.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=other**self.data)
+            return PVdiagram(header=self.header, data=other.data**self.data)
+        return PVdiagram(header=self.header, data=other**self.data)
         
     def __truediv__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data/other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data/other)
+            return PVdiagram(header=self.header, data=self.data/other.data)
+        return PVdiagram(header=self.header, data=self.data/other)
     
     def __rtruediv__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=other.data/self.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=other/self.data)
+            return PVdiagram(header=self.header, data=other.data/self.data)
+        return PVdiagram(header=self.header, data=other/self.data)
         
     def __floordiv__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data//other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data//other)
+            return PVdiagram(header=self.header, data=self.data//other.data)
+        return PVdiagram(header=self.header, data=self.data//other)
     
     def __rfloordiv__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=other.data//self.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=other//self.data)
+            return PVdiagram(header=self.header, data=other.data//self.data)
+        return PVdiagram(header=self.header, data=other//self.data)
     
     def __mod__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data%other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data%other)
+            return PVdiagram(header=self.header, data=self.data%other.data)
+        return PVdiagram(header=self.header, data=self.data%other)
     
     def __rmod__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=other.data%self.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=other%self.data)
+            return PVdiagram(header=self.header, data=other.data%self.data)
+        return PVdiagram(header=self.header, data=other%self.data)
     
     def __lt__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data<other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data<other)
+            return PVdiagram(header=self.header, data=self.data<other.data)
+        return PVdiagram(header=self.header, data=self.data<other)
     
     def __le__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data<=other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data<=other)
+            return PVdiagram(header=self.header, data=self.data<=other.data)
+        return PVdiagram(header=self.header, data=self.data<=other)
     
     def __eq__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data==other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data==other)
+            return PVdiagram(header=self.header, data=self.data==other.data)
+        return PVdiagram(header=self.header, data=self.data==other)
         
     def __ne__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data!=other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data!=other)
+            return PVdiagram(header=self.header, data=self.data!=other.data)
+        return PVdiagram(header=self.header, data=self.data!=other)
 
     def __gt__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data>other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data>other)
+            return PVdiagram(header=self.header, data=self.data>other.data)
+        return PVdiagram(header=self.header, data=self.data>other)
         
     def __ge__(self, other):
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
                     print("WARNING: operation performed on two images with significantly different beam sizes.")
-            return PVdiagram(fileinfo=self.fileinfo, data=self.data>=other.data)
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data>=other)
+            return PVdiagram(header=self.header, data=self.data>=other.data)
+        return PVdiagram(header=self.header, data=self.data>=other)
 
     def __abs__(self):
-        return PVdiagram(fileinfo=self.fileinfo, data=np.abs(self.data))
+        return PVdiagram(header=self.header, data=np.abs(self.data))
     
     def __pos__(self):
         return self
     
     def __neg__(self):
-        return PVdiagram(fileinfo=self.fileinfo, data=-self.data)
+        return PVdiagram(header=self.header, data=-self.data)
     
     def __invert__(self):
-        return PVdiagram(fileinfo=self.fileinfo, data=~self.data)
+        return PVdiagram(header=self.header, data=~self.data)
     
     def __getitem__(self, indices):
         try:
             try:
-                return PVdiagram(fileinfo=self.fileinfo, data=self.data[indices])
+                return PVdiagram(header=self.header, data=self.data[indices])
             except:
                 print("WARNING: Returning value after reshaping image data to 2 dimensions.")
                 return self.data.copy[:, indices[0], indices[1]]
@@ -4624,7 +4655,7 @@ class PVdiagram:
     def __setitem__(self, indices, value):
         newdata = self.data.copy()
         newdata[indices] = value
-        return PVdiagram(fileinfo=self.fileinfo, data=newdata)
+        return PVdiagram(header=self.header, data=newdata)
     
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         # Extract the Spatialmap object from inputs
@@ -4638,14 +4669,14 @@ class PVdiagram:
                 decimals = inputs[1]
             else:
                 decimals = 0  # Default value for decimals
-            return PVdiagram(fileinfo=self.fileinfo, data=np.round(self.data, decimals))
+            return PVdiagram(header=self.header, data=np.round(self.data, decimals))
         
         # Apply the numpy ufunc to the data
         result = getattr(ufunc, method)(*inputs, **kwargs)
 
         # Return a new PVdiagram instance with the result if the ufunc operation was successful
         if method == '__call__' and isinstance(result, np.ndarray):
-            return PVdiagram(fileinfo=self.fileinfo, data=result)
+            return PVdiagram(header=self.header, data=result)
         else:
             return result
         
@@ -4656,7 +4687,7 @@ class PVdiagram:
         """
         This method converts the intensity unit of original image to the specified unit.
         """
-        return PVdiagram(fileinfo=self.fileinfo, data=self.data.to(unit, *args, **kwargs))
+        return PVdiagram(header=self.header, data=self.data.to(unit, *args, **kwargs))
 
     def to_value(self, unit, *args, **kwargs):
         """
@@ -4669,7 +4700,7 @@ class PVdiagram:
         
     def copy(self):
         """
-        This method converts the intensity unit of original image to the specified unit.
+        This method makes a deep copy of the instance.
         """
         return copy.deepcopy(self)
     
@@ -4722,9 +4753,9 @@ class PVdiagram:
         """
         image = self if inplace else self.copy()
         vaxis = image.get_vaxis(specunit=specunit)
-        image.fileinfo["dv"] = vaxis[1]-vaxis[0]
-        image.fileinfo["vrange"] = vaxis[[0, -1]].tolist()
-        image.fileinfo["specunit"] = _apu_to_headerstr(_to_apu(specunit))
+        image.header["dv"] = vaxis[1]-vaxis[0]
+        image.header["vrange"] = vaxis[[0, -1]].tolist()
+        image.header["specunit"] = _apu_to_headerstr(_to_apu(specunit))
         image.__updateparams()
         return image
     
@@ -4766,8 +4797,8 @@ class PVdiagram:
                 self.data = np.where(self.data<threshold, self.data, np.nan)
             return self
         if minimum:
-            return PVdiagram(fileinfo=self.fileinfo, data=np.where(self.data<threshold, np.nan, self.data))
-        return PVdiagram(fileinfo=self.fileinfo, data=np.where(self.data<threshold, self.data, np.nan))
+            return PVdiagram(header=self.header, data=np.where(self.data<threshold, np.nan, self.data))
+        return PVdiagram(header=self.header, data=np.where(self.data<threshold, self.data, np.nan))
     
     def noise(self, sigma=3., plthist=False, shownoise=False, printstats=False, bins='auto', 
               gaussfit=False, curvecolor="crimson", curvelw=0.6, fixmean=True, histtype='step', 
@@ -4875,11 +4906,11 @@ class PVdiagram:
             self.header["unit"] = _apu_to_headerstr(_to_apu(unit))
             self.__updateparams()
             return self
-        newfileinfo = copy.deepcopy(self.fileinfo)
-        newfileinfo["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
-        newfileinfo["beam"] = newbeam
-        newfileinfo["unit"] = _apu_to_headerstr(_to_apu(unit))
-        return PVdiagram(fileinfo=newfileinfo, data=self.data)
+        newheader = copy.deepcopy(self.header)
+        newheader["dx"] = u.Quantity(self.dx, self.unit).to_value(unit)
+        newheader["beam"] = newbeam
+        newheader["unit"] = _apu_to_headerstr(_to_apu(unit))
+        return PVdiagram(header=newheader, data=self.data)
     
     def conv_bunit(self, bunit, inplace=False):
         """
@@ -4933,51 +4964,138 @@ class PVdiagram:
         newimage.__updateparams()
         return newimage
     
-    def _mean_velocities_at_position(self):
-        # intiialize variables
-        vaxis = self.vaxis.copy()
-        data = self.data[0]
-        nv = self.nv
-        nx = self.nx
+#     def __mean_velocities_at_position(self, data):
+#         # initialize variables
+#         vaxis = self.vaxis.copy()
+#         nv = self.nv
+#         nx = self.nx
 
-        # broadcast vaxis
-        vv = vaxis[:, None]
-        vv = np.broadcast_to(vv, (nv, nx))
+#         # broadcast vaxis
+#         vv = vaxis[:, None]
+#         vv = np.broadcast_to(vv, (nv, nx))
         
-        # mean velocity at each position, weighted by intensity
-        mean_vel = np.nansum(vv*data, axis=0)/np.nansum(data, axis=0)  # size: nx
+#         # mean velocity at each position, weighted by intensity
+#         mean_vel = np.nansum(vv*data, axis=0)/np.nansum(data, axis=0)  # size: nx
         
-        # calculate standard error
-        N = np.count_nonzero(~np.isnan(data), axis=0)  # number of observations
-        weighted_sqdev = data*(vv-mean_vel[None, :])**2  # weighted deviations squared
-        weighted_var = np.nansum(weighted_sqdev, axis=0)/np.nansum(data, axis=0)  # weighted variance
-        weighted_sd = np.sqrt(weighted_var)
-        std_err = weighted_sd / np.sqrt(N-1)
+#         # calculate error
+#         N = np.count_nonzero(~np.isnan(data), axis=0)  # number of observations
+#         weighted_sqdev = data*(vv-mean_vel[None, :])**2  # weighted deviations squared
+#         weighted_var = np.nansum(weighted_sqdev, axis=0)/np.nansum(data, axis=0)  # weighted variance
+#         weighted_sd = np.sqrt(weighted_var)
+#         std_err = weighted_sd / np.sqrt(N-1)
         
-        return mean_vel, std_err
-           
-    def _mean_positions_at_velocity(self):
-        # intiialize variables
-        xaxis = self.xaxis.copy()
-        data = self.data[0]
-        nv = self.nv
-        nx = self.nx
+#         return mean_vel, std_err
+        
+#     def __mean_positions_at_velocity(self, data):
+#         # intiialize variables
+#         xaxis = self.xaxis.copy()
+#         nv = self.nv
+#         nx = self.nx
 
-        # broadcast vaxis
-        xx = xaxis[None, :]
-        xx = np.broadcast_to(xx, (nv, nx))
+#         # broadcast vaxis
+#         xx = xaxis[None, :]
+#         xx = np.broadcast_to(xx, (nv, nx))
         
-        # mean velocity at each position, weighted by intensity
-        mean_offset = np.nansum(xx*data, axis=1)/np.nansum(data, axis=1)  # size: nx
+#         # mean velocity at each position, weighted by intensity
+#         mean_offset = np.nansum(xx*data, axis=1)/np.nansum(data, axis=1)  # size: nv
         
-        # calculate standard error
-        N = np.count_nonzero(~np.isnan(data), axis=1)  # number of observations
-        weighted_sqdev = data*(xx-mean_offset[:, None])**2  # weighted deviations squared
-        weighted_var = np.nansum(weighted_sqdev, axis=1)/np.nansum(data, axis=1)  # weighted variance
-        weighted_sd = np.sqrt(weighted_var)
-        std_err = weighted_sd / np.sqrt(N-1)
+#         # calculate standard error
+#         N = np.count_nonzero(~np.isnan(data), axis=1)  # number of observations
+#         weighted_sqdev = data*(xx-mean_offset[:, None])**2  # weighted deviations squared
+#         weighted_var = np.nansum(weighted_sqdev, axis=1)/np.nansum(data, axis=1)  # weighted variance
+#         weighted_sd = np.sqrt(weighted_var)
+#         std_err = weighted_sd / np.sqrt(N-1)
         
-        return mean_offset, std_err        
+#         return mean_offset, std_err
+    
+#     def __plot_PV_points(self, ax, vsys=0, vlim=None, xlim=None, threshold=None, 
+#                          offset_as_hor=False):
+#         """
+#         Plot measurements on PV diagram
+#         """
+#         # apply threshold if necessary
+#         if threshold is not None:
+#             data = np.where(self.data<threshold, np.nan, self.data)[0]
+#         else:
+#             data = self.data[0]
+        
+#         # mean velocity at position
+#         mean_vel, mean_vel_err = self.__mean_velocities_at_position(data=data)
+#         xaxis = self.xaxis.copy()
+#         if vlim is not None:
+#             vmask = (vlim[0] <= mean_vel) & (mean_vel <= vlim[1])
+#             mean_vel = mean_vel[vmask]
+#             mean_vel_err = mean_vel_err[vmask]
+#             xaxis = xaxis[vmask]
+        
+#         if xlim is not None:
+#             xmask = (xlim[0] <= xaxis) & (xaxis <= xlim[1])
+#             mean_vel = mean_vel[xmask]
+#             mean_vel_err = mean_vel_err[xmask]
+#             xaxis = xaxis[xmask]
+        
+#         if offset_as_hor:
+#             # blueshifted
+#             ax.errorbar(x=xaxis[mean_vel<vsys], y=mean_vel[mean_vel<vsys], 
+#                         yerr=mean_vel_err[mean_vel<vsys], color="skyblue", capsize=3, 
+#                         capthick=1., elinewidth=1., ls='none')
+#             # redshifted
+#             ax.errorbar(x=xaxis[mean_vel>vsys], y=mean_vel[mean_vel>vsys], 
+#                         yerr=mean_vel_err[mean_vel>vsys], color="pink", capsize=3, 
+#                         capthick=1., elinewidth=1., ls='none')
+#         else:
+#             # blueshifted
+#             ax.errorbar(y=xaxis[mean_vel<vsys], x=mean_vel[mean_vel<vsys], 
+#                         xerr=mean_vel_err[mean_vel<vsys], color="skyblue", capsize=3, 
+#                         capthick=1., elinewidth=1., ls='none')
+#             # redshifted
+#             ax.errorbar(y=xaxis[mean_vel>vsys], x=mean_vel[mean_vel>vsys], 
+#                         xerr=mean_vel_err[mean_vel>vsys], color="pink", capsize=3, 
+#                         capthick=1., elinewidth=1., ls='none')
+        
+#         # mean position at velocity
+#         mean_pos, mean_pos_err = self.__mean_positions_at_velocity(data=data)
+        
+#         vaxis = self.vaxis.copy()
+#         if xlim is not None:
+#             xmask = (vlim[0] <= mean_pos) & (mean_pos <= vlim[1])
+#             mean_pos = mean_pos[xmask]
+#             mean_pos_err = mean_pos_err[xmask]
+#             vaxis = vaxis[xmask]
+        
+#         if vlim is not None:
+#             vmask = (vlim[0] <= vaxis) & (vaxis <= vlim[1])
+#             mean_pos = mean_pos[vmask]
+#             mean_pos_err = mean_pos_err[vmask]
+#             vaxis = vaxis[xmask]
+            
+#         if offset_as_hor:
+#             # blueshifted
+#             ax.errorbar(x=mean_pos[vaxis<vsys], y=vaxis[vaxis<vsys], 
+#                         xerr=mean_pos_err[vaxis<vsys], color="b", capsize=3, 
+#                         capthick=1., elinewidth=1., ls='none')
+#             # redshifted
+#             ax.errorbar(x=mean_pos[vaxis>vsys], y=vaxis[vaxis>vsys], 
+#                         xerr=mean_pos_err[vaxis>vsys], color="r", capsize=3, 
+#                         capthick=1., elinewidth=1., ls='none')
+#         else:
+#             # blueshifted
+#             ax.errorbar(y=mean_pos[vaxis<vsys], x=vaxis[vaxis<vsys], 
+#                         yerr=mean_pos_err[vaxis<vsys], color="b", capsize=3, 
+#                         capthick=1., elinewidth=1., ls='none')
+#             # redshifted
+#             ax.errorbar(y=mean_pos[vaxis>vsys], x=vaxis[vaxis>vsys], 
+#                         yerr=mean_pos_err[vaxis>vsys], color="r", capsize=3, 
+#                         capthick=1., elinewidth=1., ls='none')
+            
+#         return ax
+            
+#     def plot_measurements(self, vsys=0, pt_vlim=None, pt_xlim=None, threshold=None,
+#                           offset_as_hor=False, **kwargs):
+#         ax = self.imview(vsys=vsys, offset_as_hor=offset_as_hor, plot=False, **kwargs)
+#         ax = self.__plot_PV_points(ax=ax, vsys=vsys, vlim=pt_vlim, xlim=pt_xlim, 
+#                                    threshold=threshold, offset_as_hor=offset_as_hor)
+#         return ax
     
     def __get_offset_resolution(self, pa=None):
         if pa is None:
@@ -4988,14 +5106,15 @@ class PVdiagram:
         return np.sqrt(1/(aa+bb))
         
     def imview(self, contourmap=None, cmap="inferno", vmin=None, vmax=None, nancolor="k", crms=None, 
-               clevels=np.arange(3, 21, 3), ccolor="w", clw=1., dpi=500, cbaron=True, cbarloc="right", 
-               cbarpad="0%", vsys=None, xlim=None, vlim=None, xcenter=0., vlineon=True, xlineon=True, 
-               cbarlabelon=True, cbarwidth='5%', cbarlabel=None, fontsize=12, labelsize=10, width=330, height=300, 
-               plotres=True, xlabelon=True, vlabelon=True, xlabel=None, vlabel=None, offset_as_hor=False, 
-               aspect_ratio=1.15, axeslw=1., tickson=True, tickwidth=1., tickdirection="in", ticksize=3., ticklabelsize=10,
-               cbartick_width=1, cbartick_length=3, xticks=None, vticks=None, title=None, titleloc=(0.05, 0.985), 
-               ha="left", va="top", txtcolor="w", refline_color="w", pa=None, refline_width=None, 
-               subtract_vsys=False, errbarloc=(0.1, 0.1225), ax=None, plot=True):
+               clevels=np.arange(3, 21, 3), ccolor="w", clw=1., dpi=600, cbaron=True, cbarloc="right", 
+               cbarpad="0%", vsys=None, percentile=None, xlim=None, vlim=None, xcenter=0., vlineon=True, 
+               xlineon=True, cbarlabelon=True, cbarwidth='5%', cbarlabel=None, fontsize=10, labelsize=10, 
+               width=330, height=300, plotres=True, xlabelon=True, vlabelon=True, xlabel=None, vlabel=None, 
+               offset_as_hor=False, aspect_ratio=1.15, axeslw=1., tickson=True, tickwidth=1., tickdirection="in", 
+               ticksize=3., tickcolor="k", cbartick_width=1, cbartick_length=3, xticks=None, title_fontsize=12,
+               vticks=None, title=None, titleloc=(0.1, 0.9), ha="left", va="top", txtcolor="w", 
+               refline_color="w", pa=None, refline_width=None, subtract_vsys=False, errbarloc=(0.1, 0.1225), 
+               ax=None, plot=True):
         """
         Display a Position-Velocity (PV) diagram.
 
@@ -5003,7 +5122,7 @@ class PVdiagram:
         for visual aspects like colormap, contour levels, axis labels, etc.
 
         Parameters:
-            contourmap (Datacube, optional): A Datacube instance to use for contour mapping. Default is None.
+            contourmap (PVdiagram, optional): A PVdiagram instance to use for contour mapping. Default is None.
             cmap (str): Colormap for the image data. Default is 'inferno'.
             nancolor (str): Color used for NaN values in the data. Default is 'k' (black).
             crms (float, optional): RMS noise level for contour mapping. Automatically estimated if None and contourmap is provided.
@@ -5052,6 +5171,10 @@ class PVdiagram:
         # initialize parameters:
         if not isinstance(clevels, np.ndarray):
             clevels = np.array(clevels)
+        if isinstance(self.data, u.Quantity):
+            colordata = self.data.value.copy()[0]
+        else:
+            colordata = self.data.copy()[0]
         if pa is None:
             pa = self.pa
         if subtract_vsys and vsys is None:
@@ -5065,8 +5188,13 @@ class PVdiagram:
                 contourmap = None
                 print("Failed to estimate RMS noise level of contour map.")
                 print("Please specify base contour level using 'crms' parameter.")
-        contmap = contourmap.copy() if contourmap is not None else contourmap
-        xlim = self.maxxlim if xlim is None else xlim
+        if contourmap is not None:
+            if isinstance(contourmap.data, u.Quantity):
+                contmap = contourmap.value.copy()
+            else:
+                contmap = contourmap.copy()
+        if xlim is None:
+            xlim = self.maxxlim
         if vlim is None:
             if subtract_vsys:
                 vlim = np.array(self.maxvlim)-vsys
@@ -5118,20 +5246,27 @@ class PVdiagram:
                   'ytick.direction': tickdirection,
                   }
         rcParams.update(params)
-        
+
         if ax is None:
             fig = plt.figure(figsize=fig_size)
             ax = fig.add_subplot(111)
         
+        if percentile is not None:
+            trimmed_data = self.__trim_data(xlim=xlim, vlim=vlim)
+            vmin, vmax = clip_percentile(data=trimmed_data, area=percentile, bins="auto", plot=False)
+        
+        # get data for preparation
+        imextent = copy.deepcopy(self.imextent)
+        
         # plot image
         if offset_as_hor:
-            imextent = [self.imextent[2], self.imextent[3], self.imextent[0], self.imextent[1]]
+            imextent = [imextent[2], imextent[3], imextent[0], imextent[1]]
             if subtract_vsys:
                 imextent[3] -= vsys
                 imextent[4] -= vsys
-            colordata = self.data[0, :, :]
-            climage = ax.imshow(colordata, cmap=cmap, extent=imextent, origin='lower', vmin=vmin, vmax=vmax)
-            if contmap is not None:
+            climage = ax.imshow(colordata, cmap=cmap, extent=imextent, 
+                                origin='lower', vmin=vmin, vmax=vmax)
+            if contourmap is not None:
                 contextent = [contmap.imextent[2], contmap.imextent[3], contmap.imextent[0], contmap.imextent[1]]
                 contdata = contmap.data[0, :, :]
                 ax.contour(contdata, colors=ccolor, origin='lower', extent=contextent, 
@@ -5156,13 +5291,12 @@ class PVdiagram:
                     ax.plot([xlim[0], xlim[1]], [vsys, vsys], color=refline_color, 
                             ls='dashed', lw=refline_width)
         else:
-            imextent = self.imextent[:]
             if subtract_vsys:
                 imextent[0] -= vsys
                 imextent[1] -= vsys
-            colordata = self.data[0, :, :].T
-            climage = ax.imshow(colordata, cmap=cmap, extent=imextent, origin='lower', vmin=vmin, vmax=vmax)
-            if contmap is not None:
+            climage = ax.imshow(colordata.T, cmap=cmap, extent=imextent, 
+                                origin='lower', vmin=vmin, vmax=vmax)
+            if contourmap is not None:
                 contextent = contmap.imextent
                 contdata = contmap.data[0, :, :].T
                 ax.contour(contdata, colors=ccolor, origin='lower', extent=contextent, 
@@ -5187,11 +5321,12 @@ class PVdiagram:
                         ls='dashed', lw=refline_width)
         # tick parameters
         if tickson:
-            ax.tick_params(which='both', direction=tickdirection, bottom=True, top=True, left=True, right=True,
-                           pad=9, labelsize=labelsize)
+            ax.tick_params(which='both', direction=tickdirection, bottom=True, top=True, 
+                           left=True, right=True, pad=9, labelsize=labelsize, color=tickcolor,
+                           width=tickwidth)
         else:
-            ax.tick_params(which='both', direction=tickdirection, bottom=False, top=False, left=False, right=False,
-                           pad=9, labelsize=labelsize)
+            ax.tick_params(which='both', direction=tickdirection, bottom=False, top=False, 
+                           left=False, right=False, pad=9, labelsize=labelsize)
         
         # define horizontal and vertical limits
         if offset_as_hor:
@@ -5219,8 +5354,8 @@ class PVdiagram:
                 
             cbar = fig.colorbar(climage, cax=ax_cb, pad=cbarpad, 
                                 orientation=orientation, ticklocation=cbarloc.lower())
-            cbar.set_label(cbarlabel)
-            cbar.ax.tick_params(labelsize=ticklabelsize, width=cbartick_width, 
+            cbar.set_label(cbarlabel, fontsize=fontsize)
+            cbar.ax.tick_params(labelsize=labelsize, width=cbartick_width, 
                                 length=cbartick_length, direction="in")
             
          # set aspect ratio
@@ -5240,19 +5375,31 @@ class PVdiagram:
         # plot title, if necessary
         if title is not None:
             titlex = horlim[0] + titleloc[0]*hor_range
-            titley = horlim[0] + titleloc[1]*vert_range
+            titley = vertlim[0] + titleloc[1]*vert_range
             ax.text(x=titlex, y=titley, s=title, ha=ha, va=va, 
-                    color=txtcolor, fontsize=fontsize)
+                    color=txtcolor, fontsize=title_fontsize)
         
         if plot:
             plt.show()
         
         return ax
     
+    def __trim_data(self, vlim, xlim):
+        if list(vlim) == [self.vaxis.min(), self.vaxis.max()] \
+           and list(xlim) == [self.xaxis.min(), self.xaxis.max()]:
+            return self.data[0]
+        
+        vmask = (min(vlim) <= self.vaxis) & (self.vaxis <= max(vlim))
+        xmask = (min(xlim) <= self.xaxis) & (self.xaxis <= max(xlim))
+        trimmed_data = self.data[0][vmask, :][:, xmask]
+        return trimmed_data
+    
     def line_info(self, **kwargs):
         """
         This method searches for the molecular line data from the Splatalogue database
         """
+        if np.isnan(self.restfreq):
+            raise Exception("Failed to find molecular line as rest frequency cannot be read.")
         return search_molecular_line(self.restfreq, unit="Hz", **kwargs)
     
     def get_hduheader(self):
@@ -5306,6 +5453,7 @@ class PVdiagram:
         print(f"File saved as '{outname}'.")
 
 
+# +
 class Region:
     """
     A class for handling regions.
@@ -5572,7 +5720,7 @@ class Region:
                            "pa": pa,
                            "unit": unit,
                            "relative": relative,}
-        elif self.shape == "ellipse":
+        elif shape == "ellipse":
             self.unit = unit = "deg"
             coord_tup = self.__filelst[3].replace(self.shape+"(", "")
             coord_tup = coord_tup.split(")")[0]  # string
@@ -5593,7 +5741,7 @@ class Region:
                            "unit": unit,
                            "relative": relative
                            }
-        elif self.shape == "box":
+        elif shape == "box":
             self.unit = unit = "deg"
             coord_tup = self.__filelst[3].replace(self.shape+"(", "")
             coord_tup = coord_tup.split(")")[0]  # string
@@ -5616,19 +5764,53 @@ class Region:
                            "relative": relative
                            }
         else:
-            raise Exception("Not implemented yet.")
+            raise Exception("Region not supported in this current version.")
 
     def __readCRTF(self):
         raise Exception("Not implemented yet.")
+#         shape = self.shape
+#         if self.shape == "line":
+#             coord_lst = self.__filelst[1].split()[1:5]
+#             start_ra = coord_lst[0][2:-1]
+#             start_dec = coord_lst[1][:-2]
+#             self.start = start = start_ra + " " + start_dec
+#             start_coord = SkyCoord(start, unit=(u.hourangle, u.deg))
+            
+#             end_ra = coord_lst[2][1:-1]
+#             end_dec = coord_lst[3][:-2]
+#             self.end = end = end_ra + " " + end_dec
+#             end_coord = SkyCoord(end, unit=(u.hourangle, u.deg))
+            
+#             center_ra = (end_coord.ra + start_coord.ra)/2
+#             center_dec = (end_coord.dec + start_coord.dec)/2
+#             self.center = center = 
+#             # completed up to this point.
+            
+#             self.length = length = np.sqrt((start[0]-end[0])**2+(start[1]-end[1])**2)
+#             dx, dy = start[0]-end[0], end[1]-start[1]
+#             pa = -np.rad2deg(np.arctan(dx/dy)) if dy != 0 else (90. if dx > 0 else -90.)
+#             self.center = center = (start[0]+end[0])/2, (start[1]+end[1])/2
+#             self.relative = relative = False
+#             self.pa = pa
+#             self.header = {"shape": shape,
+#                            "start": start,
+#                            "end": end,
+#                            "center": center,
+#                            "length": length,
+#                            "pa": pa,
+#                            "unit": unit,
+#                            "relative": relative,}
 
+
+# -
 
 def plt_1ddata(xdata=None, ydata=None, xlim=None, ylim=None, mean_center=False, title=None,
                legendon=True, xlabel="", ylabel="", threshold=None, linewidth=0.8,
-               xtick_spacing=None, ytick_spacing=None, ticklabelsize=7, borderwidth=0.7,
+               xtick_spacing=None, ytick_spacing=None, borderwidth=0.7,
                labelsize=7, fontsize=8, ticksize=3, legendsize=6, title_position=0.92,
                bbox_to_anchor=(0.6, 0.95), legendloc="best", threshold_color="gray",
                linecolor="k", figsize=(2.76, 2.76), bins="auto", hist=False,
-               dpi=500, plot=True, **kwargs):
+               dpi=600, plot=True, **kwargs):
     
     fontsize = labelsize if fontsize is None else fontsize
     
@@ -5637,12 +5819,12 @@ def plt_1ddata(xdata=None, ydata=None, xlim=None, ylim=None, mean_center=False, 
     if ylim is None:
         ylim = []
     
-    params = {'axes.labelsize': labelsize,
-              'axes.titlesize': labelsize,
+    params = {'axes.labelsize': fontsize,
+              'axes.titlesize': fontsize,
               'font.size': fontsize,
               'legend.fontsize': legendsize,
-              'xtick.labelsize': ticklabelsize,
-              'ytick.labelsize': ticklabelsize,
+              'xtick.labelsize': labelsize,
+              'ytick.labelsize': labelsize,
               'figure.figsize': figsize,
               'figure.dpi': dpi,
               'font.family': _fontfamily,
@@ -5717,10 +5899,10 @@ def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=None, ylim=N
                   gaussfit=True, mean_center=True, title=None, legendon=True,
                   xlabel=r"Velocity offset ($\rm km~s^{-1}$)", ylabel=r"Intensity ($\rm K$)", 
                   threshold=None, linewidth=0.8, figsize=(2.76, 2.76), xtick_spacing=None,
-                  ytick_spacing=None, ticklabelsize=7, borderwidth=0.7, labelsize=7,
+                  ytick_spacing=None, borderwidth=0.7, labelsize=7,
                   fontsize=8, ticksize=3,legendsize=6, title_position=0.92,
                   bbox_to_anchor=(0.6, 0.95), legendloc="best", skiprows=5,
-                  delimiter="\t", vsys=0., subtract_vsys=False, dpi=500,
+                  delimiter="\t", vsys=0., subtract_vsys=False, dpi=600,
                   threshold_color="gray", **kwargs):
     
     """
@@ -5741,7 +5923,7 @@ def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=None, ylim=N
         linewidth (float, optional): Line width for plotting.
         figsize (tuple, optional): Size of the figure.
         xtick_spacing/ytick_spacing (float, optional): Spacing for x and y ticks.
-        ticklabelsize, borderwidth, labelsize, fontsize (float, optional): Various formatting parameters.
+        borderwidth, labelsize, fontsize (float, optional): Various formatting parameters.
         ticksize, legendsize, title_position (float, optional): Additional formatting parameters.
         bbox_to_anchor, legendloc (tuple/str, optional): Legend positioning.
         skiprows (int, optional): Number of rows to skip when reading a CSV file.
@@ -5811,15 +5993,17 @@ def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=None, ylim=N
             velocity = velocity - vsys if subtract_vsys else velocity
             xlabel=r"Radio velocity ($\rm km~s^{-1}$)" if not subtract_vsys else r"Velocity offset ($\rm km~s^{-1}$)"
             intensity = dataset["y"]
-                
-    fontsize = labelsize if fontsize is None else fontsize
+    
+    if fontsize is None:
+        fontsize = labelsize
+    
     params = {'axes.labelsize': labelsize,
               'axes.titlesize': labelsize,
               'font.size': fontsize,
               'figure.dpi': dpi,
               'legend.fontsize': legendsize,
-              'xtick.labelsize': ticklabelsize,
-              'ytick.labelsize': ticklabelsize,
+              'xtick.labelsize': labelsize,
+              'ytick.labelsize': labelsize,
               'font.family': _fontfamily,
               "mathtext.fontset": _mathtext_fontset, #"Times New Roman"
               'mathtext.tt': _mathtext_tt,
@@ -5899,11 +6083,11 @@ def exportfits(image, *args, **kwargs):
 def imview(image, *args, **kwargs):
     if isinstance(image, (Datacube, Spatialmap, PVdiagram)):
         return image.imview(*args, **kwargs)
-    elif isinstance(image, *args, **kwargs):
+    elif isinstance(image, str):
         image = importfits(image)
         return image.imview(*args, **kwargs)
     else:
-        raise ValueError("'image' parameter must be a direcotry to a FITS file or an image instance.")
+        raise ValueError("'image' parameter must be a directory to a FITS file or an image instance.")
 
 
 def search_molecular_line(restfreq, unit="GHz", printinfo=True):
@@ -6071,6 +6255,66 @@ def planck_function(v, T):
     
     # return value
     return Bv.to_value(u.Jy)
+
+
+def clip_percentile(data, area=0.95, bins="auto", plot=True, xlim=None):
+    """
+    Public function to calculate the interval containing the percentile (from middle).
+    Parameters:
+        data: the 2D data of an image
+        area: the total area (from center)
+        bins: the number of bins of the histogram
+        xlim: the x field of view of the histogram
+    Returns:
+        The interval (tuple(float)) containing the area (from middle).
+    """
+    if not (0 <= area <= 1):
+        raise ValueError("Percentile must be between 0 and 1.")
+        
+    # get left and right tails
+    left_tail = (1 - area) / 2
+    right_tail = area + left_tail
+
+    # flatten data
+    flattened_data = data.flatten()
+    flattened_data = flattened_data[~np.isnan(flattened_data)]  # remove nan values
+
+    # get histogram data
+    freq, bin_edges = np.histogram(flattened_data, bins=bins)  # create histogram data
+    middle_bins = (bin_edges[:-1]+bin_edges[1:])/2  # middle bins
+    cum_areas = np.cumsum(freq)  # cumulative areas
+    rel_cum_areas = cum_areas/cum_areas[-1]  # relative cumulative areas
+    
+    # calculate mean value of histogram
+    mean = np.average(middle_bins, weights=freq)
+
+    # get index of left and right tails
+    left_idx = np.where(rel_cum_areas>=left_tail)[0][0]
+    right_idx = np.where(rel_cum_areas>=right_tail)[0][0]
+
+    # get interval
+    interval = (middle_bins[left_idx], middle_bins[right_idx])
+    
+    # print info
+    title = f"{100*area}th percentile"
+    print(15*"#"+title+15*"#")
+    print(f"Interval: {interval}")
+    print(f"Mean of histogram: %.4f"%mean)
+    print((30+len(title))*"#")
+    
+    # plot data if needed
+    if plot:
+        fig = plt.figure(figsize=(3.2, 2.4))
+        ax = fig.add_subplot(111)
+        ax.hist(flattened_data, bins=bins)
+        ymin, ymax = ax.get_ylim()
+        ax.vlines(x=interval, ymin=ymin, ymax=ymax, colors="r", lw=1, ls="dashed")
+        ax.vlines(x=mean, ymin=ymin, ymax=ymax, colors="g", lw=1, ls="dashed")
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        ax.set_ylim(ymin, ymax)
+        
+    return interval
 
 
 def H2_column_density(continuum, T_dust, k_v):
