@@ -157,11 +157,13 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         else:
             if len(good_hdu) >= 2:
                 if not quiet:
+                    print()
                     print(f"Found {len(good_hdu)} readable HDUs." +  
                           "Change 'hduindex' parameter to read a different HDU.")
                     print("Below are the readable HDUs and their corresponding 'hduindex' parameters:")
                     for i in range(len(good_hdu)):
                         print(f"[{i}] {good_hdu[i]}")
+                    print()
             if not isinstance(hduindex, int):
                 hduindex = int(hduindex)
             data = good_hdu[hduindex].data
@@ -179,7 +181,7 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         restfreq = hdu_header["FREQ"]
     else:
         restfreq = np.nan
-        print("WARNING: Failed to read rest frequnecy.")
+        print("WARNING: Failed to read rest frequency. It is set to NaN in the header.")
     
     # stokes axis
     nstokes = hdu_header.get(f"NAXIS{ctype.index('STOKES')+1}", 1) if "STOKES" in ctype else 1
@@ -305,11 +307,11 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
     # determine image type and reshape data
     if nx > 1 and ny > 1 and nchan > 1:
         imagetype = "datacube"
-        newshape = (nstokes, nchan, nx, ny)
+        newshape = (nstokes, nchan, ny, nx)
         data = data.reshape(newshape)
     elif nx > 1 and ny > 1 and nchan == 1:
         imagetype = "spatialmap"
-        newshape = (nstokes, nchan, nx, ny)
+        newshape = (nstokes, nchan, ny, nx)
         data = data.reshape(newshape)
     elif nchan > 1 and nx > 1 and ny == 1:
         imagetype = "pvdiagram"
@@ -339,12 +341,18 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         dx = round(dx, 7)
     if dy is not None:
         dy = round(dy, 7)
+        
+    # error checking / rounding for beam
     if not np.isnan(bmaj):
         bmaj = round(bmaj, 7)
     if not np.isnan(bmin):
         bmin = round(bmin, 7)
     if not np.isnan(bpa):
         bpa = round(bpa, 7)
+    beam = (bmaj, bmin, bpa)
+    if np.all(np.isnan(beam)):
+        print("WARNING: Failed to read beam dimensions. It is set to NaN in the header. " + \
+              "Certain unit conversions may be inaccurate.")
             
     # input information into dictionary as header information of image
     header = {"filepath": fitsfile,
@@ -362,7 +370,7 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
               "refny": refny,
               "refcoord": refcoord,
               "restfreq": restfreq,
-              "beam": (bmaj, bmin, bpa),
+              "beam": beam,
               "specframe": hdu_header.get("RADESYS", "ICRS"),
               "unit": spatialunit,
               "specunit": '' if imagetype == "spatialmap" else _apu_to_headerstr(_to_apu(specunit)),
@@ -678,6 +686,8 @@ def _apu_to_headerstr(unit):
     This is private function that converts an astropy unit object to the string 
     value corresponding to the 'bunit' key in the header.
     """
+    if unit == u.arcmin:  # special case
+        return "arcmin"
     unit_str = _apu_to_str(unit)
     unit_str = unit_str.replace("$", "").replace("\\mathrm", "")[1:-1]
     unit_lst = unit_str.split(r",")
@@ -1260,13 +1270,13 @@ class Datacube:
         # intensity weighted coordinate (unit: km/s) 
         elif moment == 1:
             reshaped_vaxis = vaxis.reshape((1, nv, 1, 1))
-            vv = np.broadcast_to(reshaped_vaxis, (1, nv, self.nx, self.ny))
+            vv = np.broadcast_to(reshaped_vaxis, (1, nv, self.ny, self.nx))
             momdata = np.nansum(data*vv, axis=1) / np.nansum(data, axis=1)
         
         # intensity weighted dispersion of the coordinate (unit: km/s)
         elif moment == 2:
             reshaped_vaxis = vaxis.reshape((1, nv, 1, 1))
-            vv = np.broadcast_to(reshaped_vaxis, (1, nv, self.nx, self.ny))
+            vv = np.broadcast_to(reshaped_vaxis, (1, nv, self.ny, self.nx))
             meanvel = np.nansum(data*vv, axis=1) / np.nansum(data, axis=1)
             momdata = np.sqrt(np.nansum(data*(vv-meanvel)**2, axis=1)/np.nansum(data, axis=1))
             
@@ -1331,7 +1341,7 @@ class Datacube:
                     else:
                         momdata[0, 0, i, j] = vaxis[np.nanargmin(pixdata)]      
         
-        return momdata.reshape((1, 1, self.nx, self.ny))
+        return momdata.reshape((1, 1, self.ny, self.nx))
     
     def immoments(self, moments=[0], vrange=None, chans=None, threshold=None):
         """
@@ -1583,8 +1593,8 @@ class Datacube:
            or ylim != [-self.widestfov, self.widestfov]:
             xmask = (xlim[1]<=self.xaxis) & (self.xaxis<=xlim[0])
             ymask = (ylim[0]<=self.yaxis) & (self.yaxis<=ylim[1])
-            trimmed_data = trimmed_data[:, :, xmask, :]
-            trimmed_data = trimmed_data[:, :, :, ymask]
+            trimmed_data = trimmed_data[:, :, :, xmask]
+            trimmed_data = trimmed_data[:, :, ymask, :]
         imextent = [xlim[0]-0.5*self.dx, xlim[1]+0.5*self.dx, 
                     ylim[0]-0.5*self.dy, ylim[1]+0.5*self.dy]
         
@@ -1608,8 +1618,8 @@ class Datacube:
                or ylim != [-contmap.widestfov, contmap.widestfov]:
                 cxmask = (xlim[1]<=contmap.xaxis) & (contmap.xaxis<=xlim[0])
                 cymask = (ylim[0]<=contmap.yaxis) & (contmap.yaxis<=ylim[1])
-                trimmed_cdata = contmap.data[:, :, cxmask, :]
-                trimmed_cdata = trimmed_cdata[:, :, :, cymask]
+                trimmed_cdata = contmap.data[:, :, cymask, :]
+                trimmed_cdata = trimmed_cdata[:, :, :, cxmask]
             else:
                 trimmed_cdata = contmap.data
             contextent = [xlim[0]-0.5*contmap.dx, xlim[1]+0.5*contmap.dx, 
@@ -1910,14 +1920,14 @@ class Datacube:
         new_header = copy.deepcopy(self.header)
         new_header["dv"] = None
         new_header["nchan"] = 1
-        new_header["shape"] = (1, 1, self.nx, self.ny)
+        new_header["shape"] = (1, 1, self.ny, self.nx)
         new_header["imagetype"] = "spatialmap"
         
         # start extracting and adding maps
         for i in range(chans[0], chans[1]+1, 1):
             new_header["vrange"] = [vaxis[i], vaxis[i]]
             maps.append(Spatialmap(header=copy.deepcopy(new_header), 
-                                   data=self.data[0, i].reshape(1, 1, self.nx, self.ny)))
+                                   data=self.data[0, i].reshape(1, 1, self.ny, self.nx)))
             
         # return maps as list or as inidividual object.
         if len(maps) == 1:
@@ -1964,7 +1974,7 @@ class Datacube:
     
     def pixel_area(self, unit=None):
         """
-        To calculate the beam area of the image.
+        To calculate the pixel area of the image.
         Parameters:
             unit (float): the unit of the pixel area to be returned.
                           Default (None) is to use the same unit as the positional axes.
@@ -2225,7 +2235,7 @@ class Datacube:
         if len(vrange) == 2:
             vmask = (vrange[0] <= self.vaxis) & (self.vaxis <= vrange[1])
             vmask = np.broadcast_to(vmask[:, np.newaxis, np.newaxis], 
-                                    (self.nchan, self.nx, self.ny)) 
+                                    (self.nchan, self.ny, self.nx)) 
             mask = mask | ~vmask
         masked_data = np.where(mask, data[0], np.nan)
         newshape =  (1, masked_data.shape[0],  masked_data.shape[1], masked_data.shape[2])
@@ -2329,19 +2339,19 @@ class Datacube:
         rotated_img = shifted_img.rotate(angle=-pa_prime, ccw=False, inplace=False) if pa_prime != 0 else shifted_img
         
         # trim data
-        ymask = (-length/2 <= self.yaxis) & (self.yaxis <= length/2)
+        xmask = (-length/2 <= self.xaxis) & (self.xaxis <= length/2)
         vmask = (vrange[0] <= self.vaxis) & (self.vaxis <= vrange[1])
-        pv_xaxis = self.yaxis[ymask]
+        pv_xaxis = self.xaxis[xmask]
         pv_vaxis = self.vaxis[vmask]
-        pv_data = rotated_img.data[:, :, :, ymask][:, vmask, :, :]
+        pv_data = rotated_img.data[:, :, :, xmask][:, vmask, :, :]
         if width == 1:
-            xmask = (self.xaxis == np.abs(self.xaxis).min())
-            pv_data = pv_data[:, :, xmask, :]
+            ymask = (self.yaxis == np.abs(self.yaxis).min())
+            pv_data = pv_data[:, :, ymask, :]
         else:
             add_idx = int(width//2)
-            idx = np.where(self.xaxis == np.abs(self.xaxis).min())[0][0]
-            xidx1, xidx2 = idx-add_idx, idx+add_idx+1  # plus 1 to avoid OBOB
-            pv_data = pv_data[:, :, xidx1:xidx2, :]
+            idx = np.where(self.yaxis == np.abs(self.xaxis).min())[0][0]
+            yidx1, yidx2 = idx-add_idx, idx+add_idx+1  # plus 1 to avoid OBOB
+            pv_data = pv_data[:, :, yidx1:yidx2, :]
             pv_data = np.nanmean(pv_data, axis=2)
         pv_data = np.fliplr(pv_data.reshape(pv_vaxis.size, pv_xaxis.size))
         pv_data = pv_data[None, :, :]
@@ -2351,9 +2361,9 @@ class Datacube:
         newheader["shape"] = pv_data.shape
         newheader["imagetype"] = "pvdiagram"
         newheader["vrange"] = [pv_vaxis.min(), pv_vaxis.max()]
-        newheader["dv"] = np.round(pv_vaxis[1] - pv_vaxis[0], 7)
+        newheader["dv"] = np.round(pv_vaxis[1]-pv_vaxis[0], 7)
         newheader["nchan"] = pv_vaxis.size
-        newheader["dx"] = np.round(pv_xaxis[1] - pv_xaxis[0], 7)
+        newheader["dx"] = np.round(pv_xaxis[0]-pv_xaxis[1], 7)
         newheader["nx"] = pv_xaxis.size
         newheader["refnx"] = pv_xaxis.size//2 + 1
         newheader["dy"] = None
@@ -2471,8 +2481,11 @@ class Datacube:
         """
         # get parameters from template if a template is given:
         if template is not None:
-            dx = template.dx  # note: this does not store the same memory address, so no need to copy.
-            dy = template.dy
+            if isinstance(template, (Datacube, Spatialmap)):
+                dx = template.dx  # note: this does not store the same memory address, so no need to copy.
+                dy = template.dy
+            else:
+                raise TypeError("'template' must be a Datacube or Spatialmap instance.")
         
         # calculate dx from imsize if imsize is given:
         if len(imsize) == 2:
@@ -2501,8 +2514,8 @@ class Datacube:
         
         print("Regridding...")
         new_data = np.array([[griddata(np.array([old_xx[mask[i]].ravel(), old_yy[mask[i]].ravel()]).T, 
-                                                 self.data[0, i][mask[i]].ravel(), (new_xx, new_yy), 
-                                                 method=interpolation).reshape((new_nx, new_ny)) \
+                                                 self.data[0, i][mask[i]].ravel(), (new_yy, new_xx), 
+                                                 method=interpolation).reshape((new_ny, new_nx)) \
                                                  for i in range(self.nchan)]])
 
         # update header information
@@ -3234,8 +3247,11 @@ class Spatialmap:
             Spatialmap: The regridded image.
         """
         if template is not None:
-            dx = template.dx
-            dy = template.dy
+            if isinstance(template, (Datacube, Spatialmap)):
+                dx = template.dx  # note: this does not store the same memory address, so no need to copy.
+                dy = template.dy
+            else:
+                raise TypeError("'template' must be a Datacube or Spatialmap instance.")
         
         if len(imsize) == 2:
             dx = -(self.xaxis.max() - self.xaxis.min())/imsize[0]
@@ -3243,7 +3259,7 @@ class Spatialmap:
 
         # If dx or dy is not provided, raise an error
         if dx is None or dy is None:
-            raise ValueError("New grid resolution (dx and dy) must be provided"
+            raise ValueError("New grid resolution (dx and dy) must be provided " + \
                               "either directly, via imsize, or via a template.")
             
         dx = -dx if dx > 0 else dx
@@ -3261,7 +3277,7 @@ class Spatialmap:
         old_xx, old_yy = self.get_xyaxes(grid=True)
         points = np.array([old_xx[~mask].ravel(), old_yy[~mask].ravel()]).T
         values = self.data[0, 0][~mask].ravel()
-        new_data = griddata(points, values, (new_xx, new_yy), method=interpolation)
+        new_data = griddata(points, values, (new_yy, new_xx), method=interpolation)
         new_data = new_data.reshape((1, 1, new_data.shape[0], new_data.shape[1]))
 
         # Update header information
@@ -3364,7 +3380,7 @@ class Spatialmap:
             self.__updateparams()
         
         # create new object with the new header and data
-        convolved_image = Spatialmap(data=newimage.reshape((1, 1, self.nx, self.ny)), header=new_header)
+        convolved_image = Spatialmap(data=newimage.reshape((1, 1, self.ny, self.nx)), header=new_header)
         if preview:
             convolved_image.imview(title="Convolved image", **kwargs)
         
@@ -3447,7 +3463,7 @@ class Spatialmap:
         perr = [x0_err, y0_err, amp_err, xsig_err*sigma2fwhm, ysig_err*sigma2fwhm, np.rad2deg(theta_err)]
         
         # Calculate the fitted model
-        fitted_model = g(xx, yy).reshape(1, 1, self.nx, self.ny)     
+        fitted_model = g(xx, yy).reshape(1, 1, self.ny, self.nx)     
         model_image = Spatialmap(header=self.header, data=fitted_model)
         
         # Print results
@@ -3604,7 +3620,7 @@ class Spatialmap:
     
     def pixel_area(self, unit=None):
         """
-        To calculate the beam area of the image.
+        To calculate the pixel area of the image.
         Parameters:
             unit (float): the unit of the pixel area to be returned.
                           None to use the same unit as the positional axes.
@@ -3791,8 +3807,10 @@ class Spatialmap:
         ydata = ydata[:, :, :, yidx1:yidx2][0, 0, 0]
         
         # plot data
-        xlabel = f"Offset ({self.unit})" if xlabel is None else xlabel
-        ylabel = f"Intensity ({_unit_plt_str(_apu_to_str(_to_apu(self.bunit)))})" if ylabel is None else ylabel
+        if xlabel is None:
+            xlabel = f"Offset ({self.unit})"
+        if ylabel is None:
+            ylabel = f"Intensity ({_unit_plt_str(_apu_to_str(_to_apu(self.bunit)))})"
         ax = plt_1ddata(xdata, ydata, xlabel=xlabel, ylabel=ylabel, **kwargs)
         
         # returning
@@ -4141,8 +4159,6 @@ class Spatialmap:
             if cbarlabelon:
                 if cbarlabel is None:
                     cbarlabel = "(" + _unit_plt_str(_apu_to_str(_to_apu(self.bunit))) + ")"
-                else:
-                    cbarlabel = ""
             
             # determine orientation from color bar location
             if cbarloc.lower() == "right":
@@ -4161,14 +4177,15 @@ class Spatialmap:
                     labels = (f"%.{decimals}f"%label for label in cbarticks)  # generator object
                     labels = [label[:-1] if label.endswith(".") else label for label in labels]
                     cb.set_ticklabels(labels)
-            cb.set_label(cbarlabel, fontsize=fontsize)
+            if cbarlabelon:
+                cb.set_label(cbarlabel, fontsize=fontsize)
             cb.ax.tick_params(labelsize=labelsize, width=cbartick_width, 
                               length=cbartick_length, direction='in')
         
         if contourmap is not None:
             contour_data = contourmap.data[0, 0]
             if smooth is not None:
-                contour_data = gaussian_filter(contour_data, smooth)
+                contour_data = ndimage.gaussian_filter(contour_data, smooth)
             ax.contour(contour_data, extent=contourmap.imextent, 
                        levels=crms*clevels, colors=ccolors, linewidths=clw, origin='lower')
             
@@ -4254,7 +4271,7 @@ class Spatialmap:
         
         xmask = (min(xlim) <= self.xaxis) & (self.xaxis <= max(xlim))
         ymask = (min(ylim) <= self.yaxis) & (self.yaxis <= max(ylim))
-        trimmed_data = self.data[0, 0][xmask, :][:, ymask]
+        trimmed_data = self.data[0, 0][ymask, :][:, xmask]
         return trimmed_data
 
     def __add_scalebar(self, ax, xlim, ylim, distance, size=0.1, barloc=(0.85, 0.15), 
@@ -5354,7 +5371,8 @@ class PVdiagram:
                 
             cbar = fig.colorbar(climage, cax=ax_cb, pad=cbarpad, 
                                 orientation=orientation, ticklocation=cbarloc.lower())
-            cbar.set_label(cbarlabel, fontsize=fontsize)
+            if cbarlabelon:
+                cbar.set_label(cbarlabel, fontsize=fontsize)
             cbar.ax.tick_params(labelsize=labelsize, width=cbartick_width, 
                                 length=cbartick_length, direction="in")
             
@@ -5453,7 +5471,8 @@ class PVdiagram:
         print(f"File saved as '{outname}'.")
 
 
-# +
+# -
+
 class Region:
     """
     A class for handling regions.
@@ -5691,7 +5710,7 @@ class Region:
             self.__readDS9()
         elif "CRTF" in filelst[0]:
             self.filetype = "CRTF"
-            self.shape = filelst[2].split()[0]
+            self.shape = filelst[1].split()[0]
             self.__readCRTF()
         
     def saveregion(self, filetype="DS9"):
@@ -5767,42 +5786,57 @@ class Region:
             raise Exception("Region not supported in this current version.")
 
     def __readCRTF(self):
-        raise Exception("Not implemented yet.")
-#         shape = self.shape
-#         if self.shape == "line":
-#             coord_lst = self.__filelst[1].split()[1:5]
-#             start_ra = coord_lst[0][2:-1]
-#             start_dec = coord_lst[1][:-2]
-#             self.start = start = start_ra + " " + start_dec
-#             start_coord = SkyCoord(start, unit=(u.hourangle, u.deg))
+        shape = self.shape
+        unit = self.unit = "deg"
+        if shape == "line":
+            coord_lst = self.__filelst[1].split()[1:5]
             
-#             end_ra = coord_lst[2][1:-1]
-#             end_dec = coord_lst[3][:-2]
-#             self.end = end = end_ra + " " + end_dec
-#             end_coord = SkyCoord(end, unit=(u.hourangle, u.deg))
+            # start coordinate
+            start_ra = coord_lst[0][2:-1]
+            start_dec = coord_lst[1][:-2]
+            start_dec = start_dec.split(".")
+            start_dec = start_dec[0] + ":" + start_dec[1] + ":" + start_dec[2] + "." + start_dec[3]
+            start_str = start_ra + " " + start_dec
+            start_coord = SkyCoord(start_str, unit=(u.hourangle, u.deg), frame="icrs")
+            self.start = start = start_coord.to_string("hmsdms")
             
-#             center_ra = (end_coord.ra + start_coord.ra)/2
-#             center_dec = (end_coord.dec + start_coord.dec)/2
-#             self.center = center = 
-#             # completed up to this point.
+            # end coordinate
+            end_ra = coord_lst[2][1:-1]
+            end_dec = coord_lst[3][:-2]
+            end_dec = end_dec.split(".")
+            end_dec = end_dec[0] + ":" + end_dec[1] + ":" + end_dec[2] + "." + end_dec[3]
+            end_str = end_ra + " " + end_dec
+            end_coord = SkyCoord(end_str, unit=(u.hourangle, u.deg), frame="icrs")
+            self.end = end = end_coord.to_string("hmsdms")
             
-#             self.length = length = np.sqrt((start[0]-end[0])**2+(start[1]-end[1])**2)
-#             dx, dy = start[0]-end[0], end[1]-start[1]
-#             pa = -np.rad2deg(np.arctan(dx/dy)) if dy != 0 else (90. if dx > 0 else -90.)
-#             self.center = center = (start[0]+end[0])/2, (start[1]+end[1])/2
-#             self.relative = relative = False
-#             self.pa = pa
-#             self.header = {"shape": shape,
-#                            "start": start,
-#                            "end": end,
-#                            "center": center,
-#                            "length": length,
-#                            "pa": pa,
-#                            "unit": unit,
-#                            "relative": relative,}
+            # central coordinate
+            center_ra = (end_coord.ra + start_coord.ra)/2
+            center_dec = (end_coord.dec + start_coord.dec)/2
+            self.center = center = SkyCoord(ra=center_ra, dec=center_dec, frame="icrs").to_string("hmsdms")
+            
+            # position angle 
+            dx = start_coord.ra - end_coord.ra
+            dy = end_coord.dec - start_coord.dec
+            self.length = length = np.sqrt(dx**2+dy**2).to_value(self.unit)
+            pa = -np.arctan(dx/dy).to_value(u.deg) if dy != 0 else (90. if dx>0 else -90.)
+            self.pa = pa
+            
+            self.relative = relative = False
+            self.header = {"shape": shape,
+                           "start": start,
+                           "end": end,
+                           "center": center,
+                           "length": length,
+                           "pa": pa,
+                           "unit": unit,
+                           "relative": relative}
+        elif shape == "ellipse":
+            raise Exception("Not implemented yet.")
+        elif shape == "box":
+            raise Exception("Not implemented yet.")
+        else:
+            raise Exception("Not implemented yet.")
 
-
-# -
 
 def plt_1ddata(xdata=None, ydata=None, xlim=None, ylim=None, mean_center=False, title=None,
                legendon=True, xlabel="", ylabel="", threshold=None, linewidth=0.8,
@@ -6149,39 +6183,22 @@ def search_molecular_line(restfreq, unit="GHz", printinfo=True):
         try:
             # search the web for rotational constants 
             from urllib.request import urlopen
-            url = f"https://splatalogue.online/species_metadata_displayer.php?species_id={species_id}"
+            url = f"https://splatalogue.online/splata-slap/species/{species_id}"
+            display_url = f"https://splatalogue.online/#/species?id={species_id}"
             page = urlopen(url)
             html = page.read().decode("utf-8")
+            metadata = eval(html.replace("null", "None"))[0]['metaData']  # list of dictionaries
         except:
-            print(f"Failed to read webpage: {url} \n")
+            print(f"Failed to read webpage: {display_url} \n")
             print(f"Double check internet connection / installation of 'urllib' module.")
             url = None
             constants = None
         else:
-            lines = np.array(html.split("\n"))
-            a_mask = np.char.find(lines, "<td>A</td><td>") != -1
-            b_mask = np.char.find(lines, "<td>B</td><td>") != -1
-            c_mask = np.char.find(lines, "<td>C</td><td>") != -1
-            if np.all(~(a_mask|b_mask|c_mask)):
-                constants = None
-                print("Failed to find rotational constants. \n")
-            else:
-                # get rotational A constant
-                if np.any(a_mask):
-                    a_const = float("".join(char for char in lines[a_mask][0] if char.isnumeric() or char == "."))
-                else:
-                    a_const = None
-                # get rotational B constant
-                if np.any(b_mask):
-                    b_const = float("".join(char for char in lines[b_mask][0] if char.isnumeric() or char == "."))
-                else:
-                    b_const = None
-                # get rotational C constant
-                if np.any(c_mask):
-                    c_const = float("".join(char for char in lines[c_mask][0] if char.isnumeric() or char == "."))
-                else:
-                    c_const = None
-                constants = (a_const, b_const, c_const)
+            a_const = metadata.get("A")
+            b_const = metadata.get("B")
+            c_const = metadata.get("C")
+            constants = tuple((float(rot_const) if rot_const is not None else None) \
+                              for rot_const in (a_const, b_const, c_const))
                 
     # store data in a list to be returned and convert masked data to NaN
     data = [species, chemical_name, freq, freq_err, qns, CDMS_JPL_intensity, Sijmu_sq,
@@ -6224,7 +6241,7 @@ def search_molecular_line(restfreq, unit="GHz", printinfo=True):
         print(f"Source: {data[14]}")
         print(46*"#")
         if url is not None:
-            print(f"Link to species data: {url} \n")
+            print(f"Link to species data: {display_url} \n")
     
     # return data
     return tuple(data)
@@ -6431,7 +6448,7 @@ def J_v(v, T):
     return Jv.to(u.K)
 
 
-def column_density_linear_optically_thin(image, T_ex, T_bg=2.726, R_i=1, f=1.):
+def column_density_linear_optically_thin(image, T_ex, T_bg=2.726, B0=None, R_i=1, f=1.):
     """
     Public function to calculate the column density of a linear molecule using optically thin assumption.
     Source: https://doi.org/10.48550/arXiv.1501.01703
@@ -6473,13 +6490,17 @@ def column_density_linear_optically_thin(image, T_ex, T_bg=2.726, R_i=1, f=1.):
     v = line_data[2]*u.GHz  # rest frequency
     S_mu2 = line_data[6]*(1e-18**2)*(u.cm**5*u.g/u.s**2)  # S mu^2 * g_i*g_j*g_k [debye2]
     E_u = line_data[11]*u.K  # upper energy level 
-    B0 = line_data[13][1]*u.MHz  # rotational constant
+    if B0 is None:
+        B0 = line_data[13][1]*u.MHz  # rotational constant
+    elif not isinstance(B0, u.Quantity):
+        B0 *= u.MHz
     Q_rot = __Qrot_linear(T=T_ex, B0=B0)  # partition function
         
     # error checking to make sure molecule is linear
-    if line_data[13][0] is not None or line_data[13][2] is not None:
-        raise Exception("The molecule is not linear.")
-        
+    if line_data[13] is not None:
+        if line_data[13][0] is not None or line_data[13][2] is not None:
+            raise Exception("The molecule is not linear.")
+
     # calculate column density
     aa = 3*h/(8*np.pi**3*S_mu2*R_i)
     bb = Q_rot
