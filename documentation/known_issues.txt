@@ -1,4 +1,2 @@
-1. As of February 2024, the .line_info() method can no longer retrieve data about rotational constants from Splatalogue database due to the website update.
-  A warning message will appear as the metadata displayer of Splatalogue cannot be accessed (it is removed from the most recent update)
-2. .imshift() method sets all NaN values to 0 as scipy's ndimage.shift function does not support interpolation of NaN values. 
+1. The .imshift() method sets all NaN values to 0 as scipy's ndimage.shift function does not support interpolation of NaN values. 
   Extracting PV diagrams also results in NaN values being replaced by 0.
