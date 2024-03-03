@@ -1,4 +1,5 @@
 1. The .imshift() method sets all NaN values to 0 as scipy's ndimage.shift function does not support the interpolation of NaN values. 
   Extracting PV diagrams also results in NaN values being replaced by 0.
 2. xaxis, yaxis, and vaxis may be affected by floating point errors (due to use of np.linspace and np.arange). 
-This leads to off-by-one bug when specifying the velocity range of the data cube with the 'vrange' parameter of the .imview() method. Extracting PV diagrams is also affected by floating point errors, leading to offset/velocity range specified sometimes not including the upper/lower bounds.
+This leads to off-by-one bug when specifying the velocity range of the data cube with the 'vrange' parameter of the .imview() method. 
+Extracting PV diagrams is also affected by floating point errors, leading to offset/velocity range specified sometimes not including the upper/lower bounds.
