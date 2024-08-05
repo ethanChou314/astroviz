@@ -68,38 +68,53 @@ Description of module:
                             semimajor=3.5, semiminor=2.1, pa=36)       # another example
 """
 
+
+# utils package (standard tools)
+from utils import (_unnormalize_location, _normalize_location, _change_cell_size, _trim_data, _plt_cmap, 
+                   _prevent_overwriting, _plt_cbar_and_set_aspect_ratio, _find_file, _get_contour_beam_loc,
+                   _true_round_whole, _get_hduheader, _icrs2relative, _customizable_scale,
+                   _relative2icrs, _to_apu, _apu_to_str, _apu_to_headerstr, _best_match_line,
+                   _unit_plt_str, _convert_Bunit, _Qrot_linear, _get_beam_dim_along_pa,
+                   _Qrot_linear_polyatomic, _match_limits, _get_optimal_columns,)
+
 # numerical packages
 import numpy as np
+import pandas as pd
 
 # standard packages
 import copy
 import os
 import sys
-# import string
-# import inspect
 import datetime as dt
+import string
+import inspect
+import warnings
+import itertools
+from typing import *
 
 # scientific packages
 from scipy import ndimage
 from scipy.optimize import curve_fit
-from scipy.interpolate import griddata
+from scipy.stats import linregress
+from scipy import interpolate
 from astropy import units as u, constants as const
 from astropy.units import Unit, def_unit, UnitConversionError
 from astropy.io import fits
+from astropy.wcs import WCS
 from astropy.stats import sigma_clip
 from astropy.coordinates import Angle, SkyCoord
 from astropy.modeling import models, fitting
 from astropy.convolution import Gaussian2DKernel, Box2DKernel, convolve, convolve_fft
 
+# parallel processing
+from concurrent.futures import ProcessPoolExecutor
+
 # data visualization packages
 import matplotlib as mpl
 from matplotlib import cm, rcParams, ticker, patches, colors, pyplot as plt
-from mpl_toolkits.axes_grid1 import make_axes_locatable, ImageGrid
+from mpl_toolkits.axes_grid1 import ImageGrid
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
-# clarify module's public interface
-__all__ = ["importfits", "Datacube", "Spatialmap", "PVdiagram", "Region", "plt_1ddata",
-           "search_molecular_line", "set_font", "exportfits"]
 
 # variables to control all map fonts globally
 _fontfamily = "Times New Roman"
@@ -111,64 +126,83 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
     """
     This function reads the given FITS file directory and returns the corresponding image object.
     Parameters:
-        fitsfile (str): the directory of the fitsfile. 
+        fitsfile (str): the directory of the FITS file. 
         hduindex (int): the index of the HDU in the list of readable HDUs
         spatialunit (str): the unit of the spatial axes
+        specunit (str): the unit of the spectral axis
         quiet (bool): Nothing will be printed to communicate with user. 
                       Useful for iterative processes, as it allows for faster file reading time.
     Returns:
         The image object (Datacube/Spatialmap/PVdiagram)
     ----------
     Additional notes:
-        If given fitsfile directory does not exist, the function will attempt to recursively 
+        - If given fitsfile directory does not exist, the function will attempt to recursively 
         find the file within all subdirectories.
+        - A temporary FITS file will be made from the CASA image format and then deleted 
+          if the specified file is a directory. This would require the 'casatasks' module to 
+          be imported within this function.
     """
-    # function that recursively finds file
-    def find_file(file):  
-        for root, dirs, files in os.walk(os.getcwd()):
-            if file in files:
-                return os.path.join(root, file)
-        return None 
     
-    # try to recursively find file if relative directory does not exist
-    if not os.path.exists(fitsfile):
-        if not quiet:
-            print(f"Given directory '{fitsfile}' does not exist as a relative directory. " + \
-                   "Recursively finding file...")
-        maybe_filename = find_file(fitsfile)
-        if maybe_filename is not None:
-            fitsfile = maybe_filename
+    if isinstance(fitsfile, str):
+        # try to recursively find file if relative directory does not exist
+        if not os.path.exists(fitsfile):
             if not quiet:
-                print(f"Found a matching filename: '{fitsfile}'")
-        else:
-            raise FileNotFoundError(f"Filename '{fitsfile}' does not exist.")
-    
-    # read file
-    hdu_lst = fits.open(fitsfile)
-    if len(hdu_lst) == 1:
-        data = hdu_lst[0].data
-        hdu_header = dict(hdu_lst[0].header)
-    else:
-        good_hdu = [item for item in hdu_lst \
-                    if item.data is not None and item.header is not None \
-                    and not isinstance(item, fits.hdu.table.BinTableHDU)]
-        if len(good_hdu) == 0:
-            raise Exception("Cannot find any readable HDUs.")
-        else:
-            if len(good_hdu) >= 2:
+                print(f"Given directory '{fitsfile}' does not exist as a relative directory. " + \
+                       "Recursively finding file...")
+            maybe_filename = _find_file(fitsfile)
+            if maybe_filename is not None:
+                fitsfile = maybe_filename
                 if not quiet:
-                    print()
-                    print(f"Found {len(good_hdu)} readable HDUs." +  
-                          "Change 'hduindex' parameter to read a different HDU.")
-                    print("Below are the readable HDUs and their corresponding 'hduindex' parameters:")
-                    for i in range(len(good_hdu)):
-                        print(f"[{i}] {good_hdu[i]}")
-                    print()
-            if not isinstance(hduindex, int):
-                hduindex = int(hduindex)
-            data = good_hdu[hduindex].data
-            hdu_header = dict(good_hdu[hduindex].header)
-    
+                    print(f"Found a matching filename: '{fitsfile}'")
+            else:
+                raise FileNotFoundError(f"Filename '{fitsfile}' does not exist.")
+
+        # obtain the HDU list
+        if os.path.isfile(fitsfile):  
+            hdu_lst = fits.open(fitsfile)
+        else:  # read as CASA image if it is a directory
+            import casatasks
+            dt_str = str(dt.datetime.now())
+
+            # convert CASA image format to a temporary FITS file, then read the FITS file.
+            temp_fitsfile = dt_str.replace(" ", "") + ".fits"
+            temp_fitsfile = _prevent_overwriting(temp_fitsfile)
+            casatasks.exportfits(fitsfile, temp_fitsfile, history=False)
+            hdu_lst = fits.open(temp_fitsfile)
+            os.remove(temp_fitsfile)  # remove the temporary FITS file
+        
+        # read HDU list
+        if len(hdu_lst) == 1:
+            data = hdu_lst[0].data
+            hdu_header = dict(hdu_lst[0].header)
+        else:
+            good_hdu = [item for item in hdu_lst \
+                        if item.data is not None and item.header is not None \
+                        and not isinstance(item, fits.hdu.table.BinTableHDU)]
+            if len(good_hdu) == 0:
+                raise Exception("Cannot find any readable HDUs.")
+            else:
+                if len(good_hdu) >= 2:
+                    if not quiet:
+                        print()
+                        print(f"Found {len(good_hdu)} readable HDUs." +  
+                              "Change 'hduindex' parameter to read a different HDU.")
+                        print("Below are the readable HDUs and their corresponding 'hduindex' parameters:")
+                        for i in range(len(good_hdu)):
+                            print(f"[{i}] {good_hdu[i]}")
+                        print()
+                if not isinstance(hduindex, int):
+                    hduindex = int(hduindex)
+                data = good_hdu[hduindex].data
+                hdu_header = dict(good_hdu[hduindex].header)
+    elif isinstance(fitsfile, (fits.hdu.image.PrimaryHDU, fits.PrimaryHDU)):
+        hdu_lst = [fitsfile]
+        data = fitsfile.data 
+        hdu_header = fitsfile.header
+        fitsfile = ''  # still make it represent a directory (empty string denotes not imported from anywhere)
+    else:
+        raise ValueError("'fitsfile' must be a absolute/relative directory or a 'PrimaryHDU' instance.")
+
     # store ctypes as list, 1-based indexing
     ctype = [hdu_header.get(f"CTYPE{i}", "") for i in range(1, data.ndim+1)] 
     
@@ -181,7 +215,7 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         restfreq = hdu_header["FREQ"]
     else:
         restfreq = np.nan
-        print("WARNING: Failed to read rest frequency. It is set to NaN in the header.")
+        warnings.warn("Failed to read rest frequency. It is set to NaN in the header.")
     
     # stokes axis
     nstokes = hdu_header.get(f"NAXIS{ctype.index('STOKES')+1}", 1) if "STOKES" in ctype else 1
@@ -272,7 +306,7 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         refx = None
         dx = None
         refnx = None
-        print("WARNING: Failed to read right ascension / offset axis information.")
+        warnings.warn("Failed to read right ascension / offset axis information.")
     
     # declination axis
     dec_mask = ["DEC" in item for item in ctype]
@@ -308,11 +342,13 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
     if nx > 1 and ny > 1 and nchan > 1:
         imagetype = "datacube"
         newshape = (nstokes, nchan, ny, nx)
-        data = data.reshape(newshape)
+        if data.shape != newshape:
+            data = data.reshape(newshape)
     elif nx > 1 and ny > 1 and nchan == 1:
         imagetype = "spatialmap"
         newshape = (nstokes, nchan, ny, nx)
-        data = data.reshape(newshape)
+        if data.shape != newshape:
+            data = data.reshape(newshape)
     elif nchan > 1 and nx > 1 and ny == 1:
         imagetype = "pvdiagram"
         newshape = (nstokes, nchan, nx)
@@ -321,37 +357,85 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
                 data = data[0].T[None, :, :]  # transpose if necessary
             else:
                 data = data.reshape(newshape)
-                print("WARNING: Data of PV diagram will be reshaped.")
+                warnings.warn("Data of PV diagram will be reshaped.")
     else:
         raise Exception("Image cannot be read as 'datacube', 'spatialmap', or 'pvdiagram'.")
     
-    # beam size
-    bmaj = hdu_header.get("BMAJ", np.nan) # deg
-    bmin = hdu_header.get("BMIN", np.nan) # deg
-    bpa =  hdu_header.get("BPA", np.nan)  # deg
+    # get beam size
+    if all(keyword in hdu_header for keyword in ("BMAJ", "BMIN", "BPA")):
+        bmaj = hdu_header["BMAJ"] * u.deg  # assume unit is degrees
+        bmin = hdu_header["BMIN"] * u.deg  # assume unit is degrees
+        bpa =  hdu_header["BPA"]  # assume unit is degrees
+
+    elif len(hdu_lst) > 1 and isinstance(hdu_lst[1], fits.hdu.table.BinTableHDU):
+        # sometimes the primary beam info is stored as second file in hdu list:
+        beam_info: fits.hdu.table.BinTableHDU = hdu_lst[1]
+        names: List[str] = beam_info.columns.names
+        beam_data: fits.fitsrec.FITS_rec = beam_info.data
+
+        # make beam header in correct format (only keep 'hashable keys' when reversed):
+        beam_header = dict((key, value) for key, value in dict(beam_info.header).items() \
+                            if isinstance(value, str))
+        
+        # swap keys and values in the dictionary (to find index of information needed):
+        beam_header_swapped = dict(zip(beam_header.values(), beam_header.keys())) 
+        
+        # major axis
+        if "BMAJ" in names:
+            bmaj_idx = beam_header_swapped["BMAJ"][-1]  # index (1-based) in header
+            bmaj_median = np.median(beam_data["BMAJ"])  # use median value
+            bmaj_unit = beam_header["TUNIT"+bmaj_idx]  # find unit in header
+            bmaj = u.Quantity(bmaj_median, bmaj_unit)
+        else:
+            bmaj = np.nan
+
+        # minor axis
+        if "BMIN" in names:
+            bmin_idx = beam_header_swapped["BMIN"][-1]  # index (1-based) in header
+            bmin_median = np.median(beam_data["BMIN"])  # use median value 
+            bmin_unit = beam_header["TUNIT"+bmin_idx]  # find unit in header
+            bmin = u.Quantity(bmin_median, bmin_unit)
+        else:
+            bmin = np.nan
+
+        # position angle
+        if "BPA" in names:
+            bpa_idx = beam_header_swapped["BPA"][-1]
+            bpa_median = np.median(beam_data["BPA"])
+            bpa_unit = beam_header["TUNIT"+bpa_idx]
+            bpa = u.Quantity(bpa_median, bpa_unit).to_value(u.deg)  # convert directly to degrees
+        else:
+            bpa = np.nan
+
+    else:
+        # assign NaN values if information cannot be located:
+        bmaj = np.nan 
+        bmin = np.nan 
+        bpa = np.nan
     
-    if spatialunit not in ("deg", "degrees", "degree"):  # convert beam size unit if necessary
+    if spatialunit in ("deg", "degrees", "degree"):  # convert beam size unit if necessary
         if not np.isnan(bmaj):
-            bmaj = u.Quantity(bmaj, u.deg).to_value(spatialunit)
+            bmaj = bmaj.value
         if not np.isnan(bmin):
-            bmin = u.Quantity(bmin, u.deg).to_value(spatialunit)
+            bmin = bmin.value
+    else:
+        if not np.isnan(bmaj):
+            bmaj = bmaj.to_value(spatialunit)
+        if not np.isnan(bmin):
+            bmin = bmin.to_value(spatialunit)
     
     # eliminate rounding error due to float64
     if dx is not None:
-        dx = round(dx, 7)
+        dx = np.round(dx, 7)
     if dy is not None:
-        dy = round(dy, 7)
+        dy = np.round(dy, 7)
         
-    # error checking / rounding for beam
-    if not np.isnan(bmaj):
-        bmaj = round(bmaj, 7)
-    if not np.isnan(bmin):
-        bmin = round(bmin, 7)
-    if not np.isnan(bpa):
-        bpa = round(bpa, 7)
+    # store beam as a tuple
     beam = (bmaj, bmin, bpa)
-    if np.all(np.isnan(beam)):
-        print("WARNING: Failed to read beam dimensions. It is set to NaN in the header. " + \
+
+    # raise warning if one of the beam dimensions cannot be read.
+    if np.any(np.isnan(beam)):
+        warnings.warn("Failed to read all beam dimensions. It is set to NaN in the header. " + \
               "Certain unit conversions may be inaccurate.")
             
     # input information into dictionary as header information of image
@@ -391,401 +475,6 @@ def importfits(fitsfile, hduindex=0, spatialunit="arcsec", specunit="km/s", quie
         return Spatialmap(header=header, data=data)
     elif imagetype == "pvdiagram":
         return PVdiagram(header=header, data=data)
-
-
-def _get_hduheader(image):
-    """
-    This is a private function that reads metadata from the header of the original fits file 
-    and modifies it to reflect the current status of the given image.
-    Parameters:
-        image (Datacube/Spatialmap/PVdiagram): the input image from which the header will be extracted
-    Returns:
-        header (astropy.io.fits.header.Header): the extracted header information.
-    """
-    # get fitsfile from name 
-    if image.header["filepath"]:
-        fitsfile = fits.open(image.header["filepath"])[0]
-        hdu_header = copy.deepcopy(fitsfile.header)
-    else:
-        hdu_header = fits.Header()  # create empty header if file path cannot be located
-    
-    # get info from current image object
-    dx = u.Quantity(image.dx, image.unit).to_value(u.deg)
-    if image.header["dy"] is not None:
-        dy = u.Quantity(image.dy, image.unit).to_value(u.deg)
-    if image.refcoord is not None:
-        center = _icrs2relative(image.refcoord, unit="deg")
-        centerx, centery = center[0].value, center[1].value
-    else:
-        centerx, centery = None, None
-    projection = image.header["projection"]
-    dtnow = str(dt.datetime.now()).replace(" ", "T")
-    
-    # start reading header information
-    if image.header["imagetype"] == "pvdiagram":
-        faxis = image.get_vaxis(specunit='Hz')
-        if hdu_header["NAXIS"] == 4:
-            hdu_header["NAXIS"] = 3
-            hdu_header.pop("NAXIS4", None)  # adding 'None' as a parameter prevents key error
-            hdu_header.pop("CTYPE4", None)
-            hdu_header.pop("CRVAL4", None)
-            hdu_header.pop("CDELT4", None)
-            hdu_header.pop("CRPIX4", None)
-            hdu_header.pop("CUNIT4", None)
-            hdu_header.pop("PC4_1", None)
-            hdu_header.pop("PC4_2", None)
-            hdu_header.pop("PC4_3", None)
-            hdu_header.pop("PC4_4", None)
-        hdu_header["NAXIS1"] = image.nx
-        hdu_header["NAXIS2"] = image.nchan
-        hdu_header["NAXIS3"] = 1
-        hdu_header["CTYPE1"] = "OFFSET"
-        hdu_header["CRVAL1"] = np.float64(0.)
-        hdu_header["CDELT1"] = np.float64(image.dx)
-        hdu_header["CRPIX1"] = np.float64(image.refnx)
-        hdu_header["CUNIT1"] = image.unit
-        hdu_header["CTYPE2"] = 'FREQ'
-        startf = faxis[0]
-        if not ("CRVAL2" in hdu_header and np.isclose(startf, hdu_header["CRVAL2"])):
-            hdu_header["CRVAL2"] = startf
-        df = faxis[1] - faxis[0]
-        if not ("CDELT2" in hdu_header and np.isclose(df, hdu_header["CDELT2"])):
-            hdu_header["CDELT2"] = df
-        hdu_header["CRPIX2"] = np.float64(1.)
-        hdu_header["CUNIT2"] = 'Hz'
-        hdu_header["ALTRVAL"] = np.float64(image.vaxis[0])  # Alternative frequency referencenpoint
-        hdu_header["ALTRPIX"] = np.float64(1.)              # Alternative frequnecy reference pixel
-        hdu_header["CTYPE3"] = 'STOKES'
-        hdu_header["CRVAL3"] = np.float64(1.)
-        hdu_header["CDELT3"] = np.float64(1.)
-        hdu_header["CRPIX3"] = np.float64(1.)
-        hdu_header["CDELT3"] = ''
-
-    elif image.header["imagetype"] in ("spatialmap", "datacube"):
-        hdu_header["NAXIS"] = 4
-        hdu_header["NAXIS1"] = image.shape[2]
-        hdu_header["NAXIS2"] = image.shape[3]
-        hdu_header["NAXIS3"] = image.shape[1]
-        hdu_header["NAXIS4"] = image.shape[0]
-        hdu_header["CTYPE1"] = f'RA---{projection}'
-        hdu_header["CRVAL1"] = np.float64(centerx)
-        hdu_header["CDELT1"] = np.float64(dx)
-        hdu_header["CRPIX1"] = np.float64(image.refnx)
-        hdu_header["CUNIT1"] = 'deg'
-        hdu_header["CTYPE2"] = f'DEC--{projection}'
-        hdu_header["CRVAL2"] = np.float64(centery)
-        hdu_header["CDELT2"] = np.float64(dy)
-        hdu_header["CRPIX2"] = np.float64(image.refny)
-        hdu_header["CUNIT2"] = 'deg'
-        if image.header["imagetype"] == "datacube":
-            faxis = image.get_vaxis(specunit="Hz")
-            hdu_header["CTYPE3"] = 'FREQ'
-            startf = faxis[0]
-            if not ("CRVAL3" in hdu_header and np.isclose(startf, hdu_header["CRVAL3"])):
-                hdu_header["CRVAL3"] = startf
-            df = faxis[1] - faxis[0]
-            if not ("CDELT3" in hdu_header and np.isclose(df, hdu_header["CDELT3"])):
-                hdu_header["CDELT3"] = df
-            hdu_header["CRPIX3"] = np.float64(1.)
-            hdu_header["CUNIT3"] = 'Hz'
-            hdu_header["ALTRVAL"] = np.float64(image.vaxis[0])  # Alternative frequency reference point
-            hdu_header["ALTRPIX"] = np.float64(1.)              # Alternative frequnecy reference pixel
-        hdu_header["CTYPE4"] = 'STOKES'
-        hdu_header["CRVAL4"] = np.float64(1.)
-        hdu_header["CDELT4"] = np.float64(1.)
-        hdu_header["CRPIX4"] = np.float64(1.)
-        hdu_header["CUNIT4"] = ''
-
-    # other information    
-    if np.isnan(image.bmaj) or np.isnan(image.bmin) or np.isnan(image.bpa):
-        updatedparams = {"BUNIT": image.header["bunit"],
-                         "DATE": dtnow,
-                         "DATAMAX": np.float64(np.nanmax(image.data)),
-                         "DATAMIN": np.float64(np.nanmin(image.data)),
-                         "BSCALE": np.float64(1.),
-                         "BZERO": np.float64(1.),
-                         "OBJECT": image.header["object"],
-                         "INSTRUME": image.header["instrument"],
-                         "DATE-OBS": image.header["obsdate"],
-                         "RESTFRQ": image.header["restfreq"],
-                         "HISTORY": "Exported from astroviz."
-                         }
-    else:
-        bmaj = np.float64(u.Quantity(image.bmaj, image.unit).to_value(u.deg))   # this value can be NaN
-        bmin = np.float64(u.Quantity(image.bmin, image.unit).to_value(u.deg))
-        bpa = np.float64(image.bpa)
-        updatedparams = {"BUNIT": image.header["bunit"],
-                         "DATE": dtnow,
-                         "BMAJ": bmaj,
-                         "BMIN": bmin,
-                         "BPA": bpa, 
-                         "DATAMAX": np.float64(np.nanmax(image.data)),
-                         "DATAMIN": np.float64(np.nanmin(image.data)),
-                         "OBJECT": image.header["object"],
-                         "BSCALE": np.float64(1.),
-                         "BZERO": np.float64(1.),
-                         "INSTRUME": image.header["instrument"],
-                         "DATE-OBS": image.header["obsdate"],
-                         "RESTFRQ": image.header["restfreq"],
-                         "HISTORY": "Exported from astroviz."
-                         }
-    
-    # don't write history if already in FITS file header
-    if "HISTORY" in hdu_header and hdu_header["HISTORY"] == "Exported from astroviz.":
-        updatedparams.pop("HISTORY")
-    
-    # start updating other header info
-    for key, value in updatedparams.items():
-        hdu_header[key] = value
-        
-    # return header
-    return hdu_header
-
-
-def _icrs2relative(coord, ref=None, unit="arcsec"):
-    """
-    This is a private function to convert the absolute coordinates to relative coordinates.
-    Parameters:
-        coord (tuple/str): either the J2000 coordinates as string in hmsdms format 
-                           or the absolute coordinates converted to an angular unit as tuple
-        ref (tuple/str): the reference coordinate. Same properties as 'coord.'
-        unit (str): the unit of the relative coordinate that will be returned.
-    Returns:
-        (ra, dec): the right ascension and declination of the converted relative coordinates
-                   as tuple.
-    """
-    if isinstance(coord, str):
-        skycoord = SkyCoord(coord, unit=(u.hourangle, u.deg), frame="icrs")
-    elif len(coord) == 2 and isinstance(coord[0], str) and isinstance(coord[1], str):
-        skycoord = SkyCoord(coord[0], coord[1], unit=(u.hourangle, u.deg), frame="icrs")
-    
-    if ref is not None:
-        if isinstance(ref, str):
-            skycoord_ref = SkyCoord(ref, unit=(u.hourangle, u.deg), frame="icrs")
-        elif len(ref) == 2 and isinstance(ref[0], str) and isinstance(ref[1], str):
-            skycoord_ref = SkyCoord(ref[0], ref[1], unit=(u.hourangle, u.deg), frame="icrs")
-        relative_ra = u.Quantity(skycoord.ra - skycoord_ref.ra, unit)
-        relative_dec = u.Quantity(skycoord.dec - skycoord_ref.dec, unit)
-        return (relative_ra, relative_dec)
-    else:
-        ra = u.Quantity(skycoord.ra, unit)
-        dec = u.Quantity(skycoord.dec, unit)
-        return (ra, dec)
-
-
-def _relative2icrs(coord, ref=None, unit="arcsec"):
-    """
-    This is a private function to convert the relative coordinates to aboslute coordinates.
-    Parameters:
-        coord (tuple): the absolute coordinates converted to an angular unit as tuple
-        ref (tuple/str): the reference coordinate. Same properties as 'coord,' but could be 
-                         the J2000 coordinates as string in hmsdms format 
-        unit (str): the unit of the relative coordinate that will be returned.
-    Returns:
-        str: in hmsdms format, the absolute coordinate.
-    """
-    if isinstance(coord, tuple):
-        coord = list(coord)
-    if ref is not None:
-        if isinstance(ref, str):
-            skycoord_ref = SkyCoord(ref, unit=(u.hourangle, u.deg), frame="icrs")
-        elif len(ref) == 2 and isinstance(ref[0], str) and isinstance(ref[1], str):
-            skycoord_ref = SkyCoord(ref[0], ref[1], unit=(u.hourangle, u.deg), frame="icrs")
-        ref_ra = skycoord_ref.ra
-        ref_dec = skycoord_ref.dec
-    else:
-        ref_ra = 0*u.arcsec
-        ref_dec = 0*u.arcsec
-    coord[0] = u.Quantity(coord[0], unit)
-    coord[1] = u.Quantity(coord[1], unit)
-    return SkyCoord(coord[0]+ref_ra, coord[1]+ref_dec, frame="icrs").to_string("hmsdms")
-
-
-def _to_apu(unit_string):
-    """
-    This is private function that fixes a 'bug': astropy's incorrect reading of string units.
-    For instance, strings like "Jy/beam.km/s" would be read as u.Jy/u.beam*u.km/u.s 
-    by this function.
-    """
-    # if it is already a unit, return itself.
-    if isinstance(unit_string, u.Unit):
-        return unit_string
-    elif isinstance(unit_string, u.Quantity):
-        return unit_string.unit
-    elif isinstance(unit_string, (u.core.CompositeUnit, u.core.PrefixUnit)):
-        return unit_string
-    
-    # Split the unit string by '.' and '/'
-    units_split = unit_string.replace('.', ' * ').replace('/', ' / ').split()
-
-    # Initialize the unit
-    result_unit = 1 * u.Unit(units_split[0])
-
-    # Apply multiplication or division for the remaining units
-    for i in range(1, len(units_split)):
-        if units_split[i] in ['*', '/']:
-            continue
-        if units_split[i - 1] == '*':
-            result_unit *= u.Unit(units_split[i])
-        elif units_split[i - 1] == '/':
-            result_unit /= u.Unit(units_split[i])
-
-    return result_unit.unit
-
-
-def _apu_to_str(unit):
-    """
-    This is private function that fixes a 'bug': astropy's incorrect conversion of units to strings.
-    For instance, units like u.Jy/u.beam*u.km/u.s would be read as in the correct order in 
-    the latex format by this function.
-    """
-    if unit.is_equivalent(u.Jy/u.beam*u.km/u.s) or \
-       unit.is_equivalent(u.Jy/u.rad**2*u.km/u.s) or \
-       unit.is_equivalent(u.Jy/u.pixel*u.km/u.s):
-        unitstr = unit.to_string(format='latex_inline')
-        unitlst = list(unitstr)
-        idx_left = unitlst.index("{")
-        units_lst = unitstr[idx_left+1:-2].split(",")
-        newlst = units_lst[:]     # copy the list
-        for i, ele in enumerate(units_lst):
-            cleanunitstr = ele.replace("\\", "").replace("{", "").replace("}", "")
-            if u.Unit(cleanunitstr).is_equivalent(u.Jy):
-                newlst[0] = ele
-            elif u.Unit(cleanunitstr).is_equivalent(1/u.beam) or \
-                 u.Unit(cleanunitstr).is_equivalent(1/u.rad**2) or \
-                 u.Unit(cleanunitstr).is_equivalent(1/u.pixel):
-                newlst[1] = ele
-            elif u.Unit(cleanunitstr).is_equivalent(u.km):
-                newlst[2] = ele
-            elif u.Unit(cleanunitstr).is_equivalent(1/u.s):
-                newlst[3] = ele
-        newstr = r"$\mathrm{" + ",".join(newlst) + r"}$"
-        return newstr
-    elif unit.is_equivalent(u.K*u.km/u.s):
-        unitstr = unit.to_string(format='latex_inline')
-        unitlst = list(unitstr)
-        idx_left = unitlst.index("{")
-        units_lst = unitstr[idx_left+1:-2].split(",")
-        newlst = units_lst[:]     # copy the list
-        for i, ele in enumerate(units_lst):
-            cleanunitstr = ele.replace("\\", "").replace("{", "").replace("}", "")
-            if u.Unit(cleanunitstr).is_equivalent(u.K):
-                newlst[0] = ele
-            elif u.Unit(cleanunitstr).is_equivalent(u.km):
-                newlst[1] = ele
-            elif u.Unit(cleanunitstr).is_equivalent(1/u.s):
-                newlst[2] = ele
-        newstr = r"$\mathrm{" + ",".join(newlst) + r"}$"
-        return newstr
-    else:
-        return f"{unit:latex_inline}"
-
-
-def _apu_to_headerstr(unit):
-    """
-    This is private function that converts an astropy unit object to the string 
-    value corresponding to the 'bunit' key in the header.
-    """
-    if unit == u.arcmin:  # special case
-        return "arcmin"
-    unit_str = _apu_to_str(unit)
-    unit_str = unit_str.replace("$", "").replace("\\mathrm", "")[1:-1]
-    unit_lst = unit_str.split(r",")
-    unit_lst = (item[:-1] if item[-1] == "\\" else item for item in unit_lst)  # create generator
-    headerstr = ""
-    for i, item in enumerate(unit_lst):
-        if "^{" in item:
-            ustr, power = item.split("^{")
-            power = power[:-1]
-        else:
-            ustr = item
-            power = 1
-        if float(power) == -1:
-            headerstr += "/" + ustr
-        elif float(power) < -1:
-            if int(float(power)) == float(power):
-                headerstr += "/" + ustr + str(-int(power))
-            else:
-                headerstr += "/" + ustr + str(-float(power))
-        elif float(power) > 1:
-            if i == 0:
-                if int(float(power)) == float(power):
-                    headerstr += ustr + str(int(power))
-                else:
-                    headerstr += ustr + str(float(power))
-            else:
-                if int(float(power)) == float(power):
-                    headerstr += "." + ustr + str(int(power))
-                else:
-                    headerstr += "." + ustr + str(float(power))
-        else:
-            if i == 0:
-                headerstr += ustr
-            else:
-                headerstr += "." + ustr
-    if headerstr.startswith("/"):
-        headerstr = "1" + headerstr
-    # deal with special case (having solar mass/luminosity as unit)
-    headerstr = headerstr.replace("_{\\odot}", "sun")
-    return headerstr
-
-
-def _unit_plt_str(mathstr):
-    """
-    Private function that converts latex inline string to string for plotting 
-    (fixes font issue).
-    """
-    mathstr = mathstr.replace("math", "")
-    math_lst = mathstr[5:-2].split(r"\,")
-    for i, unit in enumerate(math_lst[:]):
-        math_lst[i] = unit.replace("^{", "$^{").replace("}", "}$")
-    mathstr = " ".join(math_lst)
-    mathstr = mathstr.replace(r"_{\odot}$", r"$_{\odot}$")
-    return mathstr
-
-
-def _convert_Bunit(quantity, newunit, equivalencies, factors, max_depth=10):
-    """
-    Private function to convert brightness units.
-    Used by the 'conv_bunit' method.
-    """
-    # helper function to recursively utilize equivalencies
-    def recursive_equiv(qt, eq, i):
-        if i >= len(eq):  # base case
-            return None
-        try:
-            return qt.to(newunit, equivalencies=eq[i])
-        except UnitConversionError:
-            return recursive_equiv(qt, eq, i+1)
-    
-    # helper function to recursively multiply/divide factors
-    def recursive_factors(qt, f, i):
-        if i >= len(factors)*2:  # base case
-            return None
-        try:
-            if i % 2 == 0:
-                return (qt / f[i//2]).to(newunit)
-            else:
-                return (qt * f[i//2]).to(newunit)
-        except UnitConversionError:
-            return recursive_factors(qt, f, i+1)
-        
-    try:
-        # try direct conversion
-        newqt = quantity.to(newunit)
-    except UnitConversionError:
-        # if that doesn't work, maybe try using equivalencies?
-        newqt = recursive_equiv(quantity, equivalencies, i=0)
-        j = 1
-        new_factors = factors
-        while newqt is None:
-            # if that still doesn't work, maybe try multiplying/dividing by factors?
-            newqt = recursive_factors(quantity, new_factors, i=0)
-            j += 1
-            new_factors = [factor**j for factor in factors]
-            if j >= max_depth:  # maximum depth
-                break
-    return newqt
 
 
 def set_font(font):
@@ -828,8 +517,8 @@ def set_font(font):
         print("Unsupported font. Please manually enter the 'font.family', 'mathtext.fontset', " + \
               "and 'mathtext.tt' attributes of matplotlib.")
         _fontfamily = input("font.family: ")
-        _fontfamily = input("mathtext.fontset: ")
-        _fontfamily = input("mathtext.tt: ")
+        _mathtext_fontset = input("mathtext.fontset: ")
+        _mathtext_tt = input("mathtext.tt: ")
 
 
 class Datacube:
@@ -917,9 +606,9 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return Datacube(header=self.header, data=self.data+other.data)
         return Datacube(header=self.header, data=self.data+other)
     
@@ -927,9 +616,9 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return Datacube(header=self.header, data=other.data+self.data)
         return Datacube(header=self.header, data=other+self.data)
         
@@ -937,9 +626,9 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return Datacube(header=self.header, data=self.data-other.data)
         return Datacube(header=self.header, data=self.data-other)
     
@@ -947,9 +636,9 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return Datacube(header=self.header, data=other.data-self.data)
         return Datacube(header=self.header, data=other-self.data)
         
@@ -957,7 +646,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data*other.data)
         return Datacube(header=self.header, data=self.data*other)
     
@@ -965,7 +654,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=other.data*self.data)
         return Datacube(header=self.header, data=other*self.data)
     
@@ -973,7 +662,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data**other.data)
         return Datacube(header=self.header, data=self.data**other)
         
@@ -981,7 +670,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=other.data**self.data)
         return Datacube(header=self.header, data=other**self.data)
         
@@ -989,7 +678,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data/other.data)
         return Datacube(header=self.header, data=self.data/other)
     
@@ -997,7 +686,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=other.data/self.data)
         return Datacube(header=self.header, data=other/self.data)
         
@@ -1005,7 +694,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data//other.data)
         return Datacube(header=self.header, data=self.data//other)
     
@@ -1013,7 +702,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=other.data//self.data)
         return Datacube(header=self.header, data=other//self.data)
     
@@ -1021,7 +710,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data%other.data)
         return Datacube(header=self.header, data=self.data%other)
     
@@ -1029,7 +718,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=other.data%self.data)
         return Datacube(header=self.header, data=other%self.data)
     
@@ -1037,7 +726,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data<other.data)
         return Datacube(header=self.header, data=self.data<other)
     
@@ -1045,7 +734,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data<=other.data)
         return Datacube(header=self.header, data=self.data<=other)
     
@@ -1053,7 +742,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data==other.data)
         return Datacube(header=self.header, data=self.data==other)
         
@@ -1061,7 +750,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data!=other.data)
         return Datacube(header=self.header, data=self.data!=other)
 
@@ -1069,7 +758,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data>other.data)
         return Datacube(header=self.header, data=self.data>other)
         
@@ -1077,7 +766,7 @@ class Datacube:
         if isinstance(other, Datacube):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Datacube(header=self.header, data=self.data>=other.data)
         return Datacube(header=self.header, data=self.data>=other)
 
@@ -1098,7 +787,7 @@ class Datacube:
             try:
                 return Datacube(header=self.header, data=self.data[indices])
             except:
-                print("WARNING: Returning value after reshaping image data to 2 dimensions.")
+                warnings.warn("Returning value after reshaping image data to 2 dimensions.")
                 return self.data.copy[:, indices[0], indices[1]]
         except:
             return self.data[indices]
@@ -1133,6 +822,82 @@ class Datacube:
         
     def __array__(self, *args, **kwargs):
         return np.array(self.data, *args, **kwargs)
+
+    def min(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the minimum value of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's min function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's min function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the minimum.
+
+        Returns:
+            scalar or array: Minimum value of the data array. If the data array is multi-dimensional, 
+                             returns an array of minimum values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nanmin(self.data, *args, **kwargs)
+        return np.min(self.data, *args, **kwargs)
+
+    def max(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the maximum value of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's max function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's max function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the maximum.
+
+        Returns:
+            scalar or array: Maximum value of the data array. If the data array is multi-dimensional, 
+                             returns an array of maximum values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nanmax(self.data, *args, **kwargs)
+        return np.max(self.data, *args, **kwargs)
+
+    def mean(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the mean value of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's mean function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's mean function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the mean.
+
+        Returns:
+            scalar or array: Mean value of the data array. If the data array is multi-dimensional, 
+                             returns an array of mean values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nanmean(self.data, *args, **kwargs)
+        return np.mean(self.data, *args, **kwargs)
+
+    def sum(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the sum of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's sum function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's sum function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the sum.
+
+        Returns:
+            scalar or array: Sum of the data array. If the data array is multi-dimensional, 
+                             returns an array of sum values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nansum(self.data, *args, **kwargs)
+        return np.sum(self.data, *args, **kwargs)
     
     def to(self, unit, *args, **kwargs):
         """
@@ -1193,6 +958,8 @@ class Datacube:
         """
         vaxis = np.linspace(self.vrange[0], self.vrange[1], self.nchan)
         if specunit is None:
+            if self.specunit == "km/s":
+                vaxis = np.round(vaxis, 7)
             return vaxis
         try:
             # attempt direct conversion
@@ -1207,7 +974,7 @@ class Datacube:
             return vaxis
         return vaxis
     
-    def conv_specunit(self, specunit, inplace=False):
+    def conv_specunit(self, specunit, inplace=True):
         """
         Convert the spectral axis into the desired unit.
         """
@@ -1247,103 +1014,9 @@ class Datacube:
             self.data = newdata
             return self
         return Datacube(header=self.header, data=newdata.reshape(self.shape))
-   
-    def __get_momentdata(self, moment, data=None, vaxis=None):
-        """
-        Private method to get the data array of the specified moment map.
-        Used for the public methods 'immoments' and 'peakshift' (moment 8 used).
-        """
-        # intialize parameters
-        vaxis = self.vaxis if vaxis is None else vaxis
-        data = self.data if data is None else data
-        nv = vaxis.size
-        dv = vaxis[1] - vaxis[0]            
-
-        # mean value of spectrum (unit: intensity)
-        if moment == -1:
-            momdata = np.nanmean(data, axis=1)
-        
-        # integrated value of the spectrum (unit: intensity*km/s)
-        elif moment == 0:
-            momdata = np.nansum(data, axis=1)*dv
-        
-        # intensity weighted coordinate (unit: km/s) 
-        elif moment == 1:
-            reshaped_vaxis = vaxis.reshape((1, nv, 1, 1))
-            vv = np.broadcast_to(reshaped_vaxis, (1, nv, self.ny, self.nx))
-            momdata = np.nansum(data*vv, axis=1) / np.nansum(data, axis=1)
-        
-        # intensity weighted dispersion of the coordinate (unit: km/s)
-        elif moment == 2:
-            reshaped_vaxis = vaxis.reshape((1, nv, 1, 1))
-            vv = np.broadcast_to(reshaped_vaxis, (1, nv, self.ny, self.nx))
-            meanvel = np.nansum(data*vv, axis=1) / np.nansum(data, axis=1)
-            momdata = np.sqrt(np.nansum(data*(vv-meanvel)**2, axis=1)/np.nansum(data, axis=1))
-            
-        # median value of the spectrum (unit: intensity)
-        elif moment == 3:
-            momdata = np.nanmedian(data, axis=1)
-        
-        # median coordinate (unit: km/s)
-        elif moment == 4:
-            momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
-            for i in range(momdata.shape[2]):
-                for j in range(momdata.shape[3]):
-                    pixdata = data[0, :, i, j]  # shape: (nv,)
-                    if np.all(np.isnan(pixdata)):
-                        momdata[0, 0, i, j] = np.nan
-                    else:
-                        sorted_data = np.sort(pixdata)
-                        sorted_data = sorted_data[~np.isnan(sorted_data)] # remove nan so that median is accurate
-                        median_at_pix = sorted_data[sorted_data.size//2]  # this is approximation of median, not always exact
-                        vidx = np.where(pixdata == median_at_pix)[0][0]   # get index of coordinate of median
-                        momdata[0, 0, i, j] = vaxis[vidx]
-        
-        # standard deviation about the mean of the spectrum (unit: intensity)
-        elif moment == 5:
-            momdata = np.nanstd(data, axis=1)
-        
-        # root mean square of the spectrum (unit: intensity)
-        elif moment == 6:
-            momdata = np.sqrt(np.nanmean(data**2, axis=1))
-        
-        # absolute mean deviation of the spectrum (unit: intensity)
-        elif moment == 7:
-            momdata = np.nanmean(np.abs(data-np.nanmean(data, axis=1)), axis=1)
-            
-        # maximum value of the spectrum (unit: intensity)
-        elif moment == 8:
-            momdata = np.nanmax(data, axis=1)
-            
-        # coordinate of the maximum value of the spectrum (unit: km/s)
-        elif moment == 9:
-            momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
-            for i in range(momdata.shape[2]):
-                for j in range(momdata.shape[3]):
-                    pixdata = data[0, :, i, j]  # intensity values of data cube at this pixel
-                    if np.all(np.isnan(pixdata)):
-                        momdata[0, 0, i, j] = np.nan  # assign nan if all nan at that pixel
-                    else:
-                        momdata[0, 0, i, j] = vaxis[np.nanargmax(pixdata)]
-            
-        # minimum value of the spectrum (unit: intensity)
-        elif moment == 10:
-            momdata = np.nanmin(data, axis=1)
-        
-        # coordinate of the minimum value of the spectrum (unit: km/s) 
-        elif moment == 11:
-            momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
-            for i in range(momdata.shape[2]):
-                for j in range(momdata.shape[3]):
-                    pixdata = data[0, :, i, j]  # intensity values of data cube at this pixel
-                    if np.all(np.isnan(pixdata)):
-                        momdata[0, 0, i, j] = np.nan  # assign nan if all nan at that pixel
-                    else:
-                        momdata[0, 0, i, j] = vaxis[np.nanargmin(pixdata)]      
-        
-        return momdata.reshape((1, 1, self.ny, self.nx))
     
-    def immoments(self, moments=[0], vrange=None, chans=None, threshold=None):
+    def immoments(self, moments=[0], vrange=None, chans=None, threshold=None, 
+                  vsys=None, keep_nan=True):
         """
         Parameters:
             moments (list[int]): a list of moment maps to be outputted
@@ -1352,6 +1025,8 @@ class Datacube:
             chans (list[float]): a list of [minimum channel, maximum channel] using 1-based indexing.
                                  Default is to use all channels.
             threshold (float): a threshold to be applied to data cube. Default is not to use a threshold.
+            vsys (float): the systemic velocity of reference for 'vrange' (signifying velocity offset.)
+                          Default is to assume vsys = 0. 
         Returns:
             A list of moment maps (Spatialmap objects).
         -------
@@ -1376,6 +1051,13 @@ class Datacube:
             vrange = []
         if chans is None:
             chans = []
+            
+        vrange = np.array(vrange).flatten()
+        # subtract systemic velocity if needed
+        if vrange.size != 0:
+            if vsys:
+                vrange += vsys
+        chans = np.array(chans).flatten()
         
         # check if moments exceed 11. 
         if isinstance(moments, (int, float)):
@@ -1391,56 +1073,50 @@ class Datacube:
                 raise ValueError("Moments < -1 are not defined.")
         
         # apply threshold
-        if threshold is not None:
-            data = np.where(self.data<threshold, np.nan, self.data)
+        if threshold is None:
+            data = self.data
         else:
-            data = self.data.copy()
+            data = np.where(self.data<threshold, np.nan, self.data)
         
         # get nx and ny 
         nx, ny = self.nx, self.ny
         
-        # truncate channels
-        if len(chans) == 2 or len(chans) == 4:
-            indicies = np.array(chans)-1
-            vrange = self.vaxis[indicies]
-        if len(vrange) == 2:
-            vmask = (vrange[0]<=self.vaxis)&(self.vaxis<=vrange[1])
-            vaxis = self.vaxis[vmask]
-            clean_data = data[:, vmask, :, :]
-        elif len(vrange) == 4:
-            vmask1 = (vrange[0]<=self.vaxis)&(self.vaxis<=vrange[1])
-            vmask2 = (vrange[2]<=self.vaxis)&(self.vaxis<=vrange[3])
-            vmask = vmask1 | vmask2
-            vaxis = self.vaxis[vmask]
-            clean_data = data[:, vmask, :, :]
-        else:
-            clean_data = data
-            vaxis = self.vaxis
-        
-        # start adding output maps to a list
-        maps = []
-        for moment in moments:
-            momdata = self.__get_momentdata(moment=moment, data=clean_data, vaxis=vaxis)
-            if moment in (-1, 3, 5, 6, 7, 8, 10):
-                bunit = self.bunit
-            elif moment == 0:
-                bunit = f"{self.bunit}.{self.specunit}"
-            else:
-                bunit = self.specunit
-            # update header information
-            newheader = copy.deepcopy(self.header)
-            newheader["imagetype"] = "spatialmap"
-            newheader["shape"] = momdata.shape
-            newheader["vrange"] = None
-            newheader["nchan"] = 1
-            newheader["dv"] = None
-            newheader["bunit"] = bunit
-            maps.append(Spatialmap(header=newheader, data=momdata))
+        # if 'chans' is given instead of 'vrange', convert it to 'vrange':
+        if chans.size > 0 and chans.size % 2 == 0:
+            indicies = np.array(chans)-1  # 1-based indexing -> 0-based indexing
+            vrange = self.vaxis[indicies] 
+            
+        # start truncating channels
+        vaxis = self.vaxis
+        if vrange.size == 2:
+            # prevent floating point errors:
+            min_vel = vrange[0] - 0.1*self.dv
+            max_vel = vrange[1] + 0.1*self.dv
+            # create mask:
+            vmask = (min_vel<=vaxis)&(vaxis<=max_vel)
+            vaxis = vaxis[vmask]
+            data = data[:, vmask, :, :]
+        elif vrange.size > 2 and vrange.size % 2 == 0:  # even number of vranges
+            vmask = np.full(self.vaxis.shape, False)
+            for (v1, v2) in np.vstack((vrange[::2], vrange[1::2])).T:
+                # prevent floating point errors:
+                v1 -= 0.1*self.dv
+                v2 += 0.1*self.dv
+                # 'concatenate' mask:
+                vmask = vmask | ((v1<=vaxis)&(vaxis<=v2))
+            vaxis = vaxis[vmask]
+            data = data[:, vmask, :, :]
+
+        # parallel processing
+        num_moments = len(moments)
+        moment_maps = [_get_moment_map(moment, data, vaxis, self.ny, self.nx,
+                                       keep_nan, self.bunit, self.specunit, 
+                                       self.header) for moment in moments]
             
         # return output
-        return maps[0] if len(maps) == 1 else maps
+        return moment_maps[0] if len(moment_maps) == 1 else moment_maps
         
-    def sum_over_chans(self, vrange=None, chans=None, threshold=None):
+    def sum_over_chans(self, vrange=None, chans=None, threshold=None, vsys=None):
         """
         Method to sum over all channels at each pixel.
         Parameters:
@@ -1449,24 +1125,30 @@ class Datacube:
             chans (list[float]): a list of [minimum channel, maximum channel] using 1-based indexing.
                                  Default is to use all channels.
             threshold (float): a threshold to be applied to data cube. Default is not to use a threshold.
+            vsys (float): the systemic velocity of reference for 'vrange' (signifying velocity offset.)
+                          Default is to assume vsys = 0. 
         Returns:
             sum_img (Spatialmap): a map with pixels being the sum of the entire spectrum 
         """
-        sum_img = self.immoments(moments=0, vrange=vrange, chans=chans, threshold=threshold) / self.dv
-        sum_img = (sum_img * _to_apu(self.bunit)).value
+        # prevent floating point errors:
+        sum_img = self.immoments(moments=0, vrange=vrange, chans=chans, 
+                                 threshold=threshold, vsys=vsys) / self.dv
+        sum_img = (sum_img * _to_apu(self.bunit)).value  # change unit back to unit of this image.
         return sum_img
     
-    def imview(self, contourmap=None, title=None, fov=None, ncol=5, nrow=None, cmap="inferno",
-               figsize=(11.69, 8.27), center=None, vrange=None, nskip=1, vskip=None, 
-               tickscale=None, tickcolor="w", txtcolor='w', crosson=True, crosslw=0.5, 
+    def imview(self, contourmap=None, title=None, fov=None, ncol=None, nrow=None, 
+               cmap="inferno", figsize=(11.69, 8.27), center=None, vrange=None, chans=None, nskip=1, 
+               vskip=None, tickscale=None, tickcolor="w", txtcolor='w', crosson=True, crosslw=0.5, 
                crosscolor="w", crosssize=0.3, dpi=400, vmin=None, vmax=None, xlim=None,
                ylim=None, xlabel=None, ylabel=None, xlabelon=True, ylabelon=True, crms=None, 
-               clevels=np.arange(3, 21, 3), ccolor="w", clw=0.5, vsys=None, fontsize=12, 
+               clevels=np.arange(3, 21, 3), ccolors="w", clw=0.5, vsys=None, fontsize=12, 
                decimals=2, vlabelon=True, cbarloc="right", cbarwidth="3%", cbarpad=0., 
-               cbarlabel=None, cbarlabelon=True, addbeam=True, beamcolor="skyblue", 
+               cbarlabel=None, cbarticks=None, cbartick_width=None, cbartick_length=3.,
+               cbartick_direction="in", cbarlabelon=True, beamon=True, beamcolor="skyblue", 
                beamloc=(0.1225, 0.1225), nancolor="k", labelcolor="k", axiscolor="w", axeslw=0.8, 
                labelsize=10, tickwidth=1., ticksize=3., tickdirection="in", vlabelsize=12, 
-               vlabelunit=False, cbaron=True, title_fontsize=14, grid=None, plot=True):
+               vlabelunit=False, cbaron=True, title_fontsize=14, scale="linear", gamma=1.5, 
+               percentile=None, grid=None, savefig=None, plot=True):
         """
         To plot the data cube's channel maps.
         Parameters:
@@ -1499,7 +1181,7 @@ class Datacube:
             crms (float): The rms noise level of the contour map regarded as the base contour level.
                           The default is an estimation of the contour map noise level using sigma clipping.
             clevels (ndarray): the relative contour levels (the values multiplied by crms).
-            ccolor (str): the color of the contour image.
+            ccolors (str): the color of the contour image.
             clw (float): the contour line width.
             vsys (float): the systemic velocity. The vaxis will be subtracted by this value.
             fontsize (float): the size of the font.
@@ -1524,51 +1206,76 @@ class Datacube:
             vlabelsize (float): the fontsize of the velocity labels.
             vlabelunit (bool): True to add units in the velocity labels.
             cbaron (bool): True to add a color bar to the image.
+            savefig (dict): list of keyword arguments to be passed to 'plt.savefig'.
             plot (bool): True to execute 'plt.show()'
             
         Returns:
             The image grid with the channel maps.
         """
         # initialize parameters:
+        if cbarticks is None:
+            cbarticks = []
+
         if vsys is None:
             vsys = 0.
+
         if fov is None:
             fov = self.widestfov
+
         if fov < 0:
             fov = -fov
+
         if center is None:
             center = [0., 0.]
+
         if xlim is None:
             xlim = [center[0]+fov, center[0]-fov]
         else:
             if xlim[0] < xlim[1]:
                 xlim[0], xlim[1] = xlim[1], xlim[0]
             center[0] = (xlim[0]+xlim[1])/2
+
         if ylim is None:
             ylim = [center[1]-fov, center[1]+fov]
         else:
             if ylim[1] < ylim[0]:
                 ylim[0], ylim[1] = ylim[1], ylim[0]
             center[1] = (ylim[0]+ylim[1])/2
+
         if tickscale is not None:
             ticklist = np.arange(0, fov, tickscale) 
             ticklist = np.append(-ticklist, ticklist)
+
         if xlabel is None:
             xlabel = f"Relative RA ({self.unit})"
+
         if ylabel is None:
             ylabel = f"Relative Dec ({self.unit})"
+
         if not isinstance(clevels, np.ndarray):
             clevels = np.array(clevels)
+
         if cbarlabel is None:
             cbarlabel = "(" + _unit_plt_str(_apu_to_str(_to_apu(self.bunit))) + ")"
+
         vaxis = self.vaxis - vsys
+
+        if chans is not None:
+            chans = np.array(chans).flatten() - 1  # 1-based indexing -> 0-based indexing
+            vrange = vaxis[chans]
+
         if vrange is None:
             vrange = [vaxis.min(), vaxis.max()]
+            
+        # this prevents floating point error
         velmin, velmax = vrange
+        velmin -= 0.1*self.dv
+        velmax += 0.1*self.dv
+        
         if vskip is None:
             vskip = self.dv*nskip
         else:
-            nskip = int(vskip/self.dv)
+            nskip = int(_true_round_whole(vskip/self.dv))
         cmap = copy.deepcopy(mpl.colormaps[cmap]) 
         cmap.set_bad(color=nancolor) 
         if crms is None and contourmap is not None:
@@ -1587,6 +1294,9 @@ class Datacube:
         vmask = (velmin <= vaxis) & (vaxis <= velmax)
         trimmed_data = self.data[:, vmask, :, :][:, ::nskip, :, :]
         trimmed_vaxis = vaxis[vmask][::nskip]
+
+        if percentile is not None:
+            vmin, vmax = clip_percentile(data=trimmed_data, area=percentile)
             
         # trim data along xyaxes for plotting:
         if xlim != [self.widestfov, -self.widestfov] \
@@ -1601,9 +1311,9 @@ class Datacube:
         # modify contour map to fit the same channels:
         if contourmap is not None:
             if isinstance(contourmap.data, u.Quantity):
-                contmap = contourmap.copy()
-            else:
                 contmap = contourmap.value.copy()
+            else:
+                contmap = contourmap.copy()
             
             # make the image conditions the same if necessary:
             if contmap.refcoord != self.refcoord:  # same reference coordinates
@@ -1627,7 +1337,10 @@ class Datacube:
         
         # figure out the number of images per row/column to plot:
         nchan = trimmed_vaxis.size
-        if nrow is None and ncol is not None:
+        if ncol is None and nrow is None:
+            ncol = _get_optimal_columns(nchan)
+            nrow = int(np.ceil(nchan/ncol))
+        elif nrow is None and ncol is not None:
             nrow = int(np.ceil(nchan/ncol))
         elif nrow is not None and ncol is None:
             ncol = int(np.ceil(nchan/nrow))
@@ -1667,20 +1380,37 @@ class Datacube:
         # start plotting:
         if contourmap is not None and not contmap_isdatacube:
             thiscdata = trimmed_cdata[0, 0]
+            
+        # assign vmin and vmax -> important to ensure log/gamma scale works properly!
+        if vmin is None: 
+            vmin = np.nanmin(trimmed_data)
+        if vmax is None:
+            vmax = np.nanmax(trimmed_data)
+            
+        is_logscale: bool = (scale.lower() in ("log", "logarithm", "logscale"))
+            
         for i in range(nrow*ncol):
             ax = grid[i] # the axes object of this channel
             if i < nchan:
                 thisvel = trimmed_vaxis[i]         # the velocity of this channel
                 thisdata = trimmed_data[0, i]      # 2d data in this channel
 
-                # color image
-                imcolor = ax.imshow(thisdata, cmap=cmap, origin='lower', 
-                                    extent=imextent, rasterized=True)
+                # plot color map using helper function
+                ax, imcolor = _plt_cmap(image_obj=self, 
+                                        ax=ax, 
+                                        two_dim_data=thisdata, 
+                                        imextent=imextent, 
+                                        cmap=cmap, 
+                                        vmin=vmin, 
+                                        vmax=vmax, 
+                                        scale=scale, 
+                                        gamma=gamma)
+                
                 # contour image
                 if contourmap is not None:
                     if contmap_isdatacube:
                         thiscdata = trimmed_cdata[:, (cvaxis == thisvel), :, :][0, 0]  # the contour data of this channel
-                    imcontour = ax.contour(thiscdata, colors=ccolor, origin='lower', 
+                    imcontour = ax.contour(thiscdata, colors=ccolors, origin='lower', 
                                            extent=contextent, levels=crms*clevels, linewidths=clw)
                 
                 # set ticks
@@ -1725,7 +1455,7 @@ class Datacube:
             ax.set_ylim(ylim)
                 
         # axis labels
-        if xlabelon or ylabelon or addbeam:
+        if xlabelon or ylabelon or beamon:
             bottomleft_ax = grid[(nrow-1)*ncol]
         if xlabelon:
             bottomleft_ax.set_xlabel(xlabel)
@@ -1735,22 +1465,42 @@ class Datacube:
             bottomleft_ax.yaxis.label.set_color(labelcolor)
         
         # add beam
-        if addbeam:
-            bottomleft_ax = self.__addbeam(bottomleft_ax, xlim=xlim, ylim=ylim,
+        if beamon:
+            bottomleft_ax = self._addbeam(bottomleft_ax, xlim=xlim, ylim=ylim, filled=True,
                                            beamcolor=beamcolor, beamloc=beamloc)
 
         # colorbar 
         if cbaron:
-            cax  = grid.cbar_axes[0]
+            cax = grid.cbar_axes[0]
             cbar = plt.colorbar(imcolor, cax=cax)
             cax.toggle_label(True)
-            cbar.ax.yaxis.set_tick_params(color=tickcolor)
             cbar.ax.spines["bottom"].set_color(axiscolor)  
             cbar.ax.spines["top"].set_color(axiscolor)
             cbar.ax.spines["left"].set_color(axiscolor)
             cbar.ax.spines["right"].set_color(axiscolor)
             if cbarlabelon:
                 cbar.ax.set_ylabel(cbarlabel, color=labelcolor)
+            
+            # change color bar ticks:
+            if len(cbarticks) != 0:
+                cbar.set_ticks(cbarticks)
+            elif is_logscale:
+                cbarticks = np.linspace(vmin, vmax, 7)[1:-1]
+                cbar.set_ticks(cbarticks)
+                
+            # change tick labels if logscale:
+            if is_logscale:
+                labels = (f"%.{decimals}f"%label for label in cbarticks)  # generator object
+                labels = [label[:-1] if label.endswith(".") else label for label in labels]
+                cbar.set_ticklabels(labels)
+            
+            # tick parameters
+            cbar.ax.tick_params(labelsize=labelsize, width=cbartick_width, 
+                                length=cbartick_length, direction=cbartick_direction, 
+                                color=tickcolor)
+            
+            # disable minor ticks
+            cbar.ax.minorticks_off()
         
         # these parameters are for looping if annotations are to be added in other methods
         self.__pltnax = nrow*ncol
@@ -1765,72 +1515,122 @@ class Datacube:
                 middle_ax = grid[ncol//2]
                 middle_ax.set_title(title, fontsize=title_fontsize)
         
+        # save figure if parameters were specified
+        if savefig:
+            plt.savefig(**savefig)
+        
         # show image
         if plot:
             plt.show()
+            
         return grid
     
-    def __addbeam(self, ax, xlim, ylim, beamcolor, beamloc=(0.1225, 0.1225)):
+    def _addbeam(self, ax, xlim, ylim, beamcolor, filled=True, beamloc=(0.1225, 0.1225)):
         """
         This method adds an ellipse representing the beam size to the specified ax.
         """
-        # get axes limits
-        xrange = xlim[1] - xlim[0]
-        yrange = ylim[1] - ylim[0]
-        
         # coordinate of ellipse center 
-        centerx = xlim[0] + beamloc[0]*xrange
-        centery = ylim[0] + beamloc[1]*yrange
-        coords = (centerx, centery)
-        
-        # beam size
-        bmaj, bmin = self.bmaj, self.bmin
+        coords = _unnormalize_location(beamloc, xlim, ylim)
+
+        if np.any(np.isnan(self.beam)):
+            warnings.warn("Beam cannot be plotted as it is not available in the header.")
+            return ax
+
+        # beam dimensions
+        bmaj, bmin, bpa = self.beam
         
         # add patch to ax
-        beam = patches.Ellipse(xy=coords, width=bmin, height=bmaj, fc=beamcolor,
-                               angle=-self.bpa, alpha=1, zorder=10)
+        if filled:
+            beam = patches.Ellipse(xy=coords, width=bmin, height=bmaj, fc=beamcolor,
+                                   ec=beamcolor, angle=-bpa, alpha=1, zorder=10)
+        else:
+            beam = patches.Ellipse(xy=coords, width=bmin, height=bmaj, fc='None',
+                                    ec=beamcolor, linestyle="solid", 
+                                    angle=-bpa, alpha=1, zorder=10)
         ax.add_patch(beam)
         return ax
         
-    def trim(self, vrange, nskip=1, vskip=None, inplace=False):
+    def trim(self, template=None, xlim=None, ylim=None, vlim=None, vsys=None, 
+             nskip=None, vskip=None, inplace=False):
         """
-        This method trims the data cube along the velocity axis.
+        Trim the image data based on specified x and y axis limits.
+
         Parameters:
-            vrange (iterable): the [minimum velocity, maximum velocity], inclusively.
-            nskip (int): the number of channel increments
-            vskip (float): the velocity increment between channels in km/s. An alternative to 'nskip' parameter.
-            inplace (True): True to modify the data cube in-place. False to return a new data cube.
+        template (Spatialmap/Channelmap): The xlim and ylim will be assigned as the the min/max values 
+                                          of the axes of this image.
+        xlim (iterable of length 2, optional): The limits for the x-axis to trim the data.
+                                               If None, no trimming is performed on the x-axis.
+        ylim (iterable of length 2, optional): The limits for the y-axis to trim the data.
+                                               If None, no trimming is performed on the y-axis.
+        inplace (bool, optional): If True, the trimming is performed in place and the original 
+                                  object is modified. If False, a copy of the object is trimmed 
+                                  and returned. Default is False.
+
         Returns:
-            The trimmed data cube.
+        image: The trimmed image object. If `inplace` is True, the original object is returned 
+               after modification. If `inplace` is False, a new object with the trimmed data is returned.
+
+        Raises:
+        ValueError: If any of `xlim` or `ylim` are provided and are not iterables of length 2.
+
+        Notes:
+        The method uses the `_trim_data` function to perform the actual data trimming. The reference 
+        coordinates are updated based on the new trimmed axes.
         """
-        # get values
-        velmin, velmax = vrange
-        vaxis = self.vaxis
+        if template is not None:
+            xlim = template.xaxis.min(), template.xaxis.max()
+            ylim = template.yaxis.min(), template.yaxis.max()
+
+        image = self if inplace else self.copy()
+
+        new_data, new_vaxis, new_yaxis, new_xaxis = _trim_data(self.data, 
+                                                               yaxis=self.yaxis,
+                                                               xaxis=self.xaxis,
+                                                               vaxis=self.vaxis,
+                                                               dy=self.dy,
+                                                               dx=self.dx,
+                                                               dv=self.dv,
+                                                               ylim=ylim,
+                                                               xlim=xlim,
+                                                               vlim=vlim,
+                                                               nskip=nskip,
+                                                               vskip=vskip,
+                                                               vsys=vsys)
+
+        # get new parameters:
+        new_shape = new_data.shape
+        new_nx = new_xaxis.size 
+        new_ny = new_yaxis.size 
+        new_nchan = new_vaxis.size
+        new_vrange = [new_vaxis.min(), new_vaxis.max()]
+        new_refnx = new_nx//2 + 1
+        new_refny = new_ny//2 + 1
+        new_dv = new_vaxis[1] - new_vaxis[0]
+
+        # calculate new reference coordinate:
+        org_ref_skycoord = SkyCoord(self.refcoord)
+        org_refcoord_x = org_ref_skycoord.ra
+        org_refcoord_y = org_ref_skycoord.dec
+
+        start_x = org_refcoord_x + u.Quantity(new_xaxis.min(), self.unit)
+        end_x = org_refcoord_x + u.Quantity(new_xaxis.max(), self.unit)
+        new_x = (start_x+end_x+self.dx*u.Unit(self.unit))/2
+
+        start_y = org_refcoord_y + u.Quantity(new_yaxis.min(), self.unit)
+        end_y = org_refcoord_y + u.Quantity(new_yaxis.max(), self.unit)
+        new_y = (start_y+end_y+self.dy*u.Unit(self.unit))/2
+
+        new_refcoord = SkyCoord(ra=new_x, dec=new_y).to_string("hmsdms")
+
+        # update object:
+        image.data = new_data
+        image.overwrite_header(shape=new_shape, nx=new_nx, ny=new_ny, 
+                               refnx=new_refnx, refny=new_refny, 
+                               refcoord=new_refcoord, nchan=new_nchan,
+                               vrange=new_vrange, dv=new_dv)
+        return image
         
-        # convert vskip to nskip, if necessary
-        if vskip is not None:
-            nskip = int(vskip/self.dv)
-        
-        # create mask and trim data
-        vmask = (velmin <= vaxis) & (vaxis <= velmax)
-        trimmed_data = self.data[:, vmask, :, :][:, ::nskip, :, :]
-        trimmed_vaxis = vaxis[vmask][::nskip]
-        
-        # update header information
-        newheader = copy.deepcopy(self.header)
-        newheader["dv"] = nskip*self.dv
-        newheader["vrange"] = [trimmed_vaxis.min(), trimmed_vaxis.max()]
-        newheader["nchan"] = int(np.round((velmax-velmin)/self.dv + 1))
-        
-        # return trimmed image or modify image in-place
-        if inplace:
-            self.data = trimmed_data
-            self.header = newheader
-            self.__updateparams()
-            return self
-        return Datacube(header=newheader, data=trimmed_data)
-        
-    def conv_bunit(self, bunit, inplace=False):
+    def conv_bunit(self, bunit, inplace=True):
         """
         This method converts the brightness unit of the image into the desired unit.
         Parameters:
@@ -1934,7 +1734,7 @@ class Datacube:
             return maps[0]
         return maps
     
-    def set_threshold(self, threshold=None, minimum=True, inplace=False):
+    def set_threshold(self, threshold=None, minimum=True, inplace=True):
         """
         To mask the intensities above or below this threshold.
         Parameters:
@@ -1988,7 +1788,7 @@ class Datacube:
             area = area.to_value(unit)
         return area
     
-    def conv_unit(self, unit, distance=None, inplace=False):
+    def conv_unit(self, unit, distance=None, inplace=True):
         """
         This method converts the axis unit of the image into the desired unit.
         Parameters:
@@ -2132,58 +1932,112 @@ class Datacube:
             The channel map with the annotated region.
         """
         grid = self.imview(plot=False, **kwargs)
-        region = self.__readregion(region)
-        if region.shape == "circle":
-            xsmooth = np.linspace(region.center[0]-region.radius, region.center[0]+region.radius, 1000)
-            inside_circle = (np.square(xsmooth-region.center[0]) <= region.radius**2)
-            ysmooth = np.sqrt(region.radius**2-np.square(xsmooth[inside_circle]-region.center[0]))
-            
-            # Plot the upper and lower semicircles
-            for i in range(self.__pltnchan):
-                ax = grid[i]
-                ax.plot(xsmooth[inside_circle], region.center[1]+ysmooth, color=color, lw=lw, linestyle=ls)
-                ax.plot(xsmooth[inside_circle], region.center[1]-ysmooth, color=color, lw=lw, linestyle=ls)
-        elif region.shape == "ellipse":
-            theta = np.linspace(0, 2*np.pi, 1000)
-            angle = np.deg2rad(-region.pa-270)
 
-            # Ellipse equation before rotation
-            x_ellipse = region.center[0]+region.semimajor*np.cos(theta)
-            y_ellipse = region.center[1]+region.semiminor*np.sin(theta)
+        if isinstance(region, Region):
+            region = self.__readregion(region)
+            if region.shape == "circle":
+                xsmooth = np.linspace(region.center[0]-region.radius, region.center[0]+region.radius, 1000)
+                inside_circle = (np.square(xsmooth-region.center[0]) <= region.radius**2)
+                ysmooth = np.sqrt(region.radius**2-np.square(xsmooth[inside_circle]-region.center[0]))
+                
+                # Plot the upper and lower semicircles
+                for i in range(self.__pltnchan):
+                    ax = grid[i]
+                    ax.plot(xsmooth[inside_circle], region.center[1]+ysmooth, color=color, lw=lw, linestyle=ls)
+                    ax.plot(xsmooth[inside_circle], region.center[1]-ysmooth, color=color, lw=lw, linestyle=ls)
+            elif region.shape == "ellipse":
+                theta = np.linspace(0, 2*np.pi, 1000)
+                angle = np.deg2rad(-region.pa-270)
 
-            # Applying rotation for position angle
-            x_rotated = region.center[0]+(x_ellipse-region.center[0])*np.cos(angle)-(y_ellipse-region.center[1])*np.sin(angle)
-            y_rotated = region.center[1]+(x_ellipse-region.center[0])*np.sin(angle)+(y_ellipse-region.center[1])*np.cos(angle)
-            
-            # Plot the ellipse
-            for i in range(self.__pltnchan):
-                grid[i].plot(x_rotated, y_rotated, color=color, lw=lw, linestyle=ls)
-        elif region.shape == "line":
-            # Plot line
-            for i in range(self.__pltnchan):
-                grid[i].plot([region.start[0], region.end[0]], [region.start[1], region.end[1]], 
-                             color=color, lw=lw, linestyle=ls)
-        elif region.shape == "box":
-            # make patch
-            pa = region.pa
-            pa_rad = np.deg2rad(pa)
-            center = region.center
-            width, height = region.width, region.height
-            dx, dy = -width/2, -height/2
-            x = center[0] + (dx*np.cos(pa_rad) + dy*np.sin(pa_rad))
-            y = center[1] - (dx*np.sin(pa_rad) - dy*np.cos(pa_rad))
-            
-            # add patch on all plots
-            for i in range(self.__pltnchan):
-                rect_patch = patches.Rectangle((x, y), width, height, angle=-region.pa,
-                                           linewidth=lw, linestyle=ls, edgecolor=color, 
-                                           facecolor='none')
-                grid[i].add_patch(rect_patch)
+                # Ellipse equation before rotation
+                x_ellipse = region.center[0]+region.semimajor*np.cos(theta)
+                y_ellipse = region.center[1]+region.semiminor*np.sin(theta)
+
+                # Applying rotation for position angle
+                x_rotated = region.center[0]+(x_ellipse-region.center[0])*np.cos(angle)-(y_ellipse-region.center[1])*np.sin(angle)
+                y_rotated = region.center[1]+(x_ellipse-region.center[0])*np.sin(angle)+(y_ellipse-region.center[1])*np.cos(angle)
+                
+                # Plot the ellipse
+                for i in range(self.__pltnchan):
+                    grid[i].plot(x_rotated, y_rotated, color=color, lw=lw, linestyle=ls)
+            elif region.shape == "line":
+                # Plot line
+                for i in range(self.__pltnchan):
+                    grid[i].plot([region.start[0], region.end[0]], [region.start[1], region.end[1]], 
+                                 color=color, lw=lw, linestyle=ls)
+            elif region.shape == "box":
+                # make patch
+                pa = region.pa
+                pa_rad = np.deg2rad(pa)
+                center = region.center
+                width, height = region.width, region.height
+                dx, dy = -width/2, -height/2
+                x = center[0] + (dx*np.cos(pa_rad) + dy*np.sin(pa_rad))
+                y = center[1] - (dx*np.sin(pa_rad) - dy*np.cos(pa_rad))
+                
+                # add patch on all plots
+                for i in range(self.__pltnchan):
+                    rect_patch = patches.Rectangle((x, y), width, height, angle=-region.pa,
+                                               linewidth=lw, linestyle=ls, edgecolor=color, 
+                                               facecolor='none')
+                    grid[i].add_patch(rect_patch)
+        elif hasattr(region, "__iter__"):
+            region_list = region 
+            for region in region_list:
+                region = self.__readregion(region)
+                if region.shape == "circle":
+                    xsmooth = np.linspace(region.center[0]-region.radius, region.center[0]+region.radius, 1000)
+                    inside_circle = (np.square(xsmooth-region.center[0]) <= region.radius**2)
+                    ysmooth = np.sqrt(region.radius**2-np.square(xsmooth[inside_circle]-region.center[0]))
+                    
+                    # Plot the upper and lower semicircles
+                    for i in range(self.__pltnchan):
+                        ax = grid[i]
+                        ax.plot(xsmooth[inside_circle], region.center[1]+ysmooth, color=color, lw=lw, linestyle=ls)
+                        ax.plot(xsmooth[inside_circle], region.center[1]-ysmooth, color=color, lw=lw, linestyle=ls)
+                elif region.shape == "ellipse":
+                    theta = np.linspace(0, 2*np.pi, 1000)
+                    angle = np.deg2rad(-region.pa-270)
+
+                    # Ellipse equation before rotation
+                    x_ellipse = region.center[0]+region.semimajor*np.cos(theta)
+                    y_ellipse = region.center[1]+region.semiminor*np.sin(theta)
+
+                    # Applying rotation for position angle
+                    x_rotated = region.center[0]+(x_ellipse-region.center[0])*np.cos(angle)-(y_ellipse-region.center[1])*np.sin(angle)
+                    y_rotated = region.center[1]+(x_ellipse-region.center[0])*np.sin(angle)+(y_ellipse-region.center[1])*np.cos(angle)
+                    
+                    # Plot the ellipse
+                    for i in range(self.__pltnchan):
+                        grid[i].plot(x_rotated, y_rotated, color=color, lw=lw, linestyle=ls)
+                elif region.shape == "line":
+                    # Plot line
+                    for i in range(self.__pltnchan):
+                        grid[i].plot([region.start[0], region.end[0]], [region.start[1], region.end[1]], 
+                                     color=color, lw=lw, linestyle=ls)
+                elif region.shape == "box":
+                    # make patch
+                    pa = region.pa
+                    pa_rad = np.deg2rad(pa)
+                    center = region.center
+                    width, height = region.width, region.height
+                    dx, dy = -width/2, -height/2
+                    x = center[0] + (dx*np.cos(pa_rad) + dy*np.sin(pa_rad))
+                    y = center[1] - (dx*np.sin(pa_rad) - dy*np.cos(pa_rad))
+                    
+                    # add patch on all plots
+                    for i in range(self.__pltnchan):
+                        rect_patch = patches.Rectangle((x, y), width, height, angle=-region.pa,
+                                                   linewidth=lw, linestyle=ls, edgecolor=color, 
+                                                   facecolor='none')
+                        grid[i].add_patch(rect_patch)
+
         if plot:
             plt.show()
+
         return grid
     
-    def mask_region(self, region, vrange=[], exclude=False, preview=True, inplace=False, **kwargs):
+    def mask_region(self, region, vrange=None, exclude=False, preview=True, inplace=False, **kwargs):
         """
         Mask the specified region.
         Parameters:
@@ -2195,6 +2049,8 @@ class Datacube:
         Returns:
             The masked image.
         """
+        if vrange is None:
+            vrange = []
         if region.shape == "line":
             raise Exception(f"Region shape cannot be '{region.shape}' ")
         region = self.__readregion(region)
@@ -2379,7 +2235,8 @@ class Datacube:
             pv.imview(**kwargs)
         return pv
     
-    def get_spectrum(self, region=None, xlabel=None, ylabel=None, returndata=False, **kwargs):
+    def get_spectrum(self, region=None, vlim=None, ylabel=None, yunit=None, 
+                     xlabel=None, xunit=None, preview=False, **kwargs):
         """
         Get the spectral profile of the data cube.
         Parameters:
@@ -2393,21 +2250,55 @@ class Datacube:
             ax (matplotlib.axes.Axes, if returndata=False): the generated plot
         """
         # initialize parameters
-        xlabel = r'Radio Velocity ($\rm km~s^{-1}$)' if xlabel is None else xlabel
-        ylabel = f'Intensity ({(_unit_plt_str(_apu_to_str(_to_apu(self.bunit))))})' if ylabel is None else ylabel
+        if xlabel is None:
+            xlabel = r"Radio Velocity"
+        if xunit is None:
+            xunit = self.specunit
+        if ylabel is None:
+            ylabel = "Intensity"
+        if yunit is None:
+            yunit = self.bunit
+
+        # trim image
         trimmed_image = self if region is None else self.mask_region(region, preview=False)
-        
-        # generate the data
-        intensity = np.nanmean(trimmed_image.data, axis=(0, 2, 3))
-        vaxis = self.vaxis.copy()     # copy to prevent modifying after returning.
-        
+
+        # if vlim is not None:
+        if vlim is None:
+            vaxis = self.vaxis
+            intensity = np.nanmean(trimmed_image.data, axis=(0, 2, 3))
+        else:
+            if not hasattr(vlim, "__iter__") or len(vlim) != 2:
+                raise ValueError("'vlim' must be an iterable of length 2")
+            minvel = min(vlim) - 0.1 * self.dv
+            maxvel = max(vlim) + 0.1 * self.dv
+            vaxis = self.vaxis
+            vmask = (minvel <= vaxis) & (vaxis <= maxvel)
+            vaxis = vaxis[vmask]
+
+            # generate the data
+            intensity = np.nanmean(trimmed_image.data, axis=(0, 2, 3))[vmask]
+
+        # header
+        header = {"filepath": "",
+                  "imagetype": "Plot2D",
+                  "size": vaxis.size,
+                  "xlabel": xlabel,
+                  "xunit": xunit,
+                  "ylabel": ylabel,
+                  "yunit": yunit,
+                  "scale": ("linear", "linear"),
+                  "date": str(dt.datetime.now()).replace(" ", "T"),
+                  "origin": "Generated by Astroviz."}
+
         # plot the data
-        ax = _plt_spectrum(vaxis, intensity, xlabel=xlabel, ylabel=ylabel, **kwargs)
+        plot = Plot2D(x=vaxis, y=intensity, header=header)
+
+        # preview data if necessary
+        if preview:
+            plot.imview(**kwargs)
         
         # return the objects
-        if returndata:
-            return vaxis, intensity
-        return ax
+        return plot
         
     def imsmooth(self, bmaj=None, bmin=None, bpa=0, width=None, unit=None, kernel="gauss",
                  fft=True, preview=True, inplace=False, **kwargs):
@@ -2441,6 +2332,8 @@ class Datacube:
             width = u.Quantity(width, unit) / u.Quantity(np.abs(self.dx), self.unit)
             k = Box2DKernel(width=width)
             newbeam = None
+        else:
+            raise ValueError("'kernel' must be 'gauss' or 'box'.")
         
         print("Convolving...")
         if fft: 
@@ -2465,93 +2358,250 @@ class Datacube:
         if inplace:
             return self
         return convolved_image
-        
-    def imregrid(self, template=None, dx=None, dy=None, imsize=[], 
-                 interpolation="linear", unit="arcsec", inplace=False):
+
+    def pad(self, new_xlim=None, new_ylim=None, 
+            new_imsize=None, left_pad=None, right_pad=None, 
+            top_pad=None, bottom_pad=None, mode="constant",
+            fill_value=np.nan, inplace=False):
         """
-        Regrid the datacube image to a new grid resolution.
+        Adds padding to the image data along specified axes and adjusts the reference coordinates accordingly.
+
         Parameters:
-            template (Datacube): Optional. A template image to use for the new grid.
-            dx (float): New grid resolution along the x-axis.
-            dy (float): New grid resolution along the y-axis.
-            imsize (list(float)): Optional. The new image size (number of pixels in x- and y-axes)
-            inplace (bool): If True, modify the current image in-place. Otherwise, return a new image.
+            new_xlim (array-like, optional): New limits for the x-axis (RA), specified as a two-element array [min, max].
+                                             The method will calculate the required padding to achieve these limits.
+                                             Default is None.
+            
+            new_ylim (array-like, optional): New limits for the y-axis (Dec), specified as a two-element array [min, max].
+                                             The method will calculate the required padding to achieve these limits.
+                                             Default is None.
+            
+            new_imsize (tuple of int, optional): New image size as a tuple (nx, ny), where nx is the new size for the x-axis
+                                                 and ny is the new size for the y-axis. The method will calculate the padding
+                                                 required to reach these dimensions. Default is None.
+            
+            left_pad (int, optional): Number of pixels to pad on the left side of the x-axis. Defaults to None, which implies
+                                      no padding.
+            
+            right_pad (int, optional): Number of pixels to pad on the right side of the x-axis. Defaults to None, which implies
+                                       no padding.
+            
+            top_pad (int, optional): Number of pixels to pad on the top side of the y-axis. Defaults to None, which implies
+                                     no padding.
+            
+            bottom_pad (int, optional): Number of pixels to pad on the bottom side of the y-axis. Defaults to None, which
+                                        implies no padding.
+            
+            fill_value (float, optional): Value to fill the padding region. Default is NaN.
+            
+            inplace (bool, optional): If True, modify the image data in place and return self. If False, return a new instance
+                                      with the modified data. Default is False.
+        
         Returns:
-            Datacube: The regridded image.
+            self or new instance: The modified image data with added padding. Returns self if inplace=True; otherwise,
+                                  returns a new instance with the padded data.
+
+        Raises:
+            ValueError: If any padding value is negative or if no valid padding, limits, or image size are specified.
+
+        Warnings:
+            If the padding difference for a new image size is an odd number, a warning is raised, indicating potential 
+            uneven padding.
+
+        Example usage:
+            # Assuming `image` is an instance with the method `pad`
+
+            # Add padding to achieve new axis limits
+            new_image = image.pad(new_xlim=[10, 50], new_ylim=[-20, 30])
+
+            # Add padding to achieve a new image size
+            new_image = image.pad(new_imsize=(100, 200))
+
+            # Add specific padding to each side
+            new_image = image.pad(left_pad=5, right_pad=5, top_pad=10, bottom_pad=10)
+
+            # Add padding in place
+            image.pad(left_pad=5, right_pad=5, inplace=True)
+
+        Notes:
+            This method modifies the reference coordinates (RA, Dec) of the image data to account for the added padding.
+            The new reference coordinates are recalculated based on the new position of the reference pixels.
         """
-        # get parameters from template if a template is given:
-        if template is not None:
-            if isinstance(template, (Datacube, Spatialmap)):
-                dx = template.dx  # note: this does not store the same memory address, so no need to copy.
-                dy = template.dy
+        # get attributes
+        xaxis = self.xaxis
+        yaxis = self.yaxis
+        dx = self.dx 
+        dy = self.dy
+        
+        # check whether parameters are specified:
+        params = (new_xlim, new_ylim, new_imsize, left_pad, right_pad, top_pad, bottom_pad)
+        if all(param is None for param in params):
+            raise ValueError("You must specify at least one of the following: " + \
+                             "new_xlim, new_ylim, new_imsize, or any of the padding " + \
+                             "values (left_pad, right_pad, top_pad, bottom_pad).")
+        
+        if new_imsize is not None:
+            x_diff = new_imsize[0] - xaxis.size
+            if x_diff % 2:  # if difference is odd number
+                warnings.warn("Padding difference for x-axis is an odd number; " + \
+                              "this may lead to uneven padding.")
+                left_pad = x_diff // 2 + 1
             else:
-                raise TypeError("'template' must be a Datacube or Spatialmap instance.")
+                left_pad = x_diff // 2
+            right_pad = x_diff // 2
+            
+            y_diff = new_imsize[1] - yaxis.size
+            if y_diff % 2:  # if difference is odd number
+                warnings.warn("Padding difference for y-axis is an odd number; " + \
+                              "this may lead to uneven padding.")
+                bottom_pad = y_diff // 2 + 1
+            else:
+                bottom_pad = y_diff // 2 
+            top_pad = y_diff // 2
         
-        # calculate dx from imsize if imsize is given:
-        if len(imsize) == 2:
-            dx = -(self.xaxis.max()-self.xaxis.min())/imsize[0]
-            dy = (self.yaxis.max()-self.yaxis.min())/imsize[1]
-
-        # if dx or dy is not provided, raise an error
-        if dx is None or dy is None:
-            raise ValueError("New grid resolution (dx and dy) must be provided " + \
-                              "either directly, via imsize, or via a template.")
+        if new_xlim is not None:
+            new_xlim = np.array(new_xlim)
+            left_pad = (new_xlim.max() - xaxis.max())/-dx
+            left_pad = _true_round_whole(left_pad)
+            right_pad = (xaxis.min() - new_xlim.min())/-dx
+            right_pad = _true_round_whole(right_pad)
+            
+        if new_ylim is not None:
+            new_ylim = np.array(new_ylim)
+            top_pad = (new_ylim.max() - yaxis.max())/dy
+            top_pad = _true_round_whole(top_pad)
+            bottom_pad = (yaxis.min() - new_ylim.min())/dy
+            bottom_pad = _true_round_whole(bottom_pad)
         
-        # dx must be negative and dy must be positive
-        dx = -dx if dx > 0. else dx
-        dy = -dy if dy < 0. else dy
-
-        # compute the new grid
-        new_nx = int((self.xaxis[-1] - self.xaxis[0]) / dx)
-        new_ny = int((self.yaxis[-1] - self.yaxis[0]) / dy)
-        new_xaxis = np.linspace(self.xaxis[0], self.xaxis[-1], new_nx)
-        new_yaxis = np.linspace(self.yaxis[0], self.yaxis[-1], new_ny)
-        new_xx, new_yy = np.meshgrid(new_xaxis, new_yaxis)
-
-        # interpolate the data to the new grid
-        old_xx, old_yy = self.get_xyaxes(grid=True)
-        mask = ~np.isnan(self.data[0])
+        # set to default values (0) if not specified
+        if left_pad is None:
+            left_pad = 0
+        if right_pad is None:
+            right_pad = 0
+        if top_pad is None:
+            top_pad = 0
+        if bottom_pad is None:
+            bottom_pad = 0
+            
+        # raise value error if number of pad is negative
+        if any(num < 0 for num in (top_pad, bottom_pad, left_pad, right_pad)):
+            raise ValueError("Padding values cannot be negative.")
+            
+        # add padding to new data
+        pad_width = ((0, 0), (bottom_pad, top_pad), (left_pad, right_pad))
+        new_data = np.pad(self.data[0],  # three-dimensional
+                          pad_width=pad_width, 
+                          mode="constant", 
+                          constant_values=fill_value)
+        new_data = new_data[np.newaxis, :, :, :]  # add stokes axis 
         
-        print("Regridding...")
-        new_data = np.array([[griddata(np.array([old_xx[mask[i]].ravel(), old_yy[mask[i]].ravel()]).T, 
-                                                 self.data[0, i][mask[i]].ravel(), (new_yy, new_xx), 
-                                                 method=interpolation).reshape((new_ny, new_nx)) \
-                                                 for i in range(self.nchan)]])
+        # calculate new cell sizes and reference pixels
+        new_nx = new_data.shape[3]
+        new_refnx = new_nx // 2 + 1
+        new_ny = new_data.shape[2]
+        new_refny = new_ny // 2 + 1
+        
+        # calculate new reference coordinate
+        current_refcoord = SkyCoord(self.refcoord)
+        current_ra = current_refcoord.ra
+        current_dec = current_refcoord.dec
 
-        # update header information
-        new_header = copy.deepcopy(self.header)
-        new_header['shape'] = new_data.shape
-        new_header['refnx'] = new_nx/2 + 1
-        new_header['refnx'] = new_ny/2 + 1
-        new_header['dx'] = dx
-        new_header['dy'] = dy
-        new_header['nx'] = new_nx
-        new_header['ny'] = new_ny
+        new_ra = current_ra + (right_pad-left_pad+1)*dx*u.Unit(self.unit)
+        new_dec = current_dec + (top_pad-bottom_pad+1)*dy*u.Unit(self.unit)
+        new_refcoord = SkyCoord(ra=new_ra, dec=new_dec).to_string("hmsdms")
+        
+        # update stuff
+        image = self if inplace else self.copy()
+        image.data = new_data
+        image.overwrite_header(nx=new_nx, refnx=new_refnx, 
+                               ny=new_ny, refny=new_refny,
+                               refcoord=new_refcoord,
+                               shape=new_data.shape,
+                               )
+        return image
 
-        # create new Datacube instance
-        regridded_map = Datacube(header=new_header, data=new_data)
+    def imregrid(self, template, interpolation="linear", parallel=True, inplace=False):
+        """
+        Regrids the image to match the grid of a template image.
 
-        # modify the current image in-place if requested
-        if inplace:
-            self.data = new_data
-            self.header = new_header
-            self.__updateparams()  # Update parameters based on new header
-            return self
-        return regridded_map
+        This method adjusts the image to have the same coordinate grid as the template image by shifting, trimming, and/or padding
+        the image data, and then regridding the data using interpolation.
+
+        Parameters:
+            template (Spatialmap or Datacube): The template image whose grid will be matched. Must be an instance of Spatialmap or Datacube.
+            
+            interpolation (str, optional): The interpolation method to use for regridding. Options include "linear", "nearest", and "cubic". 
+                                           Default is "linear".
+            
+            inplace (bool, optional): If True, modifies the image in place and returns self. If False, returns a new instance with the regridded data.
+                                      Default is False.
+
+        Returns:
+            self or new instance: The regridded image. Returns self if inplace=True; otherwise, returns a new instance with the regridded data.
+
+        Raises:
+            ValueError: If the template is not an instance of Spatialmap or Datacube.
+            Exception: If inconsistent padding and trimming conditions are detected.
+
+        Example usage:
+            # Assuming `image` is an instance with the method `imregrid` and `template` is a Spatialmap or Datacube instance
+
+            # Regrid the image to match the template
+            new_image = image.imregrid(template)
+
+            # Regrid the image with cubic interpolation and modify in place
+            image.imregrid(template, interpolation="cubic", inplace=True)
+        
+        Notes:
+            - The method first shifts the image to the new reference coordinate of the template.
+            - The image is then trimmed or padded to match the limits and size of the template.
+            - Finally, the image data is regridded using the specified interpolation method to match the template grid.
+        """
+        image = self if inplace else self.copy()
+
+        if not isinstance(template, (Spatialmap, Datacube)):
+            raise ValueError("Template must be an instance of 'Spatialmap' or 'Datacube'.")
+
+        new_dx = template.dx
+        new_dy = template.dy 
+
+        if self.unit != template.unit:
+            conversion_factor = (1*u.Unit(template.unit)).to_value(self.unit)
+            new_dx *= conversion_factor
+            new_dy *= conversion_factor
+
+        # first shift the image to new coordinate
+        image.imshift(template, inplace=True)
+
+        # change cell size of data through interpolation
+        image = _change_cell_size(image=image,
+                                  dx=new_dx,
+                                  dy=new_dy,
+                                  interpolation=interpolation,
+                                  inplace=True)
+
+        # trim/pad limits of the image
+        image = _match_limits(image=image, template_image=template, inplace=True)
+        
+        return image
     
-    def normalize(self, range=[0, 1], inplace=False):
+    def normalize(self, valrange=None, template=None, inplace=False):
         """
         Normalize the data of the data cube to a specified range.
         Parameters:
-            range (list/tuple): The range [min, max] to which the data will be normalized. Default is [0, 1].
+            valrange (list/tuple): The range [min, max] to which the data will be normalized. Default is [0, 1].
             inplace (bool): If True, modify the data in-place. 
                             If False, return a new Spatialmap instance. Default is False.
         Returns:
             The normalized image, either as a new instance or the same instance based on the 'inplace' parameter.
         """
+        if template is None:
+            if valrange is None:
+                valrange = [0, 1]
+        else:
+            valrange = [np.nanmin(template), np.nanmax(template)]
 
         # Extracting min and max from the range
-        min_val, max_val = range
+        min_val, max_val = valrange
 
         # Normalization formula: (data - min(data)) / (max(data) - min(data)) * (max_val - min_val) + min_val
         data_min, data_max = np.nanmin(self.data), np.nanmax(self.data)
@@ -2562,21 +2612,76 @@ class Datacube:
             return self
         return Datacube(header=self.header, data=normalized_data)
         
-    def imshift(self, coord, unit=None, printcc=True, inplace=False):
+    def imshift(self, coord, unit=None, printcc=True, order=3,
+                mode="constant", cval=np.nan, prefilter=True, 
+                parallel=True, inplace=True):
         """
-        This method shifts the image to the desired coordinate
+        Shifts the image to the desired coordinate.
+
+        This method shifts the image data to a specified coordinate, either in J2000 format or in relative units.
+        The shifting operation can be performed in parallel to improve performance.
+
         Parameters:
-            coord (str/tuple/list/None): the J2000 or relative coordinate
-            unit (str): the unit of the coordinate if coord is not J2000
-            gauss (bool): use gaussian fitting to shift peak position if available
-            inplace (bool): True to modify the image in-place.
+            coord (str/tuple/list/None): The target coordinate to shift the image to.
+                                         If a string, it is interpreted as a J2000 coordinate.
+                                         If a tuple or list, it is interpreted as relative coordinates.
+                                         The format depends on the type:
+                                         - J2000 (str): Example: '12h30m00s +12d30m00s'
+                                         - Relative (tuple/list): Example: [30, 40] with units specified by `unit`.
+
+            unit (str, optional): The unit of the coordinate if `coord` is not in J2000 format. Default is None,
+                                  which uses the unit attribute of the instance.
+
+            printcc (bool, optional): If True, prints the new center coordinate after shifting. Default is True.
+
+            order (int, optional): The order of the spline interpolation used in the shifting process. Default is 3.
+
+            mode (str, optional): Points outside the boundaries of the input are filled according to the given mode.
+                                  Default is 'constant'. Modes match the `scipy.ndimage.shift` options.
+
+            cval (float, optional): The value to use for points outside the boundaries of the input when mode is 'constant'.
+                                    Default is NaN.
+
+            prefilter (bool, optional): Determines if the input should be pre-filtered before applying the shift. Default is True.
+
+            parallel (bool, optional): If True, performs the shifting operation in parallel across multiple channels.
+                                       Default is True.
+
+            inplace (bool, optional): If True, modifies the image data in-place. If False, returns a new instance
+                                      with the shifted data. Default is True.
+
         Returns:
-            Image after shifting
+            Image: The shifted image instance. If `inplace` is True, returns self after modification.
+                   Otherwise, returns a new instance with the shifted data.
+
+        Raises:
+            ValueError: If the provided coordinate format is invalid.
+
+        Example usage:
+            # Assuming `image` is an instance with the method `imshift`
+
+            # Shift image to a new J2000 coordinate
+            shifted_image = image.imshift('12h30m00s +12d30m00s')
+
+            # Shift image to a new relative coordinate with specified units
+            shifted_image = image.imshift([30, 40], unit='arcsec')
+
+            # Shift image in-place
+            image.imshift('12h30m00s +12d30m00s', inplace=True)
+
+            # Shift image with parallel processing disabled
+            shifted_image = image.imshift([30, 40], unit='arcsec', parallel=False)
+
+        Notes:
+            - This method converts J2000 coordinates to arcseconds and calculates the pixel shift required.
+            - If the image contains NaN values, they will be replaced with zeros during the shifting process.
+            - The new reference coordinate is updated in the image header.
         """
         unit = self.unit if unit is None else unit
         if isinstance(coord, (Spatialmap, Datacube, PVdiagram)):
             coord = coord.header["refcoord"]
         image = self if inplace else self.copy()
+
         # convert J2000 to arcsec
         isJ2000 = (isinstance(coord, str) and not coord.isnumeric()) \
                     or (len(coord)==2 and isinstance(coord[0], str) and isinstance(coord[1], str)) 
@@ -2600,16 +2705,42 @@ class Datacube:
         
         dx = u.Quantity(np.abs(self.dx), self.unit)
         dy = u.Quantity(np.abs(self.dy), self.unit)
-        pixelx = int(shiftx/dx)
-        pixely = int(shifty/dy)
-        image.data = np.nan_to_num(image.data)
+        pixelx = shiftx / dx  # allow sub-pixel shifts
+        pixely = shifty / dy  # allow sub-pixel shifts
+
+        # warn users that nan will be replaced with zero:
+        if np.any(np.isnan(image.data)):
+            warnings.warn("NaN values were detected and will be replaced with zeros after 'imshift'.")
+            image.data = np.nan_to_num(image.data)
+
         shift = np.array([self.refny-1, self.refnx-1])-[self.refny-pixely, self.refnx+pixelx]
-        # list comprehension is somehow faster than specifying axis with the built-in parameter of ndimage.shift
-        image.data[0] = np.array([ndimage.shift(image.data[0, i], shift=shift) for i in range(self.nchan)])
+
+        if parallel and self.nchan > 5:  # make sure parallelism makes sense (there are enough channels)
+            # warn user that they may not have enough CPUs for parallelism
+            if os.cpu_count() == 1:
+                warnings.warn("This device only has 1 CPU, which is not suitable for parallelism.")
+
+            # parallel processing
+            with ProcessPoolExecutor() as executor:
+                results = executor.map(ndimage.shift,  # input a callable function
+                                       image.data[0],
+                                       (shift,) * self.nchan,  # parameter: shift
+                                       (None,) * self.nchan,  # parameter: output
+                                       (order,) * self.nchan,  # parameter: order
+                                       (mode,) * self.nchan,  # parameter: mode
+                                       (cval,) * self.nchan,  # parameter: cval
+                                       (prefilter,) * self.nchan,  # parameter: prefilter
+                                       )
+            image.data[0] = np.array(list(results))
+        else:
+            # use list comprehension, which is faster than assigning one by one
+            image.data[0] = np.array([ndimage.shift(image.data[0, i], shift=shift, cval=cval, 
+                                                    output=None, order=order, mode=mode, 
+                                                    prefilter=prefilter) for i in range(self.nchan)])
         image.__updateparams()
         return image
     
-    def peakshift(self, inplace=False):
+    def peakshift(self, inplace=True, **kwargs):
         """
         Shift the maximum value of the image to the center of the image.
         Parameter:
@@ -2617,15 +2748,15 @@ class Datacube:
         Returns:
             The shifted image.
         """
-        mom8_data = self.__get_momentdata(8)    # maximum intensity of spectrum
-        indices = np.unravel_index(np.nanargmax(mom8_data[0, 0]), mom8_data[0, 0].shape)
+        mom8_data = np.nanmax(self.data, axis=1)[0]  # maximum intensity of spectrum
+        indices = np.unravel_index(np.nanargmax(mom8_data), mom8_data.shape)
         xx, yy = self.get_xyaxes(grid=True, unit=None)
         coord = xx[indices], yy[indices]
         if self._peakshifted:
             print("The peak is already shifted to the center.")
             return self.copy()
         else:
-            shifted_image = self.imshift(coord=coord, printcc=True, unit=self.unit, inplace=inplace)
+            shifted_image = self.imshift(coord=coord, printcc=True, unit=self.unit, inplace=inplace, **kwargs)
             if inplace:
                 self._peakshifted = True
             else:
@@ -2652,6 +2783,47 @@ class Datacube:
         """
         self.__updateparams()
         return _get_hduheader(self)
+
+    def get_wcs(self):
+        """
+        Get the world coordinate system of the image (astropy object.)
+        """
+        return WCS(self.get_hduheader())
+
+    def get_hdu(self):
+        """
+        Get the primary HDU (astropy object) of the image.
+        """
+        return fits.PrimaryHDU(data=self.data, header=self.get_hduheader())
+    
+    def overwrite_header(self, new_vals=None, **kwargs):
+        """
+        Method to overwrite the existing keys of the header with new values.
+        Parameters:
+            new_vals (dict): a dictionary containing keys and values to be overwritten.
+            **kwargs (dict): keyword arguments that will be overwritten in the header
+        Return:
+            self.header (dict): the updated header 
+        """
+        if new_vals is None and len(kwargs) == 0:
+            raise ValueError("Header cannot be overwritten. Need to input a dictionary or keyword arguments.")
+        if new_vals is not None:
+            if isinstance(new_vals, dict):
+                for key, value in new_vals.items():
+                    if key in self.header:
+                        self.header[key] = value
+                    else:
+                        warnings.warn(f"'{key}' is not a valid keyword of the header and will be ignored.")
+            else:
+                raise TypeError("Please input a new dictionary as the header.")
+        if len(kwargs) > 0:
+            for key, value in kwargs.items():
+                if key in self.header:
+                    self.header[key] = value
+                else:
+                    warnings.warn(f"'{key}' is not a valid keyword of the header and will be ignored.")
+        self.__updateparams()
+        return self.header
     
     def exportfits(self, outname, overwrite=False):
         """
@@ -2679,17 +2851,38 @@ class Datacube:
         
         # if not overwrite, add (1), (2), (3), etc. to file name before '.fits'
         if not overwrite:
-            i = 1
-            while os.path.exists(outname):
-                if os.path.exists(outname[:-5] + f"({i})" + outname[-5:]):
-                    i += 1
-                else:
-                    outname = outname[:-5] + f"({i})" + outname[-5:]
+            outname = _prevent_overwriting(outname)
         
         # Write to a FITS file
         hdu = fits.PrimaryHDU(data=self.data, header=hdu_header)
         hdu.writeto(outname, overwrite=overwrite)
         print(f"File saved as '{outname}'.")
+
+    def to_casa(self, *args, **kwargs):
+        """
+        Converts the data cube object into CASA image format. 
+        Wraps the 'importfits' function of casatasks.
+
+        Parameters:
+            outname (str): The output name for the CASA image file. Must end with ".image".
+            whichrep (int, optional): The FITS representation to convert. Defaults to 0.
+            whichhdu (int, optional): The HDU (Header/Data Unit) number to convert. Defaults to -1.
+            zeroblanks (bool, optional): Replace undefined values with zeros. Defaults to True.
+            overwrite (bool, optional): Overwrite the output file if it already exists. Defaults to False.
+            defaultaxes (bool, optional): Use default axes for the output CASA image. Defaults to False.
+            defaultaxesvalues (str, optional): Default axes values, provided as a string. Defaults to '[]'.
+            beam (str, optional): Beam parameters, provided as a string. Defaults to '[]'.
+
+        Raises:
+            ValueError: If 'outname' is not a string.
+
+        Returns:
+            None
+
+        Example:
+            image.to_casa("output_image")
+        """
+        to_casa(self, *args, **kwargs)
 
 
 class Spatialmap:
@@ -2728,9 +2921,9 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return Spatialmap(header=self.header, data=self.data+other.data)
         return Spatialmap(header=self.header, data=self.data+other)
     
@@ -2738,9 +2931,9 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return Spatialmap(header=self.header, data=other.data+self.data)
         return Spatialmap(header=self.header, data=other+self.data)
         
@@ -2748,9 +2941,9 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return Spatialmap(header=self.header, data=self.data-other.data)
         return Spatialmap(header=self.header, data=self.data-other)
     
@@ -2758,9 +2951,9 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return Spatialmap(header=self.header, data=other.data-self.data)
         return Spatialmap(header=self.header, data=other-self.data)
         
@@ -2768,7 +2961,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data*other.data)
         return Spatialmap(header=self.header, data=self.data*other)
     
@@ -2776,7 +2969,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=other.data*self.data)
         return Spatialmap(header=self.header, data=other*self.data)
     
@@ -2784,7 +2977,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data**other.data)
         return Spatialmap(header=self.header, data=self.data**other)
         
@@ -2792,7 +2985,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=other.data**self.data)
         return Spatialmap(header=self.header, data=other.data**self.data)
         
@@ -2800,7 +2993,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data/other.data)
         return Spatialmap(header=self.header, data=self.data/other)
     
@@ -2808,7 +3001,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=other.data/self.data)
         return Spatialmap(header=self.header, data=other/self.data)
         
@@ -2816,7 +3009,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data//other.data)
         return Spatialmap(header=self.header, data=self.data//other)
     
@@ -2824,7 +3017,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=other.data//self.data)
         return Spatialmap(header=self.header, data=other//self.data)
     
@@ -2832,7 +3025,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data%other.data)
         return Spatialmap(header=self.header, data=self.data%other)
     
@@ -2840,7 +3033,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=other.data%self.data)
         return Spatialmap(header=self.header, data=other%self.data)
     
@@ -2848,7 +3041,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data<other.data)
         return Spatialmap(header=self.header, data=self.data<other)
     
@@ -2856,7 +3049,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data<=other.data)
         return Spatialmap(header=self.header, data=self.data<=other)
     
@@ -2864,7 +3057,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data==other.data)
         return Spatialmap(header=self.header, data=self.data==other)
         
@@ -2872,7 +3065,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data!=other.data)
         return Spatialmap(header=self.header, data=self.data!=other)
 
@@ -2880,7 +3073,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data>other.data)
         return Spatialmap(header=self.header, data=self.data>other)
         
@@ -2888,7 +3081,7 @@ class Spatialmap:
         if isinstance(other, Spatialmap):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return Spatialmap(header=self.header, data=self.data>=other.data)
         return Spatialmap(header=self.header, data=self.data>=other)
 
@@ -2909,7 +3102,7 @@ class Spatialmap:
             try:
                 return Spatialmap(header=self.header, data=self.data[indices])
             except:
-                print("WARNING: Returning value after reshaping image data to 2 dimensions.")
+                warnings.warn("Returning value after reshaping image data to 2 dimensions.")
                 return self.data.copy[:, indices[0], indices[1]]
         except:
             return self.data[indices]
@@ -2944,6 +3137,157 @@ class Spatialmap:
         
     def __array__(self, *args, **kwargs):
         return np.array(self.data, *args, **kwargs)
+
+    def min(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the minimum value of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's min function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's min function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the minimum.
+
+        Returns:
+            scalar or array: Minimum value of the data array. If the data array is multi-dimensional, 
+                             returns an array of minimum values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nanmin(self.data, *args, **kwargs)
+        return np.min(self.data, *args, **kwargs)
+
+    def max(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the maximum value of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's max function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's max function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the maximum.
+
+        Returns:
+            scalar or array: Maximum value of the data array. If the data array is multi-dimensional, 
+                             returns an array of maximum values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nanmax(self.data, *args, **kwargs)
+        return np.max(self.data, *args, **kwargs)
+
+    def mean(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the mean value of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's mean function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's mean function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the mean.
+
+        Returns:
+            scalar or array: Mean value of the data array. If the data array is multi-dimensional, 
+                             returns an array of mean values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nanmean(self.data, *args, **kwargs)
+        return np.mean(self.data, *args, **kwargs)
+
+    def sum(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the sum of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's sum function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's sum function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the sum.
+
+        Returns:
+            scalar or array: Sum of the data array. If the data array is multi-dimensional, 
+                             returns an array of sum values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nansum(self.data, *args, **kwargs)
+        return np.sum(self.data, *args, **kwargs)
+
+    def flux(self, region=None, rms=None, rms_unit=None,
+             print_results=True, **kwargs):
+        """
+        Calculate the total flux within a specified region of the image, taking into account the noise level.
+
+        Args:
+            region (Region, optional): The region within the image to calculate the flux. If None, the whole image is used.
+                This should be an instance of a `Region` class or any other object that defines a region.
+            rms (float or Quantity, optional): The root mean square (rms) noise level. If None, the rms noise is estimated from the image.
+            rms_unit (str, optional): The unit of the rms noise level. If None, the unit is assumed to be the same as the image unit.
+            print_results (bool, optional): If True, the results are printed. Default is True.
+            **kwargs: Additional keyword arguments passed to the region masking function.
+
+        Returns:
+            tuple: A tuple containing:
+                total_flux (float): The total flux within the specified region in mJy.
+                flux_error (float): The error in the flux measurement in mJy.
+
+        Notes:
+            The function first converts the image to units of mJy/pixel. If the rms noise level is not provided, 
+            it is estimated from the image. If a region is specified, the image is masked to this region.
+            The function then calculates the total flux by summing the pixel values within the region.
+            The error in the flux measurement is calculated as the square root of the number of pixels 
+            in the region multiplied by the rms noise level converted to mJy/pixel.
+
+            The results can be optionally printed, displaying the total flux, the error in the flux, 
+            the number of pixels in the beam, and the number of pixels in the specified region.
+
+        Examples:
+            >>> flux, error = image.flux(region=my_region, rms=0.5)
+            >>> flux, error = image.flux(print_results=False)
+        """
+        # convert image to mJy/pixel
+        try:
+            img_mJyppix = self.conv_bunit("mJy/pixel", inplace=False)
+        except UnitConversionError:
+            raise Exception("Image must be a continuum map or a single channel map.")
+
+        # estimate noise from image if rms is not specified:
+        estimate_rms = (rms is None)
+        if estimate_rms:
+            rms = self.noise()
+            rms_unit = self.bunit
+        elif isinstance(rms, u.Quantity):  # get the unit and value if it is an astropy 'Quantity' instance
+            rms_unit = _apu_to_headerstr(rms.unit)
+            rms = rms.value
+
+        # create image for the rms to convert unit and then get the converted rms:
+        rms_image = self.copy()
+        if rms_unit is not None and rms_image.bunit != rms_unit:
+            rms_image.set_header(bunit=rms_unit)  # set to correct unit
+        rms_image.data = rms  # image value is the rms
+        rms_image.conv_bunit("mJy/pixel", inplace=True)
+        rms_mJyppix = rms_image.data  # rms converted to mJy/pixel
+
+        # mask region 
+        if region is not None:
+            img_mJyppix = img_mJyppix.mask_region(region, **kwargs, preview=False, inplace=False)
+
+        # calculate the total flux and the error from the rms
+        total_flux = img_mJyppix.sum()
+        pix_in_aperature = np.sum(~np.isnan(img_mJyppix.data))  # count number of pixels in aperature
+        flux_error = np.sqrt(pix_in_aperature) * rms_mJyppix
+
+        # print the measured results
+        if print_results:
+            print("Total Flux Measurement".center(40, "#"))
+            print(f"Flux: {total_flux:.4f} +/- {flux_error:.4f} [mJy]")
+            print(f"Number of pixels in aperature: {pix_in_aperature}")
+            if estimate_rms:
+                print(f"Estimated RMS: {rms_mJyppix} [mJy]")
+            print(40*"#", end="\n\n")
+
+        return total_flux, flux_error
     
     def to(self, unit, *args, **kwargs):
         """
@@ -3049,16 +3393,66 @@ class Spatialmap:
             return self
         return Spatialmap(header=self.header, data=newdata.reshape(self.shape))
         
-    def imshift(self, coord, unit=None, printcc=True, inplace=False, order=0):
+    def imshift(self, coord, unit=None, printcc=True, order=3,
+                mode="constant", cval=np.nan, prefilter=True,
+                inplace=True, **kwargs):
         """
-        This method shifts the image to the desired coordinate
+        Shifts the image to the desired coordinate.
+
+        This method shifts the image data to a specified coordinate, either in J2000 format or in relative units.
+
         Parameters:
-            coord (str/tuple/list/None): the J2000 or relative coordinate
-            unit (str): the unit of the coordinate if coord is not J2000
-            gauss (bool): use gaussian fitting to shift peak position if available
-            inplace (bool): True to modify the image in-place.
+            coord (str/tuple/list): The target coordinate to shift the image to.
+                                     If a string, it is interpreted as a J2000 coordinate.
+                                     If a tuple or list, it is interpreted as relative coordinates.
+                                     The format depends on the type:
+                                     - J2000 (str): Example: '12h30m00s +12d30m00s'
+                                     - Relative (tuple/list): Example: [30, 40] with units specified by `unit`.
+
+            unit (str, optional): The unit of the coordinate if `coord` is not in J2000 format. Default is None,
+                                  which uses the unit attribute of the instance.
+
+            printcc (bool, optional): If True, prints the new center coordinate after shifting. Default is True.
+
+            order (int, optional): The order of the spline interpolation used in the shifting process. Default is 3.
+
+            mode (str, optional): Points outside the boundaries of the input are filled according to the given mode.
+                                  Default is 'constant'. Modes match the `scipy.ndimage.shift` options.
+
+            cval (float, optional): The value to use for points outside the boundaries of the input when mode is 'constant'.
+                                    Default is NaN.
+
+            prefilter (bool, optional): Determines if the input should be pre-filtered before applying the shift. Default is True.
+
+            inplace (bool, optional): If True, modifies the image data in-place. If False, returns a new instance
+                                      with the shifted data. Default is True.
+
         Returns:
-            Image after shifting
+            Image: The shifted image instance. If `inplace` is True, returns self after modification.
+                   Otherwise, returns a new instance with the shifted data.
+
+        Raises:
+            ValueError: If the provided coordinate format is invalid.
+
+        Example usage:
+            # Assuming `image` is an instance with the method `imshift`
+
+            # Shift image to a new J2000 coordinate
+            shifted_image = image.imshift('12h30m00s +12d30m00s')
+
+            # Shift image to a new relative coordinate with specified units
+            shifted_image = image.imshift([30, 40], unit='arcsec')
+
+            # Shift image in-place
+            image.imshift('12h30m00s +12d30m00s', inplace=True)
+
+            # Shift image with parallel processing disabled
+            shifted_image = image.imshift([30, 40], unit='arcsec')
+
+        Notes:
+            - This method converts J2000 coordinates to arcseconds and calculates the pixel shift required.
+            - If the image contains NaN values, they will be replaced with zeros during the shifting process.
+            - The new reference coordinate is updated in the image header.
         """
         unit = self.unit if unit is None else unit
         if isinstance(coord, (Spatialmap, Datacube, PVdiagram)):
@@ -3088,15 +3482,25 @@ class Spatialmap:
         
         dx = u.Quantity(np.abs(self.dx), self.unit)
         dy = u.Quantity(np.abs(self.dy), self.unit)
-        pixelx = int(shiftx/dx)
-        pixely = int(shifty/dy)
-        
-        image.data[0, 0] = ndimage.shift(np.nan_to_num(self.data[0, 0]), 
-                                    np.array([self.refny-1, self.refnx-1])-[self.refny-pixely, self.refnx+pixelx])        
+        pixelx = shiftx / dx
+        pixely = shifty / dy
+
+        # warn users about NaN values
+        if np.any(np.isnan(image.data)):
+            warnings.warn("NaN values were detected and will be replaced with zeros after 'imshift'.")
+            image.data = np.nan_to_num(image.data)
+
+        image.data[0, 0] = ndimage.shift(image.data[0, 0], 
+                                         shift=np.array([image.refny-1, image.refnx-1])-[image.refny-pixely, image.refnx+pixelx], 
+                                         cval=cval, 
+                                         order=order,
+                                         mode=mode, 
+                                         prefilter=prefilter,
+                                         **kwargs)        
         image.__updateparams()
         return image
     
-    def peakshift(self, inplace=False):
+    def peakshift(self, inplace=True, **kwargs):
         """
         Shift the maximum value of the image to the center of the image.
         Parameter:
@@ -3111,13 +3515,50 @@ class Spatialmap:
             print("The peak is already shifted to the center.")
             return self.copy()
         else:
-            shifted_image = self.imshift(coord=coord, printcc=True, unit=self.unit, inplace=inplace)
+            shifted_image = self.imshift(coord=coord, printcc=True, 
+                                         unit=self.unit, inplace=inplace, **kwargs)
             if inplace:
                 self._peakshifted = True
             else:
                 shifted_image._peakshifted = True
             print(f"Shifted to {coord} [{self.unit}]")
             return shifted_image
+        
+    def max_pixel(self, index=False):
+        """
+        Method to get the pixel with the maximum value.
+        Parameters:
+            index: True to return the index of the maximum value. False to return the unit of the 
+        Returns:
+            The coordinate/index with the minimum value (tuple)
+        """
+        data = self.data
+        peakpix = np.unravel_index(np.nanargmax(self.data), self.shape)
+        if index:
+            xval = peakpix[3]
+            yval = peakpix[2]
+        else:
+            xval = self.xaxis[peakpix[3]]
+            yval = self.yaxis[peakpix[2]]
+        return (xval, yval)
+    
+    def min_pixel(self, index=False):
+        """
+        Method to get the pixel with the maximum value.
+        Parameters:
+            index: True to return the index of the maximum value. False to return the unit of the 
+        Returns:
+            The coordinate/index with the minimum value (tuple)
+        """
+        data = self.data
+        peakpix = np.unravel_index(np.nanargmin(self.data), self.shape)
+        if index:
+            xval = peakpix[3]
+            yval = peakpix[2]
+        else:
+            xval = self.xaxis[peakpix[3]]
+            yval = self.yaxis[peakpix[2]]
+        return (xval, yval)
     
     def mask_region(self, region, exclude=False, preview=True, inplace=False, **kwargs):
         """
@@ -3190,130 +3631,339 @@ class Spatialmap:
             The intensity map with the annotated region.
         """
         ax = self.imview(plot=False, **kwargs)
-        region = self.__readregion(region)
-        if region.shape == "circle":
-            xsmooth = np.linspace(region.center[0]-region.radius, region.center[0]+region.radius, 1000)
-            inside_circle = (np.square(xsmooth-region.center[0]) <= region.radius**2)
-            ysmooth = np.sqrt(region.radius**2-np.square(xsmooth[inside_circle]-region.center[0]))
 
-            # Plot the upper and lower semicircles
-            ax.plot(xsmooth[inside_circle], region.center[1]+ysmooth, color=color, lw=lw, linestyle=ls)
-            ax.plot(xsmooth[inside_circle], region.center[1]-ysmooth, color=color, lw=lw, linestyle=ls)
-        elif region.shape == "ellipse":
-            theta = np.linspace(0, 2*np.pi, 1000)
-            angle = np.deg2rad(-region.pa-270)
+        if isinstance(region, Region):
+            region = self.__readregion(region)
+            if region.shape == "circle":
+                xsmooth = np.linspace(region.center[0]-region.radius, region.center[0]+region.radius, 1000)
+                inside_circle = (np.square(xsmooth-region.center[0]) <= region.radius**2)
+                ysmooth = np.sqrt(region.radius**2-np.square(xsmooth[inside_circle]-region.center[0]))
 
-            # Ellipse equation before rotation
-            x_ellipse = region.center[0] + region.semimajor * np.cos(theta)
-            y_ellipse = region.center[1] + region.semiminor * np.sin(theta)
+                # Plot the upper and lower semicircles
+                ax.plot(xsmooth[inside_circle], region.center[1]+ysmooth, color=color, lw=lw, linestyle=ls)
+                ax.plot(xsmooth[inside_circle], region.center[1]-ysmooth, color=color, lw=lw, linestyle=ls)
+            elif region.shape == "ellipse":
+                theta = np.linspace(0, 2*np.pi, 1000)
+                angle = np.deg2rad(-region.pa-270)
 
-            # Applying rotation for position angle
-            x_rotated = region.center[0]+(x_ellipse-region.center[0])*np.cos(angle)-(y_ellipse-region.center[1])*np.sin(angle)
-            y_rotated = region.center[1]+(x_ellipse-region.center[0])*np.sin(angle)+(y_ellipse-region.center[1])*np.cos(angle)
+                # Ellipse equation before rotation
+                x_ellipse = region.center[0] + region.semimajor * np.cos(theta)
+                y_ellipse = region.center[1] + region.semiminor * np.sin(theta)
 
-            # Plot the ellipse
-            ax.plot(x_rotated, y_rotated, color=color, lw=lw, linestyle=ls)
-        elif region.shape == "line":
-            ax.plot([region.start[0], region.end[0]], [region.start[1], region.end[1]], 
-                     color=color, lw=lw, linestyle=ls)
-        elif region.shape == "box":
-            # make patch
-            pa = region.pa
-            pa_rad = np.deg2rad(pa)
-            center = region.center
-            width, height = region.width, region.height
-            dx, dy = -width/2, -height/2
-            x = center[0] + (dx*np.cos(pa_rad) + dy*np.sin(pa_rad))
-            y = center[1] - (dx*np.sin(pa_rad) - dy*np.cos(pa_rad))
-            rect_patch = patches.Rectangle((x, y), width, height, angle=-region.pa,
-                                           linewidth=lw, linestyle=ls, edgecolor=color, 
-                                           facecolor='none')
-            ax.add_patch(rect_patch)
+                # Applying rotation for position angle
+                x_rotated = region.center[0]+(x_ellipse-region.center[0])*np.cos(angle)-(y_ellipse-region.center[1])*np.sin(angle)
+                y_rotated = region.center[1]+(x_ellipse-region.center[0])*np.sin(angle)+(y_ellipse-region.center[1])*np.cos(angle)
+
+                # Plot the ellipse
+                ax.plot(x_rotated, y_rotated, color=color, lw=lw, linestyle=ls)
+            elif region.shape == "line":
+                ax.plot([region.start[0], region.end[0]], [region.start[1], region.end[1]], 
+                         color=color, lw=lw, linestyle=ls)
+            elif region.shape == "box":
+                # make patch
+                pa = region.pa
+                pa_rad = np.deg2rad(pa)
+                center = region.center
+                width, height = region.width, region.height
+                dx, dy = -width/2, -height/2
+                x = center[0] + (dx*np.cos(pa_rad) + dy*np.sin(pa_rad))
+                y = center[1] - (dx*np.sin(pa_rad) - dy*np.cos(pa_rad))
+                rect_patch = patches.Rectangle((x, y), width, height, angle=-region.pa,
+                                               linewidth=lw, linestyle=ls, edgecolor=color, 
+                                               facecolor='none')
+                ax.add_patch(rect_patch)
+
+        elif hasattr(region, "__iter__"):
+            region_list = region
+            for region in region_list:
+                region = self.__readregion(region)
+                if region.shape == "circle":
+                    xsmooth = np.linspace(region.center[0]-region.radius, region.center[0]+region.radius, 1000)
+                    inside_circle = (np.square(xsmooth-region.center[0]) <= region.radius**2)
+                    ysmooth = np.sqrt(region.radius**2-np.square(xsmooth[inside_circle]-region.center[0]))
+
+                    # Plot the upper and lower semicircles
+                    ax.plot(xsmooth[inside_circle], region.center[1]+ysmooth, color=color, lw=lw, linestyle=ls)
+                    ax.plot(xsmooth[inside_circle], region.center[1]-ysmooth, color=color, lw=lw, linestyle=ls)
+                elif region.shape == "ellipse":
+                    theta = np.linspace(0, 2*np.pi, 1000)
+                    angle = np.deg2rad(-region.pa-270)
+
+                    # Ellipse equation before rotation
+                    x_ellipse = region.center[0] + region.semimajor * np.cos(theta)
+                    y_ellipse = region.center[1] + region.semiminor * np.sin(theta)
+
+                    # Applying rotation for position angle
+                    x_rotated = region.center[0]+(x_ellipse-region.center[0])*np.cos(angle)-(y_ellipse-region.center[1])*np.sin(angle)
+                    y_rotated = region.center[1]+(x_ellipse-region.center[0])*np.sin(angle)+(y_ellipse-region.center[1])*np.cos(angle)
+
+                    # Plot the ellipse
+                    ax.plot(x_rotated, y_rotated, color=color, lw=lw, linestyle=ls)
+                elif region.shape == "line":
+                    ax.plot([region.start[0], region.end[0]], [region.start[1], region.end[1]], 
+                             color=color, lw=lw, linestyle=ls)
+                elif region.shape == "box":
+                    # make patch
+                    pa = region.pa
+                    pa_rad = np.deg2rad(pa)
+                    center = region.center
+                    width, height = region.width, region.height
+                    dx, dy = -width/2, -height/2
+                    x = center[0] + (dx*np.cos(pa_rad) + dy*np.sin(pa_rad))
+                    y = center[1] - (dx*np.sin(pa_rad) - dy*np.cos(pa_rad))
+                    rect_patch = patches.Rectangle((x, y), width, height, angle=-region.pa,
+                                                   linewidth=lw, linestyle=ls, edgecolor=color, 
+                                                   facecolor='none')
+                    ax.add_patch(rect_patch)
+
         if plot:
             plt.show()
+
         return ax
-    
-    def imregrid(self, template=None, dx=None, dy=None, imsize=[], interpolation="linear", 
-                 unit="arcsec", inplace=False):
+
+    def pad(self, new_xlim=None, new_ylim=None, 
+            new_imsize=None, left_pad=None, right_pad=None, 
+            top_pad=None, bottom_pad=None, mode="constant",
+            fill_value=np.nan, inplace=False):
         """
-        Regrid the image to a new grid resolution.
+        Adds padding to the image data along specified axes and adjusts the reference coordinates accordingly.
+
         Parameters:
-            template (Spatialmap): Optional. A template image to use for the new grid.
-            dx (float): New grid resolution along the x-axis.
-            dy (float): New grid resolution along the y-axis.
-            imsize (list(float)): Optional. The new image size (number of pixels in x- and y-axes)
-            inplace (bool): If True, modify the current image in-place. Otherwise, return a new image.
-        Returns:
-            Spatialmap: The regridded image.
-        """
-        if template is not None:
-            if isinstance(template, (Datacube, Spatialmap)):
-                dx = template.dx  # note: this does not store the same memory address, so no need to copy.
-                dy = template.dy
-            else:
-                raise TypeError("'template' must be a Datacube or Spatialmap instance.")
-        
-        if len(imsize) == 2:
-            dx = -(self.xaxis.max() - self.xaxis.min())/imsize[0]
-            dy = (self.yaxis.max() - self.yaxis.min())/imsize[1]
-
-        # If dx or dy is not provided, raise an error
-        if dx is None or dy is None:
-            raise ValueError("New grid resolution (dx and dy) must be provided " + \
-                              "either directly, via imsize, or via a template.")
+            new_xlim (array-like, optional): New limits for the x-axis (RA), specified as a two-element array [min, max].
+                                             The method will calculate the required padding to achieve these limits.
+                                             Default is None.
             
-        dx = -dx if dx > 0 else dx
-        dy = -dy if dy < 0 else dy
+            new_ylim (array-like, optional): New limits for the y-axis (Dec), specified as a two-element array [min, max].
+                                             The method will calculate the required padding to achieve these limits.
+                                             Default is None.
+            
+            new_imsize (tuple of int, optional): New image size as a tuple (nx, ny), where nx is the new size for the x-axis
+                                                 and ny is the new size for the y-axis. The method will calculate the padding
+                                                 required to reach these dimensions. Default is None.
+            
+            left_pad (int, optional): Number of pixels to pad on the left side of the x-axis. Defaults to None, which implies
+                                      no padding.
+            
+            right_pad (int, optional): Number of pixels to pad on the right side of the x-axis. Defaults to None, which implies
+                                       no padding.
+            
+            top_pad (int, optional): Number of pixels to pad on the top side of the y-axis. Defaults to None, which implies
+                                     no padding.
+            
+            bottom_pad (int, optional): Number of pixels to pad on the bottom side of the y-axis. Defaults to None, which
+                                        implies no padding.
+            
+            fill_value (float, optional): Value to fill the padding region. Default is NaN.
+            
+            inplace (bool, optional): If True, modify the image data in place and return self. If False, return a new instance
+                                      with the modified data. Default is False.
+        
+        Returns:
+            self or new instance: The modified image data with added padding. Returns self if inplace=True; otherwise,
+                                  returns a new instance with the padded data.
 
-        # Compute the new grid
-        new_nx = int((self.xaxis[-1] - self.xaxis[0]) / dx)
-        new_ny = int((self.yaxis[-1] - self.yaxis[0]) / dy)
-        new_xaxis = np.linspace(self.xaxis[0], self.xaxis[-1], new_nx)
-        new_yaxis = np.linspace(self.yaxis[0], self.yaxis[-1], new_ny)
-        new_xx, new_yy = np.meshgrid(new_xaxis, new_yaxis)
+        Raises:
+            ValueError: If any padding value is negative or if no valid padding, limits, or image size are specified.
 
-        # Interpolate the data to the new grid
-        mask = np.isnan(self.data[0, 0])
-        old_xx, old_yy = self.get_xyaxes(grid=True)
-        points = np.array([old_xx[~mask].ravel(), old_yy[~mask].ravel()]).T
-        values = self.data[0, 0][~mask].ravel()
-        new_data = griddata(points, values, (new_yy, new_xx), method=interpolation)
-        new_data = new_data.reshape((1, 1, new_data.shape[0], new_data.shape[1]))
+        Warnings:
+            If the padding difference for a new image size is an odd number, a warning is raised, indicating potential 
+            uneven padding.
 
-        # Update header information
-        new_header = copy.deepcopy(self.header)
-        new_header['shape'] = new_data.shape
-        new_header['refnx'] = new_nx/2 + 1
-        new_header['refnx'] = new_ny/2 + 1
-        new_header['dx'] = dx
-        new_header['dy'] = dy
-        new_header['nx'] = new_nx
-        new_header['ny'] = new_ny
+        Example usage:
+            # Assuming `image` is an instance with the method `pad`
 
-        # Create new Spatialmap instance
-        regridded_map = Spatialmap(header=new_header, data=new_data)
+            # Add padding to achieve new axis limits
+            new_image = image.pad(new_xlim=[10, 50], new_ylim=[-20, 30])
 
-        # Modify the current image in-place if requested
-        if inplace:
-            self.data = new_data
-            self.header = new_header
-            self.__updateparams()  # Update parameters based on new data
-            return self
-        return regridded_map
+            # Add padding to achieve a new image size
+            new_image = image.pad(new_imsize=(100, 200))
+
+            # Add specific padding to each side
+            new_image = image.pad(left_pad=5, right_pad=5, top_pad=10, bottom_pad=10)
+
+            # Add padding in place
+            image.pad(left_pad=5, right_pad=5, inplace=True)
+
+        Notes:
+            This method modifies the reference coordinates (RA, Dec) of the image data to account for the added padding.
+            The new reference coordinates are recalculated based on the new position of the reference pixels.
+        """
+        # get attributes
+        xaxis = self.xaxis
+        yaxis = self.yaxis
+        dx = self.dx 
+        dy = self.dy
+        
+        # check whether parameters are specified:
+        params = (new_xlim, new_ylim, new_imsize, left_pad, right_pad, top_pad, bottom_pad)
+        if all(param is None for param in params):
+            raise ValueError("You must specify at least one of the following: " + \
+                             "new_xlim, new_ylim, new_imsize, or any of the padding " + \
+                             "values (left_pad, right_pad, top_pad, bottom_pad).")
+        
+        if new_imsize is not None:
+            x_diff = new_imsize[0] - xaxis.size
+            if x_diff % 2:  # if difference is odd number
+                warnings.warn("Padding difference for x-axis is an odd number; " + \
+                              "this may lead to uneven padding.")
+                left_pad = x_diff // 2 + 1
+            else:
+                left_pad = x_diff // 2
+            right_pad = x_diff // 2
+            
+            y_diff = new_imsize[1] - yaxis.size
+            if y_diff % 2:  # if difference is odd number
+                warnings.warn("Padding difference for y-axis is an odd number; " + \
+                              "this may lead to uneven padding.")
+                bottom_pad = y_diff // 2 + 1
+            else:
+                bottom_pad = y_diff // 2 
+            top_pad = y_diff // 2
+        
+        if new_xlim is not None:
+            new_xlim = np.array(new_xlim)
+            left_pad = (new_xlim.max() - xaxis.max())/-dx
+            left_pad = _true_round_whole(left_pad)
+            right_pad = (xaxis.min() - new_xlim.min())/-dx
+            right_pad = _true_round_whole(right_pad)
+            
+        if new_ylim is not None:
+            new_ylim = np.array(new_ylim)
+            top_pad = (new_ylim.max() - yaxis.max())/dy
+            top_pad = _true_round_whole(top_pad)
+            bottom_pad = (yaxis.min() - new_ylim.min())/dy
+            bottom_pad = _true_round_whole(bottom_pad)
+        
+        # set to default values (0) if not specified
+        if left_pad is None:
+            left_pad = 0
+        if right_pad is None:
+            right_pad = 0
+        if top_pad is None:
+            top_pad = 0
+        if bottom_pad is None:
+            bottom_pad = 0
+            
+        # raise value error if number of pad is negative
+        if any(num < 0 for num in (top_pad, bottom_pad, left_pad, right_pad)):
+            raise ValueError("Padding values cannot be negative.")
+            
+        # add padding to new data
+        pad_width = ((0, 0), (bottom_pad, top_pad), (left_pad, right_pad))
+        new_data = np.pad(self.data[0],  # three-dimensional
+                          pad_width=pad_width, 
+                          mode="constant", 
+                          constant_values=fill_value)
+        new_data = new_data[np.newaxis, :, :, :]  # add stokes axis 
+        
+        # calculate new cell sizes and reference pixels
+        new_nx = new_data.shape[3]
+        new_refnx = new_nx // 2 + 1
+        new_ny = new_data.shape[2]
+        new_refny = new_ny // 2 + 1
+        
+        # calculate new reference coordinate
+        current_refcoord = SkyCoord(self.refcoord)
+        current_ra = current_refcoord.ra
+        current_dec = current_refcoord.dec
+
+        new_ra = current_ra + (right_pad-left_pad+1)*dx*u.Unit(self.unit)
+        new_dec = current_dec + (top_pad-bottom_pad+1)*dy*u.Unit(self.unit)
+        new_refcoord = SkyCoord(ra=new_ra, dec=new_dec).to_string("hmsdms")
+        
+        # update stuff
+        image = self if inplace else self.copy()
+        image.data = new_data
+        image.overwrite_header(nx=new_nx, refnx=new_refnx, 
+                               ny=new_ny, refny=new_refny,
+                               refcoord=new_refcoord,
+                               shape=new_data.shape,
+                               )
+        return image
+
+    def imregrid(self, template, interpolation="linear", inplace=False):
+        """
+        Regrids the image to match the grid of a template image.
+
+        This method adjusts the image to have the same coordinate grid as the template image by shifting, trimming, and/or padding
+        the image data, and then regridding the data using interpolation.
+
+        Parameters:
+            template (Spatialmap or Datacube): The template image whose grid will be matched. Must be an instance of Spatialmap or Datacube.
+            
+            interpolation (str, optional): The interpolation method to use for regridding. Options include "linear", "nearest", and "cubic". 
+                                           Default is "linear".
+            
+            inplace (bool, optional): If True, modifies the image in place and returns self. If False, returns a new instance with the regridded data.
+                                      Default is False.
+
+        Returns:
+            self or new instance: The regridded image. Returns self if inplace=True; otherwise, returns a new instance with the regridded data.
+
+        Raises:
+            ValueError: If the template is not an instance of Spatialmap or Datacube.
+            Exception: If inconsistent padding and trimming conditions are detected.
+
+        Example usage:
+            # Assuming `image` is an instance with the method `imregrid` and `template` is a Spatialmap or Datacube instance
+
+            # Regrid the image to match the template
+            new_image = image.imregrid(template)
+
+            # Regrid the image with cubic interpolation and modify in place
+            image.imregrid(template, interpolation="cubic", inplace=True)
+        
+        Notes:
+            - The method first shifts the image to the new reference coordinate of the template.
+            - The image is then trimmed or padded to match the limits and size of the template.
+            - Finally, the image data is regridded using the specified interpolation method to match the template grid.
+        """
+        image = self if inplace else self.copy()
+
+        if not isinstance(template, (Spatialmap, Datacube)):
+            raise ValueError("Template must be an instance of 'Spatialmap' or 'Datacube'.")
+
+        new_dx = template.dx
+        new_dy = template.dy 
+
+        if self.unit != template.unit:
+            conversion_factor = (1*u.Unit(template.unit)).to_value(self.unit)
+            new_dx *= conversion_factor
+            new_dy *= conversion_factor
+
+        # first shift the image to new coordinate
+        image.imshift(template, inplace=True)
+
+        # change cell size of data through interpolation
+        image = _change_cell_size(image=image,
+                                  dx=new_dx,
+                                  dy=new_dy,
+                                  interpolation=interpolation,
+                                  inplace=True)
+
+        # trim/pad limits of the image
+        image = _match_limits(image=image, template_image=template, inplace=True)
+        
+        return image
     
-    def normalize(self, range=[0, 1], inplace=False):
+    def normalize(self, valrange=None, template=None, inplace=False):
         """
         Normalize the data of the spatial map to a specified range.
         Parameters:
-            range (list/tuple): The range [min, max] to which the data will be normalized. Default is [0, 1].
+            valrange (list/tuple): The range [min, max] to which the data will be normalized. Default is [0, 1].
             inplace (bool): If True, modify the data in-place. 
                             If False, return a new Spatialmap instance. Default is False.
         Returns:
             The normalized image, either as a new instance or the same instance based on the 'inplace' parameter.
         """
-
+        if template is None:
+            if valrange is None:
+                valrange = [0, 1]
+        else:
+            valrange = [np.nanmin(template), np.nanmax(template)]
+        
         # Extracting min and max from the range
-        min_val, max_val = range
+        min_val, max_val = valrange
 
         # Normalization formula: (data - min(data)) / (max(data) - min(data)) * (max_val - min_val) + min_val
         data_min, data_max = np.nanmin(self.data), np.nanmax(self.data)
@@ -3360,6 +4010,8 @@ class Spatialmap:
             width = u.Quantity(width, unit) / u.Quantity(np.abs(self.dx), self.unit)
             k = Box2DKernel(width=width)
             newbeam = None
+        else:
+            raise ValueError("'kernel' must be 'gauss' or 'box'.")
         
         # start convolving
         print("Convolving...")
@@ -3474,12 +4126,18 @@ class Spatialmap:
         total_flux = np.nansum(fitted_model)
         print(15*"#"+"2D Gaussian Fitting Results"+15*"#")
         if not shiftcenter:
-            print("center: (%.4f +/- %.4f, %.4f +/- %.4f) [arcsec]"%(popt[0], perr[0], popt[1], perr[1]))
+            print(f"center: ({popt[0]:.4f} +/- {perr[0]:.4f}, {popt[1]:.4f} +/- {perr[1]:.4f}) [arcsec]")
         print("center (J2000): " + center_J2000)
-        print("amplitude: %.4f +/- %.4f "%(popt[2], perr[2]) + f"[{(self.bunit).replace('.', ' ')}]")
-        print("total flux: %.4f "%total_flux + f"[{(self.bunit).replace('.', ' ')}]")
-        print("FWHM: %.4f +/- %.4f x %.4f +/- %.4f [arcsec]"%(popt[3], perr[3], popt[4], perr[4]))
-        print("P.A.: %.4f +/- %.4f [deg]"%(popt[5], perr[5]))
+        print(f"amplitude: {popt[2]:.4f} +/- {perr[2]:.4f} [{(self.bunit).replace('.', ' ')}]")
+        print(f"total flux: {total_flux:.4f} [{(self.bunit).replace('.', ' ')}]")
+        print(f"FWHM: {popt[3]:.4f} +/- {perr[3]:.4f} x {popt[4]:.4f} +/- {perr[4]:.4f} [arcsec]")
+
+        # calculate deconvolved size:
+        deconvolved_x = np.sqrt(popt[3]**2 - _get_beam_dim_along_pa(*self.beam, popt[5]+90)**2)
+        deconvolved_y = np.sqrt(popt[4]**2 - _get_beam_dim_along_pa(*self.beam, popt[5])**2)
+        print(f"Deconvolved size: {deconvolved_x:.4f} x {deconvolved_y:.4f} [arcsec]")
+
+        print(f"P.A.: {popt[5]:.4f} +/- {perr[5]:.4f} [deg]")
         print(57*"#")
         print()
         regionfov = 0. if region is None else region.semimajor
@@ -3634,7 +4292,7 @@ class Spatialmap:
             area = area.to_value(unit)
         return area
     
-    def conv_unit(self, unit, inplace=False):
+    def conv_unit(self, unit, inplace=True):
         """
         This method converts the axis unit of the image into the desired unit.
         Parameters:
@@ -3661,7 +4319,7 @@ class Spatialmap:
         newheader["unit"] = _apu_to_headerstr(_to_apu(unit))
         return Spatialmap(header=newheader, data=self.data)
     
-    def conv_bunit(self, bunit, inplace=False):
+    def conv_bunit(self, bunit, inplace=True):
         """
         This method converts the brightness unit of the image into the desired unit.
         Parameters:
@@ -3923,19 +4581,23 @@ class Spatialmap:
             return rms, mask
         return rms
             
-    def imview(self, contourmap=None, title=None, fov=None, vmin=None, vmax=None, percentile=None,
-               scale="linear", gamma=1.5, crms=None, clevels=np.arange(3, 21, 3), tickscale=None, 
-               scalebaron=True, distance=None, cbarlabelon=True, cbarlabel=None, xlabelon=True,
-               ylabelon=True, center=(0., 0.), dpi=600, ha="left", va="top", titleloc=(0.1, 0.9), 
-               cmap=None, fontsize=10, cbarwidth="5%", width=330, height=300, smooth=None, scalebarsize=None, 
-               nancolor=None, beamcolor=None, ccolors=None, clw=0.8, txtcolor=None, cbaron=True, cbarpad=0., 
-               tickson=True, labelcolor="k", tickcolor="k", labelsize=10., ticksize=3., title_fontsize=12, 
-               cbartick_length=3., cbartick_width=1., beamon=True, scalebar_fontsize=10,
+    def imview(self, contourmap=None, title=None, fov=None,  coloron=True, contouron=None,
+               vmin=None, vmax=None, percentile=None, scale="linear", gamma=1.5, crms=None, 
+               clevels=np.arange(3, 21, 3), tickscale=None, scalebaron=True, distance=None, 
+               cbarlabelon=True, cbarlabel=None, xlabelon=True, ylabelon=True, center=(0., 0.), 
+               dpi=600, ha="left", va="top", titleloc=(0.1, 0.9), cmap=None, fontsize=10, 
+               cbarwidth="5%", width=330, height=300, smooth=None, scalebarsize=None, 
+               nancolor=None, beamon=True, beamcolor=None, contour_beamcolor=None, 
+               contour_beamon=None, beamloc=(0.1225, 0.1225), contour_beamloc=None, 
+               ccolors=None, clw=0.8, txtcolor=None, cbaron=True, cbarpad=0., tickson=True, 
+               labelcolor="k", tickcolor="k", labelsize=10., ticksize=3., tickwidth=None, 
+               title_fontsize=12, cbartick_length=3., cbartick_width=None, scalebar_fontsize=10, 
                axeslw=1., scalecolor=None, scalelw=1., cbarloc="right", xlim=None, ylim=None, 
-               cbarticks=None, beamloc=(0.1225, 0.1225), vcenter=None, vrange=None, aspect_ratio=1, 
-               barloc=(0.85, 0.15), barlabelloc=(0.85, 0.075), decimals=2, ax=None, plot=True):
+               cbarticks=None, cbartick_direction="in", vcenter=None, vrange=None, 
+               aspect_ratio=1, barloc=(0.85, 0.15), barlabelloc=(0.85, 0.075), linthresh=1, 
+               beam_separation=0.04, linscale=1, decimals=2, ax=None, savefig=None, plot=True):
         """
-        Method to plot the 2D image.
+        Method to plot the 2D spatial map (moment maps, continuum maps, etc.).
         Parameters:
             contourmap (Spatialmap): the image to be plotted as contour. Set to "None" to not add a contour.
             title (str): the title text to be plotted
@@ -3984,24 +4646,44 @@ class Spatialmap:
             scalecolor (str): the color of the scale bar
             scalelw (float): the line width of the scale bar
             orientation (str): the orientation of the color bar
+            savefig (dict): list of keyword arguments to be passed to 'plt.savefig'.
             plot (bool): True to show the plot
         Returns:
             The 2D image ax object.
         """
         # set parameters to default values
+        if cbartick_width is None:
+            cbartick_width = axeslw
+        
+        if tickwidth is None:
+            tickwidth = axeslw
+        
         if cmap is None:
             if _to_apu(self.bunit).is_equivalent(u.Hz) or \
                _to_apu(self.bunit).is_equivalent(u.km/u.s):
-                cmap = 'RdBu_r'
+                cmap = "RdBu_r"
             else:
                 cmap = "inferno"
             
         if ccolors is None:
-            ccolors = "w" if cmap == "inferno" else "k"
+            if not coloron:
+                ccolors = "k"
+            elif cmap == "inferno":
+                ccolors = "w"
+            else:
+                ccolors = "k"
             
         if beamcolor is None:
-            beamcolor = "skyblue" if cmap == "inferno" else "magenta"
-            
+            if cmap == "inferno":
+                beamcolor = "skyblue" 
+            elif cmap == 'RdBu_r':
+                beamcolor = "gray"
+            else:
+                beamcolor = "magenta"
+
+        if contour_beamcolor is None:
+            contour_beamcolor = beamcolor
+
         if txtcolor is None:
             txtcolor = "w" if cmap == "inferno" else "k"
             
@@ -4050,12 +4732,30 @@ class Spatialmap:
             clevels = np.array(clevels)
         
         # copy data and convert data to unitless array, if necessary
-        data = self.data.copy()
+        data = self.data
         if isinstance(data, u.Quantity):
-            data = data.value.copy()
+            data = data.value
         
         # create a copy of the contour map
-        if isinstance(contourmap, Spatialmap):
+        if not coloron and contouron is None:
+            contouron = True
+
+        if contourmap is None:
+            contourmap = self
+            if contouron is None:
+                contouron = False  # default if contour map is not specified
+            if contour_beamon is None:
+                contour_beamon = not coloron
+        else:
+            if contouron is None:
+                contouron = True  # default if contour map is specified
+            if contour_beamon is None:
+                if coloron:
+                    contour_beamon = contouron and (self.beam != contourmap.beam)
+                else:
+                    contour_beamon = contouron
+
+        if contouron and isinstance(contourmap, Spatialmap):
             contourmap = contourmap.copy()
             if contourmap.refcoord != self.refcoord:
                 contourmap = contourmap.imshift(self.refcoord, printcc=False)
@@ -4078,44 +4778,45 @@ class Spatialmap:
         # determine vmin and vmax using percentile if still not specified
         if vmin is None and vmax is None and percentile is not None:
             clipped_data = self.__trim_data(xlim=xlim, ylim=ylim)
-            vmin, vmax = clip_percentile(data=clipped_data, area=percentile, plot=False)
+            vmin, vmax = clip_percentile(data=clipped_data, area=percentile)
             
-        # change default parameters
-        ncols, nrows = 1, 1
-        fig_width_pt  = width*ncols
-        fig_height_pt = height*nrows
-        inches_per_pt = 1.0/72.27                     # Convert pt to inch
-        fig_width     = fig_width_pt * inches_per_pt  # width in inches
-        fig_height    = fig_height_pt * inches_per_pt # height in inches
-        fig_size      = [fig_width, fig_height]
-        params = {'axes.labelsize': fontsize,
-                  'axes.titlesize': fontsize,
-                  'font.size' : fontsize,
-                  'legend.fontsize': fontsize,
-                  'xtick.labelsize': labelsize,
-                  'ytick.labelsize': labelsize,
-                  'xtick.top': True,   # draw ticks on the top side
-                  'xtick.major.top' : True,
-                  'figure.figsize': fig_size,
-                  'font.family': _fontfamily,
-                  'mathtext.fontset': _mathtext_fontset,
-                  'mathtext.tt': _mathtext_tt,
-                  'axes.linewidth' : axeslw,
-                  'xtick.major.width' : 1.0,
-                  "xtick.direction": 'in',
-                  "ytick.direction": 'in',
-                  'ytick.major.width' : 1.0,
-                  'xtick.minor.width' : 0.,
-                  'ytick.minor.width' : 0.,
-                  'xtick.major.size' : 6.,
-                  'ytick.major.size' : 6.,
-                  'xtick.minor.size' : 0.,
-                  'ytick.minor.size' : 0.,
-                  'figure.dpi': dpi,
-                }
-        rcParams.update(params)
+        # change default parameters if ax is None
+        if ax is None:
+            ncols, nrows = 1, 1
+            fig_width_pt  = width*ncols
+            fig_height_pt = height*nrows
+            inches_per_pt = 1.0/72.27                     # Convert pt to inch
+            fig_width     = fig_width_pt * inches_per_pt  # width in inches
+            fig_height    = fig_height_pt * inches_per_pt # height in inches
+            fig_size      = [fig_width, fig_height]
+            params = {'axes.labelsize': fontsize,
+                      'axes.titlesize': fontsize,
+                      'font.size' : fontsize,
+                      'legend.fontsize': fontsize,
+                      'xtick.labelsize': labelsize,
+                      'ytick.labelsize': labelsize,
+                      'xtick.top': True,   # draw ticks on the top side
+                      'xtick.major.top' : True,
+                      'figure.figsize': fig_size,
+                      'font.family': _fontfamily,
+                      'mathtext.fontset': _mathtext_fontset,
+                      'mathtext.tt': _mathtext_tt,
+                      'axes.linewidth' : axeslw,
+                      'xtick.major.width' : 1.0,
+                      "xtick.direction": 'in',
+                      "ytick.direction": 'in',
+                      'ytick.major.width' : 1.0,
+                      'xtick.minor.width' : 0.,
+                      'ytick.minor.width' : 0.,
+                      'xtick.major.size' : 6.,
+                      'ytick.major.size' : 6.,
+                      'xtick.minor.size' : 0.,
+                      'ytick.minor.size' : 0.,
+                      'figure.dpi': dpi,
+                    }
+            rcParams.update(params)
 
-        # set colorbar
+        # set color map
         my_cmap = copy.deepcopy(mpl.colormaps[cmap]) 
         my_cmap.set_bad(color=nancolor) 
         
@@ -4123,7 +4824,7 @@ class Spatialmap:
             fig, ax = plt.subplots(nrows=1, ncols=1, sharex=False, sharey=False)
             plt.subplots_adjust(wspace=0.4)
         
-        if contourmap is not None and crms is None:
+        if contouron and crms is None:
             try:
                 crms = contourmap.noise()
                 bunit = self.bunit.replace(".", " ")
@@ -4132,57 +4833,19 @@ class Spatialmap:
                 contourmap = None
                 print("Failed to estimate RMS noise level of contour map.")
                 print("Please specify base contour level using 'crms' parameter.")
+                print("The contour map will not be plotted.")
         
         # add image
-        if scale.lower() == "linear":
-            climage = ax.imshow(self.data[0, 0], cmap=my_cmap, extent=self.imextent, 
-                                vmin=vmin, vmax=vmax, origin='lower')
-        elif scale.lower() in ("log", "logscale", "logarithm"):
-            if vmin is None:
-                vmin = 3*self.noise()
-            if vmax is None:
-                vmax = np.nanmax(data)
-                if vmax <= 0:
-                    raise Exception("The data only contains negative values. Log scale is not suitable.")
-            climage = ax.imshow(self.data[0, 0], cmap=my_cmap, extent=self.imextent,
-                                norm=colors.LogNorm(vmin=vmin, vmax=vmax), 
-                                origin="lower")
-            if len(cbarticks) == 0:
-                cbarticks = np.linspace(vmin, vmax, 7)[1:-1]
-        elif scale.lower() == "gamma":
-            climage = ax.imshow(self.data[0, 0], cmap=my_cmap, extent=self.imextent, origin="lower",
-                                norm=colors.PowerNorm(gamma=gamma, vmin=vmin, vmax=vmax))
-        else:
-            raise ValueError("Scale must be 'linear', 'log', or 'gamma'.")
+        if coloron:
+            is_logscale: bool = (scale.lower() in ("log", "logscale", "logarithm", "symlog"))
+            ax, climage = _plt_cmap(self, ax, data[0, 0], imextent=self.imextent, 
+                                    cmap=my_cmap, vmin=vmin, vmax=vmax, scale=scale,
+                                    gamma=gamma, linthresh=linthresh, linscale=linscale)
             
-        if cbaron:
-            if cbarlabelon:
-                if cbarlabel is None:
-                    cbarlabel = "(" + _unit_plt_str(_apu_to_str(_to_apu(self.bunit))) + ")"
-            
-            # determine orientation from color bar location
-            if cbarloc.lower() == "right":
-                orientation = "vertical"
-            elif cbarloc.lower() == "top":
-                orientation = "horizontal"
-            else:
-                raise ValueError("'cbarloc' parameter must be either 'right' or 'top'.")
-                
-            divider = make_axes_locatable(ax)
-            ax_cb = divider.append_axes(cbarloc, size=cbarwidth, pad=cbarpad)
-            cb = plt.colorbar(climage, cax=ax_cb, orientation=orientation, ticklocation=cbarloc)
-            if len(cbarticks) > 0:
-                cb.set_ticks(cbarticks)
-                if scale.lower() in ("log", "logscale", "logarithm"):
-                    labels = (f"%.{decimals}f"%label for label in cbarticks)  # generator object
-                    labels = [label[:-1] if label.endswith(".") else label for label in labels]
-                    cb.set_ticklabels(labels)
-            if cbarlabelon:
-                cb.set_label(cbarlabel, fontsize=fontsize)
-            cb.ax.tick_params(labelsize=labelsize, width=cbartick_width, 
-                              length=cbartick_length, direction='in')
-        
-        if contourmap is not None:
+        if cbarlabel is None:
+            cbarlabel = "(" + _unit_plt_str(_apu_to_str(_to_apu(self.bunit))) + ")"
+
+        if contouron:
             contour_data = contourmap.data[0, 0]
             if smooth is not None:
                 contour_data = ndimage.gaussian_filter(contour_data, smooth)
@@ -4230,10 +4893,11 @@ class Spatialmap:
         if tickson:
             ax.tick_params(which='both', direction='in', bottom=True, top=True, left=True, right=True,
                            length=ticksize, colors=tickcolor, labelrotation=0, labelcolor=labelcolor, 
-                           labelsize=labelsize)
+                           labelsize=labelsize, width=tickwidth)
         else:
             ax.tick_params(which='both', direction='in',bottom=False, top=False, left=False, right=False,
-                           colors=tickcolor, labelrotation=0, labelcolor=labelcolor, labelsize=labelsize)
+                           colors=tickcolor, labelrotation=0, labelcolor=labelcolor, labelsize=labelsize,
+                           width=tickwidth)
             
         # set labels
         if xlabelon:
@@ -4242,23 +4906,158 @@ class Spatialmap:
             ax.set_ylabel(f"Relative Dec ({self.unit})", fontsize=fontsize)
         
         # add beam
-        if beamon:
-            ax = self.__addbeam(ax, xlim=xlim, ylim=ylim, beamcolor=beamcolor, 
-                                beamloc=beamloc)
-            
+        if beamon and coloron:
+            ax = self._addbeam(ax, xlim=xlim, ylim=ylim, beamcolor=beamcolor, 
+                               filled=True, beamloc=beamloc)
+        else:
+            if contour_beamloc is None:
+                contour_beamloc = beamloc
+
+        if contour_beamon:
+            if contour_beamloc is None:
+                contour_beamloc = _get_contour_beam_loc(self.beam, contourmap.beam,
+                                                        color_beamloc=beamloc, xlim=xlim, 
+                                                        beam_separation=beam_separation)
+            ax = contourmap._addbeam(ax, xlim=xlim, ylim=ylim, 
+                                     beamcolor=contour_beamcolor,
+                                     filled=False,
+                                     beamloc=contour_beamloc)
+
         # add scale bar
         if scalebaron and distance is not None:
             ax = self.__add_scalebar(ax, xlim=xlim, ylim=ylim, distance=distance, 
                                      size=scalebarsize, scalecolor=scalecolor, scalelw=scalelw, 
                                      fontsize=scalebar_fontsize, barloc=barloc, txtloc=barlabelloc)
-            
-        # aspect ratio
-        ax.set_aspect(aspect_ratio)
         
         # reset field of view
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
+
+        # plot color bar and set aspect ratio  
+        if not coloron:
+            cbaron = False
+            climage = None
+            is_logscale = False
+        ax = _plt_cbar_and_set_aspect_ratio(ax=ax, 
+                                            climage=climage,
+                                            cbarlabelon=cbarlabelon,
+                                            cbarlabel=cbarlabel,
+                                            cbarloc=cbarloc,
+                                            cbaron=cbaron,
+                                            cbarwidth=cbarwidth, 
+                                            cbarpad=cbarpad,
+                                            cbarticks=cbarticks,
+                                            fontsize=fontsize, 
+                                            labelsize=labelsize, 
+                                            cbartick_width=cbartick_width, 
+                                            cbartick_length=cbartick_length, 
+                                            cbartick_direction=cbartick_direction, 
+                                            aspect_ratio=aspect_ratio, 
+                                            is_logscale=is_logscale, 
+                                            decimals=decimals)
         
+        # save figure if parameters were specified
+        if savefig:
+            plt.savefig(**savefig)
+        
+        # plot image
+        if plot:
+            plt.show()
+            
+        return ax
+
+    def add_contour(self, ax, crms=None, clevels=np.arange(3, 21, 3), 
+                    beamon=True, beamcolor=None, beamloc=None, 
+                    ccolors="limegreen", smooth=None, clw=0.8, 
+                    beam_separation=0.04, zorder=None, plot=False):
+        """
+        Add contour of data to a matplotlib image.
+
+        This function adds a contour plot to an existing matplotlib axis. It does not take 
+        into account the center of the original image, so make sure the center of the 
+        contour aligns with your desired center.
+
+        Parameters:
+            ax (matplotlib.axes._axes.Axes): The matplotlib axis instance on which the 
+                                             contour will be added.
+            crms (float, optional): The base contour level. If not specified, it will be 
+                                    estimated using the `self.noise()` method.
+            clevels (array-like, optional): The contour levels to be used. Defaults to 
+                                            np.arange(3, 21, 3).
+            beamon (bool, optional): If True, a beam will be added to the plot. Defaults to True.
+            beamcolor (str or None, optional): Color of the beam. If None, it will be set 
+                                               to the same as `ccolors`. Defaults to None.
+            beamloc (tuple or None, optional): Location of the beam. If None, it will be 
+                                               calculated. Defaults to None.
+            ccolors (str, optional): Color of the contour lines. Defaults to "limegreen".
+            smooth (float or None, optional): Standard deviation for Gaussian kernel to smooth 
+                                              the data. If None, no smoothing is applied. 
+                                              Defaults to None.
+            clw (float, optional): Line width of the contour lines. Defaults to 0.8.
+            beam_separation (float, optional): Separation between beams if multiple are present. 
+                                               Defaults to 0.04.
+            plot (bool, optional): If True, `plt.show()` will be called to display the plot. 
+                                   Defaults to False.
+
+        Returns:
+            ax (matplotlib.axes._axes.Axes): The axis with the added contour.
+        """
+        # estimate rms noise level if it is not specified.
+        if crms is None:
+            try:
+                crms = self.noise()
+                bunit = self.bunit.replace(".", " ")
+                print(f"Estimated base contour level (rms): {crms:.4e} [{bunit}]")
+            except Exception:
+                raise Exception("Failed to estimate RMS noise level of contour map. " + \
+                    "Please specify base contour level using 'crms' parameter.")
+
+        # set beam color to be the same as the contour colors
+        if beamcolor is None:
+            beamcolor = ccolors
+
+        # get limits
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+
+        # plot contour
+        contextent = [self.imextent[2], self.imextent[3], 
+                     self.imextent[0], self.imextent[1]]
+        contdata = self.data[0, 0, :, :].copy()
+
+        # smooth parameter
+        if smooth is not None:
+            contdata = ndimage.gaussian_filter(contdata, smooth)
+
+        ax.contour(contdata, colors=ccolors, origin='lower', extent=contextent, 
+                   levels=crms*clevels, linewidths=clw, zorder=zorder)
+
+        if beamon:
+            if beamloc is None:
+                # get information of rightmost beam (as reference):
+                bottom_quarter_cutoff = 0.25*(ylim[1]-ylim[0]) + ylim[0]  # avoids non-beam ellipses 
+                beams = [patch for patch in ax.get_children() if isinstance(patch, patches.Ellipse) and \
+                         ylim[0] <= patch.center[1] <= bottom_quarter_cutoff]
+
+                if len(beams) == 0:
+                    beamloc = (0.1225, 0.1225)
+                else:
+                    normalized_locations = tuple(map(lambda beam: _normalize_location(beam.center, xlim, ylim), beams))
+                    normalized_x = tuple(map(lambda coord: coord[0], normalized_locations))
+                    rightmost_index = np.argmax(normalized_x)
+
+                    ref_beam = beams[rightmost_index]
+                    ref_beamloc = normalized_locations[rightmost_index]
+                    ref_beam_dims = (ref_beam.get_height(), ref_beam.get_width(), -ref_beam.angle)
+                    beamloc = _get_contour_beam_loc(color_beam_dims=ref_beam_dims,
+                                                    contour_beam_dims=self.beam,
+                                                    color_beamloc=ref_beamloc,
+                                                    xlim=xlim,
+                                                    beam_separation=beam_separation)
+            # add beam to ax object
+            ax = self._addbeam(ax, xlim, ylim, beamcolor, 
+                               filled=False, beamloc=beamloc)
+
         if plot:
             plt.show()
             
@@ -4300,14 +5099,8 @@ class Spatialmap:
         dist_au = size*ang2au
         
         # convert absolute to relative
-        xrange = xlim[1] - xlim[0]
-        yrange = ylim[1] - ylim[0]
-        
-        barx = xlim[0] + xrange*barloc[0]
-        bary = ylim[0] + yrange*barloc[1]
-            
-        textx = xlim[0] + xrange*txtloc[0]
-        texty = ylim[0] + yrange*txtloc[1]
+        barx, bary = _unnormalize_location(barloc, xlim, ylim)
+        textx, texty = _unnormalize_location(txtloc, xlim, ylim)
         
         label = str(int(dist_au))+' au'
         ax.text(textx, texty, label, ha='center', va='bottom', 
@@ -4317,27 +5110,99 @@ class Spatialmap:
         
         return ax
         
-    def __addbeam(self, ax, xlim, ylim, beamcolor, beamloc=(0.1225, 0.1225)):
+    def _addbeam(self, ax, xlim, ylim, beamcolor, filled=True, beamloc=(0.1225, 0.1225)):
         """
         This method adds an ellipse representing the beam size to the specified ax.
         """
-        # get axes limits
-        xrange = xlim[1] - xlim[0]
-        yrange = ylim[1] - ylim[0]
-        
         # coordinate of ellipse center 
-        centerx = xlim[0] + beamloc[0]*xrange
-        centery = ylim[0] + beamloc[1]*yrange
-        coords = (centerx, centery)
-        
-        # beam size
-        bmaj, bmin = self.bmaj, self.bmin
+        coords = _unnormalize_location(beamloc, xlim, ylim)
+
+        if np.any(np.isnan(self.beam)):
+            warnings.warn("Beam cannot be plotted as it is not available in the header.")
+            return ax
+
+        # beam dimensions
+        bmaj, bmin, bpa = self.beam
         
         # add patch to ax
-        beam = patches.Ellipse(xy=coords, width=bmin, height=bmaj, fc=beamcolor,
-                               angle=-self.bpa, alpha=1, zorder=10)
+        if filled:
+            beam = patches.Ellipse(xy=coords, width=bmin, height=bmaj, fc=beamcolor,
+                                   ec=beamcolor, angle=-bpa, alpha=1, zorder=10)
+        else:
+            beam = patches.Ellipse(xy=coords, width=bmin, height=bmaj, fc='None',
+                                    ec=beamcolor, linestyle="solid", 
+                                    angle=-bpa, alpha=1, zorder=10)
         ax.add_patch(beam)
         return ax
+
+    def trim(self, template=None, xlim=None, ylim=None, inplace=False):
+        """
+        Trim the image data based on specified x and y axis limits.
+
+        Parameters:
+        template (Spatialmap/Channelmap): The xlim and ylim will be assigned as the the min/max values 
+                                          of the axes of this image.
+        xlim (iterable of length 2, optional): The limits for the x-axis to trim the data.
+                                               If None, no trimming is performed on the x-axis.
+        ylim (iterable of length 2, optional): The limits for the y-axis to trim the data.
+                                               If None, no trimming is performed on the y-axis.
+        inplace (bool, optional): If True, the trimming is performed in place and the original 
+                                  object is modified. If False, a copy of the object is trimmed 
+                                  and returned. Default is False.
+
+        Returns:
+        image: The trimmed image object. If `inplace` is True, the original object is returned 
+               after modification. If `inplace` is False, a new object with the trimmed data is returned.
+
+        Raises:
+        ValueError: If any of `xlim` or `ylim` are provided and are not iterables of length 2.
+
+        Notes:
+        The method uses the `_trim_data` function to perform the actual data trimming. The reference 
+        coordinates are updated based on the new trimmed axes.
+        """
+        warnings.warn("The method 'trim' is still in testing.")
+        if template is not None:
+            xlim = template.xaxis.min(), template.xaxis.max()
+            ylim = template.yaxis.min(), template.yaxis.max()
+
+        image = self if inplace else self.copy()
+
+        new_data, _, new_yaxis, new_xaxis = _trim_data(self.data, 
+                                                       yaxis=self.yaxis,
+                                                       xaxis=self.xaxis,
+                                                       dy=self.dy,
+                                                       dx=self.dx,
+                                                       ylim=ylim,
+                                                       xlim=xlim)
+
+        # get new parameters:
+        new_nx = new_xaxis.size 
+        new_ny = new_yaxis.size 
+        new_shape = new_data.shape
+        new_refnx = new_nx//2 + 1
+        new_refny = new_ny//2 + 1
+
+        # calculate new reference coordinate:
+        org_ref_skycoord = SkyCoord(self.refcoord)
+        org_refcoord_x = org_ref_skycoord.ra
+        org_refcoord_y = org_ref_skycoord.dec
+
+        start_x = org_refcoord_x + u.Quantity(new_xaxis.min(), self.unit)
+        end_x = org_refcoord_x + u.Quantity(new_xaxis.max(), self.unit)
+        new_x = (start_x+end_x+self.dx*u.Unit(self.unit))/2
+
+        start_y = org_refcoord_y + u.Quantity(new_yaxis.min(), self.unit)
+        end_y = org_refcoord_y + u.Quantity(new_yaxis.max(), self.unit)
+        new_y = (start_y+end_y+self.dy*u.Unit(self.unit))/2
+
+        new_refcoord = SkyCoord(ra=new_x, dec=new_y).to_string("hmsdms")
+        # update object:
+        image.data = new_data
+        image.overwrite_header(shape=new_shape, nx=new_nx, ny=new_ny, 
+                               refnx=new_refnx, refny=new_refny, 
+                               refcoord=new_refcoord)
+        return image
     
     def line_info(self, **kwargs):
         """
@@ -4358,7 +5223,48 @@ class Spatialmap:
         """
         self.__updateparams()
         return _get_hduheader(self)
+
+    def get_hdu(self):
+        """
+        Get the primary HDU (astropy object) of the image.
+        """
+        return fits.PrimaryHDU(data=self.data, header=self.get_hduheader())
+
+    def get_wcs(self):
+        """
+        Get the world coordinate system of the image (astropy object.)
+        """
+        return WCS(self.get_hduheader())
     
+    def overwrite_header(self, new_vals=None, **kwargs):
+        """
+        Method to overwrite the existing keys of the header with new values.
+        Parameters:
+            new_vals (dict): a dictionary containing keys and values to be overwritten.
+            **kwargs (dict): keyword arguments that will be overwritten in the header
+        Return:
+            self.header (dict): the updated header 
+        """
+        if new_vals is None and len(kwargs) == 0:
+            raise ValueError("Header cannot be overwritten. Need to input a dictionary or keyword arguments.")
+        if new_vals is not None:
+            if isinstance(new_vals, dict):
+                for key, value in new_vals.items():
+                    if key in self.header:
+                        self.header[key] = value
+                    else:
+                        print(f"'{key}' is not a valid keyword of the header and will be ignored.")
+            else:
+                raise TypeError("Please input a new dictionary as the header.")
+        if len(kwargs) > 0:
+            for key, value in kwargs.items():
+                if key in self.header:
+                    self.header[key] = value
+                else:
+                    print(f"'{key}' is not a valid keyword of the header and will be ignored.")
+        self.__updateparams()
+        return self.header
+                
     def exportfits(self, outname, overwrite=False):
         """
         Save the current image to a FITS file.
@@ -4385,20 +5291,40 @@ class Spatialmap:
         
         # if not overwrite, add (1), (2), (3), etc. to file name before '.fits'
         if not overwrite:
-            i = 1
-            while os.path.exists(outname):
-                if os.path.exists(outname[:-5] + f"({i})" + outname[-5:]):
-                    i += 1
-                else:
-                    outname = outname[:-5] + f"({i})" + outname[-5:]
+            outname = _prevent_overwriting(outname)
         
         # Write to a FITS file
         hdu = fits.PrimaryHDU(data=self.data, header=hdu_header)
         hdu.writeto(outname, overwrite=overwrite)
         print(f"File saved as '{outname}'.")
 
+    def to_casa(self, *args, **kwargs):
+        """
+        Converts the spatial map object into CASA image format. 
+        Wraps the 'importfits' function of casatasks.
 
-# +
+        Parameters:
+            outname (str): The output name for the CASA image file. Must end with ".image".
+            whichrep (int, optional): The FITS representation to convert. Defaults to 0.
+            whichhdu (int, optional): The HDU (Header/Data Unit) number to convert. Defaults to -1.
+            zeroblanks (bool, optional): Replace undefined values with zeros. Defaults to True.
+            overwrite (bool, optional): Overwrite the output file if it already exists. Defaults to False.
+            defaultaxes (bool, optional): Use default axes for the output CASA image. Defaults to False.
+            defaultaxesvalues (str, optional): Default axes values, provided as a string. Defaults to '[]'.
+            beam (str, optional): Beam parameters, provided as a string. Defaults to '[]'.
+
+        Raises:
+            ValueError: If 'outname' is not a string.
+
+        Returns:
+            None
+
+        Example:
+            image.to_casa("output_image")
+        """
+        to_casa(self, *args, **kwargs)
+
+
 class PVdiagram:
     """
     A class for handling FITS position-velocity diagrams in astronomical imaging.
@@ -4483,9 +5409,9 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return PVdiagram(header=self.header, data=self.data+other.data)
         return PVdiagram(header=self.header, data=self.data+other)
     
@@ -4493,9 +5419,9 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return PVdiagram(header=self.header, data=other.data+self.data)
         return PVdiagram(header=self.header, data=other+self.data)
         
@@ -4503,9 +5429,9 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return PVdiagram(header=self.header, data=self.data-other.data)
         return PVdiagram(header=self.header, data=self.data-other)
     
@@ -4513,9 +5439,9 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             if self.bunit != other.bunit:
-                print("WARNING: operation performed on two images with different units.")
+                warnings.warn("operation performed on two images with different units.")
             return PVdiagram(header=self.header, data=other.data-self.data)
         return PVdiagram(header=self.header, data=other-self.data)
         
@@ -4523,7 +5449,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data*other.data)
         return PVdiagram(header=self.header, data=self.data*other)
     
@@ -4531,7 +5457,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=other.data*self.data)
         return PVdiagram(header=self.header, data=other*self.data)
     
@@ -4539,7 +5465,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data**other.data)
         return PVdiagram(header=self.header, data=self.data**other)
         
@@ -4547,7 +5473,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=other.data**self.data)
         return PVdiagram(header=self.header, data=other**self.data)
         
@@ -4555,7 +5481,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data/other.data)
         return PVdiagram(header=self.header, data=self.data/other)
     
@@ -4563,7 +5489,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=other.data/self.data)
         return PVdiagram(header=self.header, data=other/self.data)
         
@@ -4571,7 +5497,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data//other.data)
         return PVdiagram(header=self.header, data=self.data//other)
     
@@ -4579,7 +5505,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=other.data//self.data)
         return PVdiagram(header=self.header, data=other//self.data)
     
@@ -4587,7 +5513,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data%other.data)
         return PVdiagram(header=self.header, data=self.data%other)
     
@@ -4595,7 +5521,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=other.data%self.data)
         return PVdiagram(header=self.header, data=other%self.data)
     
@@ -4603,7 +5529,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data<other.data)
         return PVdiagram(header=self.header, data=self.data<other)
     
@@ -4611,7 +5537,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data<=other.data)
         return PVdiagram(header=self.header, data=self.data<=other)
     
@@ -4619,7 +5545,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data==other.data)
         return PVdiagram(header=self.header, data=self.data==other)
         
@@ -4627,7 +5553,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data!=other.data)
         return PVdiagram(header=self.header, data=self.data!=other)
 
@@ -4635,7 +5561,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data>other.data)
         return PVdiagram(header=self.header, data=self.data>other)
         
@@ -4643,7 +5569,7 @@ class PVdiagram:
         if isinstance(other, PVdiagram):
             if self.resolution is not None and other.resolution is not None:
                 if np.round(self.resolution, 1) != np.round(other.resolution, 1):
-                    print("WARNING: operation performed on two images with significantly different beam sizes.")
+                    warnings.warn("operation performed on two images with significantly different beam sizes.")
             return PVdiagram(header=self.header, data=self.data>=other.data)
         return PVdiagram(header=self.header, data=self.data>=other)
 
@@ -4664,7 +5590,7 @@ class PVdiagram:
             try:
                 return PVdiagram(header=self.header, data=self.data[indices])
             except:
-                print("WARNING: Returning value after reshaping image data to 2 dimensions.")
+                warnings.warn("Returning value after reshaping image data to 2 dimensions.")
                 return self.data.copy[:, indices[0], indices[1]]
         except:
             return self.data[indices]
@@ -4699,6 +5625,82 @@ class PVdiagram:
         
     def __array__(self, *args, **kwargs):
         return np.array(self.data, *args, **kwargs)
+
+    def min(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the minimum value of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's min function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's min function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the minimum.
+
+        Returns:
+            scalar or array: Minimum value of the data array. If the data array is multi-dimensional, 
+                             returns an array of minimum values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nanmin(self.data, *args, **kwargs)
+        return np.min(self.data, *args, **kwargs)
+
+    def max(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the maximum value of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's max function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's max function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the maximum.
+
+        Returns:
+            scalar or array: Maximum value of the data array. If the data array is multi-dimensional, 
+                             returns an array of maximum values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nanmax(self.data, *args, **kwargs)
+        return np.max(self.data, *args, **kwargs)
+
+    def mean(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the mean value of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's mean function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's mean function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the mean.
+
+        Returns:
+            scalar or array: Mean value of the data array. If the data array is multi-dimensional, 
+                             returns an array of mean values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nanmean(self.data, *args, **kwargs)
+        return np.mean(self.data, *args, **kwargs)
+
+    def sum(self, *args, ignore_nan=True, **kwargs):
+        """
+        Calculate the sum of the data array.
+
+        Parameters:
+            *args: tuple, optional
+                Additional arguments passed to numpy's sum function.
+            **kwargs: dict, optional
+                Additional keyword arguments passed to numpy's sum function.
+            ignore_nan (bool): Default is True. If True, ignores NaN values when computing the sum.
+
+        Returns:
+            scalar or array: Sum of the data array. If the data array is multi-dimensional, 
+                             returns an array of sum values along the specified axis.
+        """
+        if ignore_nan:
+            return np.nansum(self.data, *args, **kwargs)
+        return np.sum(self.data, *args, **kwargs)
     
     def to(self, unit, *args, **kwargs):
         """
@@ -4750,6 +5752,8 @@ class PVdiagram:
         """
         vaxis = np.linspace(self.vrange[0], self.vrange[1], self.nchan)
         if specunit is None:
+            if self.specunit == "km/s":
+                vaxis = np.round(vaxis, 7)
             return vaxis
         try:
             # attempt direct conversion
@@ -4764,7 +5768,7 @@ class PVdiagram:
             return vaxis
         return vaxis
     
-    def conv_specunit(self, specunit, inplace=False):
+    def conv_specunit(self, specunit, inplace=True):
         """
         Convert the spectral axis into the desired unit.
         """
@@ -4794,7 +5798,7 @@ class PVdiagram:
         newimg.data = data
         return newimg
     
-    def set_threshold(self, threshold=None, minimum=True, inplace=False):
+    def set_threshold(self, threshold=None, minimum=True, inplace=True):
         """
         To mask the intensities above or below this threshold.
         Parameters:
@@ -4904,7 +5908,7 @@ class PVdiagram:
             return rms, mask
         return rms
 
-    def conv_unit(self, unit, inplace=False):
+    def conv_unit(self, unit, inplace=True):
         """
         This method converts the axis unit of the image into the desired unit.
         Parameters:
@@ -4929,7 +5933,7 @@ class PVdiagram:
         newheader["unit"] = _apu_to_headerstr(_to_apu(unit))
         return PVdiagram(header=newheader, data=self.data)
     
-    def conv_bunit(self, bunit, inplace=False):
+    def conv_bunit(self, bunit, inplace=True):
         """
         This method converts the brightness unit of the image into the desired unit.
         Parameters:
@@ -4980,139 +5984,66 @@ class PVdiagram:
         newimage.header["bunit"] = _apu_to_headerstr(bunit)
         newimage.__updateparams()
         return newimage
-    
-#     def __mean_velocities_at_position(self, data):
-#         # initialize variables
-#         vaxis = self.vaxis.copy()
-#         nv = self.nv
-#         nx = self.nx
 
-#         # broadcast vaxis
-#         vv = vaxis[:, None]
-#         vv = np.broadcast_to(vv, (nv, nx))
-        
-#         # mean velocity at each position, weighted by intensity
-#         mean_vel = np.nansum(vv*data, axis=0)/np.nansum(data, axis=0)  # size: nx
-        
-#         # calculate error
-#         N = np.count_nonzero(~np.isnan(data), axis=0)  # number of observations
-#         weighted_sqdev = data*(vv-mean_vel[None, :])**2  # weighted deviations squared
-#         weighted_var = np.nansum(weighted_sqdev, axis=0)/np.nansum(data, axis=0)  # weighted variance
-#         weighted_sd = np.sqrt(weighted_var)
-#         std_err = weighted_sd / np.sqrt(N-1)
-        
-#         return mean_vel, std_err
-        
-#     def __mean_positions_at_velocity(self, data):
-#         # intiialize variables
-#         xaxis = self.xaxis.copy()
-#         nv = self.nv
-#         nx = self.nx
+    def beam_area(self, unit=None):
+        """
+        To calculate the beam area of the image.
+        Parameters:
+            unit (float): the unit of the beam area to be returned. 
+                          Default (None) is to use same unit as the positional axes.
+        Returns:
+            The beam area.
+        """
+        bmaj = u.Quantity(self.bmaj, self.unit)
+        bmin = u.Quantity(self.bmin, self.unit)
+        area = np.pi*bmaj*bmin/(4*np.log(2))
+        if unit is not None:
+            area = area.to_value(unit)
+        return area
 
-#         # broadcast vaxis
-#         xx = xaxis[None, :]
-#         xx = np.broadcast_to(xx, (nv, nx))
-        
-#         # mean velocity at each position, weighted by intensity
-#         mean_offset = np.nansum(xx*data, axis=1)/np.nansum(data, axis=1)  # size: nv
-        
-#         # calculate standard error
-#         N = np.count_nonzero(~np.isnan(data), axis=1)  # number of observations
-#         weighted_sqdev = data*(xx-mean_offset[:, None])**2  # weighted deviations squared
-#         weighted_var = np.nansum(weighted_sqdev, axis=1)/np.nansum(data, axis=1)  # weighted variance
-#         weighted_sd = np.sqrt(weighted_var)
-#         std_err = weighted_sd / np.sqrt(N-1)
-        
-#         return mean_offset, std_err
-    
-#     def __plot_PV_points(self, ax, vsys=0, vlim=None, xlim=None, threshold=None, 
-#                          offset_as_hor=False):
-#         """
-#         Plot measurements on PV diagram
-#         """
-#         # apply threshold if necessary
-#         if threshold is not None:
-#             data = np.where(self.data<threshold, np.nan, self.data)[0]
-#         else:
-#             data = self.data[0]
-        
-#         # mean velocity at position
-#         mean_vel, mean_vel_err = self.__mean_velocities_at_position(data=data)
-#         xaxis = self.xaxis.copy()
-#         if vlim is not None:
-#             vmask = (vlim[0] <= mean_vel) & (mean_vel <= vlim[1])
-#             mean_vel = mean_vel[vmask]
-#             mean_vel_err = mean_vel_err[vmask]
-#             xaxis = xaxis[vmask]
-        
-#         if xlim is not None:
-#             xmask = (xlim[0] <= xaxis) & (xaxis <= xlim[1])
-#             mean_vel = mean_vel[xmask]
-#             mean_vel_err = mean_vel_err[xmask]
-#             xaxis = xaxis[xmask]
-        
-#         if offset_as_hor:
-#             # blueshifted
-#             ax.errorbar(x=xaxis[mean_vel<vsys], y=mean_vel[mean_vel<vsys], 
-#                         yerr=mean_vel_err[mean_vel<vsys], color="skyblue", capsize=3, 
-#                         capthick=1., elinewidth=1., ls='none')
-#             # redshifted
-#             ax.errorbar(x=xaxis[mean_vel>vsys], y=mean_vel[mean_vel>vsys], 
-#                         yerr=mean_vel_err[mean_vel>vsys], color="pink", capsize=3, 
-#                         capthick=1., elinewidth=1., ls='none')
-#         else:
-#             # blueshifted
-#             ax.errorbar(y=xaxis[mean_vel<vsys], x=mean_vel[mean_vel<vsys], 
-#                         xerr=mean_vel_err[mean_vel<vsys], color="skyblue", capsize=3, 
-#                         capthick=1., elinewidth=1., ls='none')
-#             # redshifted
-#             ax.errorbar(y=xaxis[mean_vel>vsys], x=mean_vel[mean_vel>vsys], 
-#                         xerr=mean_vel_err[mean_vel>vsys], color="pink", capsize=3, 
-#                         capthick=1., elinewidth=1., ls='none')
-        
-#         # mean position at velocity
-#         mean_pos, mean_pos_err = self.__mean_positions_at_velocity(data=data)
-        
-#         vaxis = self.vaxis.copy()
-#         if xlim is not None:
-#             xmask = (vlim[0] <= mean_pos) & (mean_pos <= vlim[1])
-#             mean_pos = mean_pos[xmask]
-#             mean_pos_err = mean_pos_err[xmask]
-#             vaxis = vaxis[xmask]
-        
-#         if vlim is not None:
-#             vmask = (vlim[0] <= vaxis) & (vaxis <= vlim[1])
-#             mean_pos = mean_pos[vmask]
-#             mean_pos_err = mean_pos_err[vmask]
-#             vaxis = vaxis[xmask]
+    def get_representative_points(self, threshold=None, vlim=None, xlim=None):
+        vaxis = self.vaxis   # shape: (nv,)
+        xaxis = self.xaxis   # shape: (nx,)
+        data = self.data[0].copy()  # shape: (nv, nx)
+
+        # set values below threshold to NaN
+        if threshold is not None:
+            data[data<threshold] = np.nan 
+
+        # set velocity and position limits
+        if vlim is not None:
+            vmin = min(vlim) - 0.5*abs(self.dv)
+            vmax = max(vlim) + 0.5*abs(self.dv) 
+            vmask = (vmin<=vaxis) & (vaxis<=vmax)
+            vaxis = vaxis[vmask]
+            data = data[vmask, :]
+
+        if xlim is not None:
+            xmin = min(xlim) - abs(0.5*self.dx)
+            xmax = max(xlim) + abs(0.5*self.dx)
+            xmask = (xmin<=xaxis) & (xaxis<=xmax)
+            xaxis = xaxis[xmask]
+            data = data[:, xmask]
             
-#         if offset_as_hor:
-#             # blueshifted
-#             ax.errorbar(x=mean_pos[vaxis<vsys], y=vaxis[vaxis<vsys], 
-#                         xerr=mean_pos_err[vaxis<vsys], color="b", capsize=3, 
-#                         capthick=1., elinewidth=1., ls='none')
-#             # redshifted
-#             ax.errorbar(x=mean_pos[vaxis>vsys], y=vaxis[vaxis>vsys], 
-#                         xerr=mean_pos_err[vaxis>vsys], color="r", capsize=3, 
-#                         capthick=1., elinewidth=1., ls='none')
-#         else:
-#             # blueshifted
-#             ax.errorbar(y=mean_pos[vaxis<vsys], x=vaxis[vaxis<vsys], 
-#                         yerr=mean_pos_err[vaxis<vsys], color="b", capsize=3, 
-#                         capthick=1., elinewidth=1., ls='none')
-#             # redshifted
-#             ax.errorbar(y=mean_pos[vaxis>vsys], x=vaxis[vaxis>vsys], 
-#                         yerr=mean_pos_err[vaxis>vsys], color="r", capsize=3, 
-#                         capthick=1., elinewidth=1., ls='none')
-            
-#         return ax
-            
-#     def plot_measurements(self, vsys=0, pt_vlim=None, pt_xlim=None, threshold=None,
-#                           offset_as_hor=False, **kwargs):
-#         ax = self.imview(vsys=vsys, offset_as_hor=offset_as_hor, plot=False, **kwargs)
-#         ax = self.__plot_PV_points(ax=ax, vsys=vsys, vlim=pt_vlim, xlim=pt_xlim, 
-#                                    threshold=threshold, offset_as_hor=offset_as_hor)
-#         return ax
+        # mean_velocities = np.empty_like(xaxis)
+        # for i in range(mean_velocities.shape[0]):
+        #     mean_velocities[i] = np.average(vaxis, weights=data[:, i])
+        
+        # mean_positions = np.empty_like(vaxis):
+        # for j in range(mean_positions.shape[0]):
+        #     mean_positions[j] = np.average(xaxis, weights=data[j, :])
+
+        # return (mean_velocities, xaxis), (vaxis, mean_positions)
+
+        # Calculate mean velocities
+        sum_weights = np.nansum(data, axis=0)
+        mean_velocities = np.nansum(vaxis[:, np.newaxis] * data, axis=0) / sum_weights
+
+        # Calculate mean positions
+        sum_weights = np.nansum(data, axis=1)
+        mean_positions = np.nansum(xaxis * data, axis=1) / sum_weights
+
+        return (mean_velocities, xaxis), (vaxis, mean_positions)
     
     def __get_offset_resolution(self, pa=None):
         if pa is None:
@@ -5123,15 +6054,17 @@ class PVdiagram:
         return np.sqrt(1/(aa+bb))
         
     def imview(self, contourmap=None, cmap="inferno", vmin=None, vmax=None, nancolor="k", crms=None, 
-               clevels=np.arange(3, 21, 3), ccolor="w", clw=1., dpi=600, cbaron=True, cbarloc="right", 
-               cbarpad="0%", vsys=None, percentile=None, xlim=None, vlim=None, xcenter=0., vlineon=True, 
-               xlineon=True, cbarlabelon=True, cbarwidth='5%', cbarlabel=None, fontsize=10, labelsize=10, 
-               width=330, height=300, plotres=True, xlabelon=True, vlabelon=True, xlabel=None, vlabel=None, 
-               offset_as_hor=False, aspect_ratio=1.15, axeslw=1., tickson=True, tickwidth=1., tickdirection="in", 
-               ticksize=3., tickcolor="k", cbartick_width=1, cbartick_length=3, xticks=None, title_fontsize=12,
-               vticks=None, title=None, titleloc=(0.1, 0.9), ha="left", va="top", txtcolor="w", 
-               refline_color="w", pa=None, refline_width=None, subtract_vsys=False, errbarloc=(0.1, 0.1225), 
-               ax=None, plot=True):
+               clevels=np.arange(3, 21, 3), ccolors="w", clw=1., dpi=600, cbaron=True, cbarloc="right", 
+               cbarpad=0., vsys=None, percentile=None, xlim=None, vlim=None, xcenter=0., vlineon=True, 
+               xlineon=True, cbarlabelon=True, cbarwidth='5%', cbarlabel=None, cbarticks=None, fontsize=10, 
+               labelsize=10, width=330, height=300, plotres=True, xlabelon=True, vlabelon=True, xlabel=None, 
+               vlabel=None, offset_as_hor=False, aspect_ratio=1., axeslw=1., tickson=True, tickwidth=None, 
+               tickdirection="in", ticksize=3., tickcolor="k", cbartick_width=None, cbartick_length=3, 
+               cbartick_direction="in", xticks=None, title_fontsize=12, vticks=None, title=None, 
+               titleloc=(0.1, 0.9), ha="left", va="top", txtcolor="w", refline_color="w", pa=None, 
+               refline_width=None, subtract_vsys=False, errbarloc=(0.1, 0.1225), errbarlw=None, 
+               errbar_captick=None, errbar_capsize=1.5, scale="linear", gamma=1.5, smooth=None, 
+               flip_offset=False, flip_contour_offset=False, decimals=2, ax=None, savefig=None, plot=True):
         """
         Display a Position-Velocity (PV) diagram.
 
@@ -5144,13 +6077,13 @@ class PVdiagram:
             nancolor (str): Color used for NaN values in the data. Default is 'k' (black).
             crms (float, optional): RMS noise level for contour mapping. Automatically estimated if None and contourmap is provided.
             clevels (numpy.ndarray): Contour levels for the contour mapping. Default is np.arange(3, 21, 3).
-            ccolor (str): Color of the contour lines. Default is 'w' (white).
             clw (float): Line width of the contour lines. Default is 1.0.
             dpi (int): Dots per inch for the plot. Affects the quality of the image. Default is 500.
             cbaron (bool): Flag to display the color bar. Default is True.
             cbarloc (str): Location of the color bar. Default is 'right'.
             cbarpad (str): Padding for the color bar. Default is '0%'.
-            vsys (float, optional): Systemic velocity. If provided, adjusts velocity axis accordingly. Default is None.
+            vsys (float, optional): Systemic velocity. If provided, adjusts velocity axis accordingly. 
+                                    Default is None (no systemic velocity).
             xlim (tuple, optional): Limits for the X-axis. Default is None (automatically determined).
             vlim (tuple, optional): Limits for the velocity axis. Default is None (automatically determined).
             xcenter (float): Center position for the X-axis. Default is 0.0.
@@ -5180,22 +6113,43 @@ class PVdiagram:
             txtcolor (str): Color of the text in the plot. Default is 'w' (white).
             refline_color (str): Color of the reference lines. Default is 'w' (white).
             refline_width (float, optional): Line width of the reference lines. Default is None (same as clw).
+            savefig (dict): list of keyword arguments to be passed to 'plt.savefig'.
             plot (bool): Flag to execute the plotting. Default is True.
 
         Returns:
             matplotlib.axes.Axes: The Axes object of the plot if 'plot' is True, allowing further customization.
         """
         # initialize parameters:
+        if tickwidth is None:
+            tickwidth = axeslw
+
+        if cbartick_width is None:
+            cbartick_width = axeslw
+
+        if cbarticks is None:
+            cbarticks = []
+
         if not isinstance(clevels, np.ndarray):
             clevels = np.array(clevels)
+
         if isinstance(self.data, u.Quantity):
             colordata = self.data.value.copy()[0]
         else:
             colordata = self.data.copy()[0]
+
+        if flip_offset:
+            colordata = colordata[:, ::-1]
+
         if pa is None:
             pa = self.pa
+            if self.pa is None:
+                warnings.warn("Position angle is not specified nor known from the header. " + \
+                               "The beam dimension in the error bar will be shown as the geometric " + \
+                               "mean of the beam dimensions.")
+        
         if subtract_vsys and vsys is None:
             raise ValueError("'vsys' parameter cannot be None if subtract_vsys = True.")
+
         if crms is None and contourmap is not None:
             try:
                 crms = contourmap.noise()
@@ -5205,18 +6159,24 @@ class PVdiagram:
                 contourmap = None
                 print("Failed to estimate RMS noise level of contour map.")
                 print("Please specify base contour level using 'crms' parameter.")
+
         if contourmap is not None:
             if isinstance(contourmap.data, u.Quantity):
                 contmap = contourmap.value.copy()
             else:
                 contmap = contourmap.copy()
+            if flip_contour_offset:
+                contmap.data = contmap.data[:, :, ::-1]
+
         if xlim is None:
             xlim = self.maxxlim
+
         if vlim is None:
             if subtract_vsys:
                 vlim = np.array(self.maxvlim)-vsys
             else:
                 vlim = self.maxvlim
+
         if vlabel is None:
             if subtract_vsys:
                 vlabel = r"$v_{\rm obs}-v_{\rm sys}$ " + "(" + _unit_plt_str(_apu_to_str(_to_apu(self.specunit))) + ")"
@@ -5225,55 +6185,67 @@ class PVdiagram:
         
         if xlabel is None:
             xlabel = f'Offset ({self.unit})'
+
         if cbarlabel is None:
             cbarlabel = "(" + _unit_plt_str(_apu_to_str(_to_apu(self.bunit))) + ")"
+
         if refline_width is None:
             refline_width = clw
+
+        if errbarlw is None:
+            errbarlw = axeslw
+
+        if errbar_captick is None:
+            errbar_captick = errbarlw
+
         vres, xres = self.dv, self.__get_offset_resolution(pa=pa)
         cmap = copy.deepcopy(mpl.colormaps[cmap]) 
         cmap.set_bad(color=nancolor)
                 
         # change default matplotlib parameters
-        ncols, nrows = 1, 1
-        fig_width_pt  = width*ncols
-        fig_height_pt = height*nrows
-        inches_per_pt = 1.0/72.27                     # Convert pt to inch
-        fig_width     = fig_width_pt * inches_per_pt  # width in inches
-        fig_height    = fig_height_pt * inches_per_pt # height in inches
-        fig_size      = [fig_width, fig_height]
-        params = {'axes.labelsize': labelsize,
-                  'axes.titlesize': labelsize,
-                  'font.size': fontsize,
-                  'legend.fontsize': labelsize,
-                  'xtick.labelsize': labelsize,
-                  'ytick.labelsize': labelsize,
-                  'xtick.top': True,   # draw ticks on the top side
-                  'xtick.major.top': True,
-                  'figure.figsize': fig_size,
-                  'figure.dpi': dpi,
-                  'font.family': _fontfamily,
-                  'mathtext.fontset': _mathtext_fontset,
-                  'mathtext.tt': _mathtext_tt,
-                  'axes.linewidth': axeslw,
-                  'xtick.major.width': tickwidth,
-                  'xtick.major.size': ticksize,
-                  'xtick.direction': tickdirection,
-                  'ytick.major.width': tickwidth,
-                  'ytick.major.size': ticksize,
-                  'ytick.direction': tickdirection,
-                  }
-        rcParams.update(params)
-
         if ax is None:
+            ncols, nrows = 1, 1
+            fig_width_pt  = width*ncols
+            fig_height_pt = height*nrows
+            inches_per_pt = 1.0/72.27                     # Convert pt to inch
+            fig_width     = fig_width_pt * inches_per_pt  # width in inches
+            fig_height    = fig_height_pt * inches_per_pt # height in inches
+            fig_size      = [fig_width, fig_height]
+            params = {'axes.labelsize': labelsize,
+                      'axes.titlesize': labelsize,
+                      'font.size': fontsize,
+                      'legend.fontsize': labelsize,
+                      'xtick.labelsize': labelsize,
+                      'ytick.labelsize': labelsize,
+                      'xtick.top': True,   # draw ticks on the top side
+                      'xtick.major.top': True,
+                      'figure.figsize': fig_size,
+                      'figure.dpi': dpi,
+                      'font.family': _fontfamily,
+                      'mathtext.fontset': _mathtext_fontset,
+                      'mathtext.tt': _mathtext_tt,
+                      'axes.linewidth': axeslw,
+                      'xtick.major.width': tickwidth,
+                      'xtick.major.size': ticksize,
+                      'xtick.direction': tickdirection,
+                      'ytick.major.width': tickwidth,
+                      'ytick.major.size': ticksize,
+                      'ytick.direction': tickdirection,
+                      }
+            rcParams.update(params)
+
             fig = plt.figure(figsize=fig_size)
             ax = fig.add_subplot(111)
         
         if percentile is not None:
             trimmed_data = self.__trim_data(xlim=xlim, vlim=vlim)
-            vmin, vmax = clip_percentile(data=trimmed_data, area=percentile, bins="auto", plot=False)
+            vmin, vmax = clip_percentile(data=trimmed_data, area=percentile)
         
         # get data for preparation
         imextent = copy.deepcopy(self.imextent)
+        
+        # check if color map is in log scale
+        is_logscale: bool = (scale.lower() in ("log", "logscale", "logarithm"))
         
         # plot image
         if offset_as_hor:
@@ -5281,16 +6253,27 @@ class PVdiagram:
             if subtract_vsys:
                 imextent[3] -= vsys
                 imextent[4] -= vsys
-            climage = ax.imshow(colordata, cmap=cmap, extent=imextent, 
-                                origin='lower', vmin=vmin, vmax=vmax)
+            ax, climage = _plt_cmap(image_obj=self, 
+                                    ax=ax,
+                                    two_dim_data=colordata,
+                                    imextent=imextent, 
+                                    cmap=cmap,
+                                    vmin=vmin, 
+                                    vmax=vmax,
+                                    scale=scale, 
+                                    gamma=gamma)
+                
             if contourmap is not None:
                 contextent = [contmap.imextent[2], contmap.imextent[3], contmap.imextent[0], contmap.imextent[1]]
                 contdata = contmap.data[0, :, :]
-                ax.contour(contdata, colors=ccolor, origin='lower', extent=contextent, 
+                if smooth is not None:
+                    contdata = ndimage.gaussian_filter(contdata, smooth)
+                ax.contour(contdata, colors=ccolors, origin='lower', extent=contextent, 
                            levels=crms*clevels, linewidths=clw)
-            
-            ax.set_xlabel(xlabel, fontsize=fontsize)
-            ax.set_ylabel(vlabel, fontsize=fontsize)
+            if xlabelon:
+                ax.set_xlabel(xlabel, fontsize=fontsize)
+            if vlabelon:
+                ax.set_ylabel(vlabel, fontsize=fontsize)
             ax.set_xlim(xlim)
             ax.set_ylim(vlim)
             if xticks is not None:
@@ -5311,15 +6294,28 @@ class PVdiagram:
             if subtract_vsys:
                 imextent[0] -= vsys
                 imextent[1] -= vsys
-            climage = ax.imshow(colordata.T, cmap=cmap, extent=imextent, 
-                                origin='lower', vmin=vmin, vmax=vmax)
+                
+            ax, climage = _plt_cmap(image_obj=self, 
+                                    ax=ax,
+                                    two_dim_data=colordata.T,
+                                    imextent=imextent, 
+                                    cmap=cmap,
+                                    vmin=vmin, 
+                                    vmax=vmax,
+                                    scale=scale, 
+                                    gamma=gamma)
+            
             if contourmap is not None:
                 contextent = contmap.imextent
                 contdata = contmap.data[0, :, :].T
-                ax.contour(contdata, colors=ccolor, origin='lower', extent=contextent, 
+                if smooth is not None:
+                    contdata = ndimage.gaussian_filter(contdata, smooth)
+                ax.contour(contdata, colors=ccolors, origin='lower', extent=contextent, 
                            levels=crms*clevels, linewidths=clw)
-            ax.set_xlabel(vlabel, fontsize=fontsize)
-            ax.set_ylabel(xlabel, fontsize=fontsize)
+            if vlabelon:
+                ax.set_xlabel(vlabel, fontsize=fontsize)
+            if xlabelon:
+                ax.set_ylabel(xlabel, fontsize=fontsize)
             ax.set_xlim(vlim)
             ax.set_ylim(xlim)
             if vticks is not None:
@@ -5353,42 +6349,39 @@ class PVdiagram:
             horlim = vlim
             vertlim = xlim
         
-        # color bar
-        if cbaron:
-            # determine orientation based on color bar location
-            if cbarloc.lower() == "right":
-                orientation = "vertical"
-                ax_cb = inset_axes(ax, width=cbarwidth, height='100%', loc='lower left',
-                               bbox_to_anchor=(1.0 + float(cbarpad.strip('%'))*0.01, 0., 1., 1.),
-                               bbox_transform=ax.transAxes, borderpad=0)
-            elif cbarloc.lower() == "top":
-                orientation = "horizontal"
-                ax_cb = inset_axes(ax, width='100%', height=cbarwidth, loc='lower left',
-                       bbox_to_anchor=(0., 1.0 + float(cbarpad.strip('%'))*0.01, 1., 1.),
-                       bbox_transform=ax.transAxes, borderpad=0)
-            else:
-                raise ValueError("'cbarloc' parameter must be eitehr 'right' or 'top'.")
-                
-            cbar = fig.colorbar(climage, cax=ax_cb, pad=cbarpad, 
-                                orientation=orientation, ticklocation=cbarloc.lower())
-            if cbarlabelon:
-                cbar.set_label(cbarlabel, fontsize=fontsize)
-            cbar.ax.tick_params(labelsize=labelsize, width=cbartick_width, 
-                                length=cbartick_length, direction="in")
+        hor_range = horlim[1] - horlim[0]  # horizontal range
+        vert_range = vertlim[1] - vertlim[0]  # vertical range
             
-         # set aspect ratio
-        if aspect_ratio is not None:
-            hor_range = horlim[1]-horlim[0]
-            vert_range = vertlim[1]-vertlim[0]    
-            real_ar = float(np.abs(1/aspect_ratio*hor_range/vert_range))
-            ax.set_aspect(real_ar)
+        # set aspect ratio
+        if cbarlabel is None:
+            cbarlabel = "(" + _unit_plt_str(_apu_to_str(_to_apu(self.bunit))) + ")"
+            
+        # plot color bar and set aspect ratio (helper function)
+        ax = _plt_cbar_and_set_aspect_ratio(ax=ax, 
+                                            climage=climage, 
+                                            cbarlabelon=cbarlabelon,
+                                            cbarlabel=cbarlabel,
+                                            cbarloc=cbarloc,
+                                            cbaron=cbaron,
+                                            cbarwidth=cbarwidth, 
+                                            cbarpad=cbarpad,
+                                            cbarticks=cbarticks,
+                                            fontsize=fontsize, 
+                                            labelsize=labelsize, 
+                                            cbartick_width=cbartick_width, 
+                                            cbartick_length=cbartick_length, 
+                                            cbartick_direction=cbartick_direction, 
+                                            aspect_ratio=aspect_ratio, 
+                                            is_logscale=is_logscale,  # will change in the future 
+                                            decimals=decimals)  # will change
         
         # plot resolution
         if plotres:
             res_x, res_y = (xres, vres) if offset_as_hor else (vres, xres)
             res_x_plt, res_y_plt = ax.transLimits.transform((res_x*0.5, res_y*0.5))-ax.transLimits.transform((0, 0))
-            ax.errorbar(errbarloc[0], errbarloc[1], xerr=res_x_plt, yerr=res_y_plt, color=ccolor, capsize=3, 
-                        capthick=1., elinewidth=1., transform=ax.transAxes)
+            ax.errorbar(errbarloc[0], errbarloc[1], xerr=res_x_plt, yerr=res_y_plt, color=ccolors, 
+                        capsize=errbar_capsize, capthick=errbar_captick, elinewidth=errbarlw, 
+                        transform=ax.transAxes)
            
         # plot title, if necessary
         if title is not None:
@@ -5397,6 +6390,11 @@ class PVdiagram:
             ax.text(x=titlex, y=titley, s=title, ha=ha, va=va, 
                     color=txtcolor, fontsize=title_fontsize)
         
+        # save figure if parameters were specified
+        if savefig:
+            plt.savefig(**savefig)
+            
+        # plot image
         if plot:
             plt.show()
         
@@ -5431,6 +6429,47 @@ class PVdiagram:
         """
         self.__updateparams()
         return _get_hduheader(self)
+
+    def get_hdu(self):
+        """
+        Get the primary HDU (astropy object) of the image.
+        """
+        return fits.PrimaryHDU(data=self.data, header=self.get_hduheader())
+
+    def get_wcs(self):
+        """
+        Get the world coordinate system of the image (astropy object.)
+        """
+        return WCS(self.get_hduheader())
+    
+    def overwrite_header(self, new_vals=None, **kwargs):
+        """
+        Method to overwrite the existing keys of the header with new values.
+        Parameters:
+            new_vals (dict): a dictionary containing keys and values to be overwritten.
+            **kwargs (dict): keyword arguments that will be overwritten in the header
+        Return:
+            self.header (dict): the updated header 
+        """
+        if new_vals is None and len(kwargs) == 0:
+            raise ValueError("Header cannot be overwritten. Need to input a dictionary or keyword arguments.")
+        if new_vals is not None:
+            if isinstance(new_vals, dict):
+                for key, value in new_vals.items():
+                    if key in self.header:
+                        self.header[key] = value
+                    else:
+                        print(f"'{key}' is not a valid keyword of the header and will be ignored.")
+            else:
+                raise TypeError("Please input a new dictionary as the header.")
+        if len(kwargs) > 0:
+            for key, value in kwargs.items():
+                if key in self.header:
+                    self.header[key] = value
+                else:
+                    print(f"'{key}' is not a valid keyword of the header and will be ignored.")
+        self.__updateparams()
+        return self.header
     
     def exportfits(self, outname, overwrite=False):
         """
@@ -5458,20 +6497,1358 @@ class PVdiagram:
         
         # if not overwrite, add (1), (2), (3), etc. to file name before '.fits'
         if not overwrite:
-            i = 1
-            while os.path.exists(outname):
-                if os.path.exists(outname[:-5] + f"({i})" + outname[-5:]):
-                    i += 1
-                else:
-                    outname = outname[:-5] + f"({i})" + outname[-5:]
+            outname = _prevent_overwriting(outname)
         
         # Write to a FITS file
         hdu = fits.PrimaryHDU(data=self.data, header=hdu_header)
         hdu.writeto(outname, overwrite=overwrite)
         print(f"File saved as '{outname}'.")
 
+    def to_casa(self, *args, **kwargs):
+        """
+        Converts the PV diagram object into CASA image format. 
+        Wraps the 'importfits' function of casatasks.
 
-# -
+        Parameters:
+            outname (str): The output name for the CASA image file. Must end with ".image".
+            whichrep (int, optional): The FITS representation to convert. Defaults to 0.
+            whichhdu (int, optional): The HDU (Header/Data Unit) number to convert. Defaults to -1.
+            zeroblanks (bool, optional): Replace undefined values with zeros. Defaults to True.
+            overwrite (bool, optional): Overwrite the output file if it already exists. Defaults to False.
+            defaultaxes (bool, optional): Use default axes for the output CASA image. Defaults to False.
+            defaultaxesvalues (str, optional): Default axes values, provided as a string. Defaults to '[]'.
+            beam (str, optional): Beam parameters, provided as a string. Defaults to '[]'.
+
+        Raises:
+            ValueError: If 'outname' is not a string.
+
+        Returns:
+            None
+
+        Example:
+            image.to_casa("output_image")
+        """
+        to_casa(self, *args, **kwargs)
+
+
+class Plot2D:
+    """
+    A class for handling two-dimensional plots such as SED plots, 
+    spectral/spatial profiles, and intensity distribution diagrams.
+    """
+    def __init__(self, file=None, x=None, y=None, xerr=None, yerr=None,
+                 header=None, bins=None, xlabel=None, xunit=None, 
+                 ylabel=None, yunit=None, pandas=False, delimiter=None, 
+                 xloc=None, yloc=None, comment="#", pd_header=None, 
+                 scale="linear", quiet=False, **kwargs):
+        """
+        Constructor that initializes the Plot2D object with the provided data and parameters.
+
+        Parameters:
+        - file (str, optional): Path to the file containing data.
+        - x (array-like, optional): Data for the x-axis.
+        - y (array-like, optional): Data for the y-axis.
+        - xerr (array-like, optional): Error bars for the x-axis.
+        - yerr (array-like, optional): Error bars for the y-axis.
+        - header (dict, optional): Dictionary containing header information.
+        - bins (int or sequence, optional): Number of bins or bin edges for histograms.
+        - xlabel (str, optional): Label for the x-axis.
+        - xunit (str or astropy.units.Unit, optional): Unit for the x-axis data.
+        - ylabel (str, optional): Label for the y-axis.
+        - yunit (str or astropy.units.Unit, optional): Unit for the y-axis data.
+        - pandas (bool, optional): Whether to use pandas for file reading.
+        - delimiter (str, optional): Delimiter for reading the file.
+        - xloc (int, optional): Column index for x data in the file.
+        - yloc (int, optional): Column index for y data in the file.
+        - comment (str, optional): Character used to indicate the start of a comment in the file.
+        - pd_header (int, optional): Row number to use as the header (and column names) for pandas.
+        - scale (str or tuple, optional): Scale type for the axes ('linear' or 'log').
+        - **kwargs: Additional keyword arguments to be passed to the file reading function.
+
+        Raises:
+        - Exception: If no file, x, or y data is provided.
+        - ValueError: If x or y is 0-sized.
+        """
+        
+        # if nothing is specified, raise Exception
+        if all(var is None for var in (file, x, y)):
+            raise Exception("Please specify the file, x, and/or y.")
+            
+        # read file, if any
+        if file:
+            read_file_results = self.__read_file(file=file, 
+                                                 pandas=pandas, 
+                                                 delimiter=delimiter, 
+                                                 xloc=xloc, 
+                                                 yloc=yloc, 
+                                                 comment=comment, 
+                                                 header=pd_header, 
+                                                 quiet=quiet,
+                                                 **kwargs)
+            xdata,  ydata, xlabel, ylabel, xunit, yunit = read_file_results
+            x = xdata
+        
+        # initialize header
+        init_header = {"filepath": "" if file is None else file,
+                       "imagetype": "Plot2D",
+                       "size": x.size,
+                       "xlabel": "" if xlabel is None else xlabel,
+                       "xunit": "" if not xunit else _apu_to_headerstr(_to_apu(xunit)),
+                       "ylabel": "Counts" if ylabel is None else ylabel,
+                       "yunit": "" if not yunit else _apu_to_headerstr(_to_apu(yunit)),
+                       "scale": (scale.lower(), scale.lower()) if isinstance(scale, str) else scale,
+                       "date": str(dt.datetime.now()).replace(" ", "T"),
+                       "origin": "Generated by Astroviz."}
+        
+        immutable_keys = ("imagetype", "size")
+        if header is not None and isinstance(header, dict):
+            for key, value in header.items():
+                if key in init_header:
+                    if key in immutable_keys and header[key] != init_header[key]:
+                        print(f"'{key}' is an immutable header parameter " + \
+                               "and cannot be modified.")
+                    else:
+                        init_header[key] = value
+                else:
+                    print(f"'{key}' is not a valid header parameter" + \
+                          " and will be ignored.")
+                
+        self.header = init_header
+        
+        # initialize x values
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+        if x.size < 1:
+            raise ValueError("x should not be 0-sized.")
+        if x.ndim > 1:
+            warnings.warn("x is not 1-dimensional and will be flattened.")
+            x = x.flatten()
+        
+        # convert into frequency graph if y is not provided
+        if y is None:
+            self.histogram = True
+            if bins is None:
+                bins = "auto"
+            self.y, self.bins = np.histogram(x, bins=bins)
+            self.yaxis = self.y
+            self.data = x
+            self.xaxis = self.x = (self.bins[:-1] + self.bins[1:]) / 2  # set midpoints as x
+        else:
+            self.histogram = False
+            # if provided, initialize y values
+            if not isinstance(y, np.ndarray):
+                y = np.array(y)
+            if y.size < 1:
+                raise ValueError("y should not be 0-sized.")
+            if y.ndim > 1:
+                warnings.warn("y is not 1-dimensional and will be flattened.")
+                y = y.flatten()
+            
+            # sort by x if x is not sorted
+            if np.all(x[:-1] <= x[1:]):  # check if numpy array is sorted
+                sort_idx = np.argsort(x)
+                x = x[sort_idx]
+                y = y[sort_idx]
+            
+            # assign attributes
+            self.x = self.xaxis = x
+            self.y = self.yaxis = y
+            self.data = (x, y)
+
+        # parse error bars
+        if xerr is not None:
+            xerr = np.array(xerr)  # convert to numpy array
+            if xerr.size != self.x.size:
+                raise ValueError("Length of 'xerr' is different from length of 'x'.")
+        if yerr is not None:
+            yerr = np.array(yerr)  # convert to numpy array
+            if yerr.size != self.y.size:
+                raise ValueError("Length of 'yerr' is different from length of 'y'.")
+
+        self.xerr = xerr  # set as attributes
+        self.yerr = yerr
+
+        if self.x.size != self.y.size:
+            raise ValueError("Length of x is different from length of y.")
+        
+        # match attributes with header information
+        self.__updateparams()
+        
+    def __updateparams(self):
+        self.filepath = self.header["filepath"]
+        self.size = self.header["size"]
+        self.xunit = self.header["xunit"]
+        self.xlabel = self.header["xlabel"]
+        self.yunit = self.header["yunit"]
+        self.ylabel = self.header["ylabel"]
+        self.scale = self.header["scale"]
+            
+    def __len__(self):
+        return self.size
+
+    def max(self, axis="y"):
+        """
+        Public method to compute the maximum value along a specified axis.
+        ------
+        Parameters:
+            axis (str): The axis along which to compute the maximum value.
+                        It should be either 'x' or 'y' and is case-insensitive.
+                        Default is 'y'.
+        Returns:
+            float: The maximum value along the specified axis, ignoring any NaN values.
+        
+        Raises:
+            ValueError: If the provided axis is not 'x' or 'y'.
+        """
+        axis = axis.lower()  # make it case-insensitive
+        if axis == "y":
+            return np.nanmax(self.y)
+        elif axis == "x":
+            return np.nanmax(self.x)
+        raise ValueError(f"Invalid axis '{axis}'. Expected 'x' or 'y'.")
+
+    def min(self, axis="y"):
+        """
+        Public method to compute the minimum value along a specified axis.
+        ------
+        Parameters:
+            axis (str): The axis along which to compute the maximum value.
+                        It should be either 'x' or 'y' and is case-insensitive.
+                        Default is 'y'.
+        Returns:
+            float: The minimum value along the specified axis, ignoring any NaN values.
+        
+        Raises:
+            ValueError: If the provided axis is not 'x' or 'y'.
+        """
+        axis = axis.lower()
+        if axis == "y":
+            return np.nanmin(self.y)
+        elif axis == "x":
+            return np.nanmax(self.x)
+        raise ValueError(f"Invalid axis '{axis}'. Expected 'x' or 'y'.")
+
+    def copy(self):
+        """
+        This method creates a copy of the original image.
+        """
+        return copy.deepcopy(self)
+    
+    def concatenate(self, plot, equivalencies=None, inplace=False):
+        """
+        Public method to concatenate two datasets.
+        ------
+        Parameters:
+            plot (Plot2D): plot to be concatenated
+        Returns:
+            concat_plot (Plot2D): plot that is the concatenation of two datasets.
+        """
+        concat_plot = self if inplace else self.copy()
+        
+        # check if the units of the plots are the same
+        if self.xunit != plot.xunit:
+            # try to convert the units
+            if _to_apu(self.xunit).is_equivalent(_to_apu(plot.xunit), equivalencies=equivalencies):
+                plot = plot.conv_xunit(self.xunit, equivalencies=equivalencies, inplace=False)
+            else:
+                # if that doesn't work, raise an error
+                raise UnitConversionError("The x units of the two plots are not equivalent.")
+            
+        if self.yunit != plot.yunit:
+            # try to convert the units
+            if _to_apu(self.yunit).is_equivalent(_to_apu(plot.yunit), equivalencies=equivalencies):
+                plot = plot.conv_yunit(self.yunit, equivalencies=equivalencies, inplace=False)
+            else:
+                # if that doesn't work, raise an error
+                raise UnitConversionError("The y units of the two plots are not equivalent.")
+            
+        # add the axes if the units are the same
+        new_x = np.concatenate(self.x, plot.x)
+        new_y = np.concatenate(self.y, plot.y)
+        
+        # sort based on x
+        xidx = np.argsort(new_x)
+        new_x = new_x[xidx]
+        new_y = new_y[xidx]
+        
+        # assign to new data
+        concat_plot.x = new_x
+        concat_plot.y = new_y
+        
+        return concat_plot
+        
+    def conv_xunit(self, xunit, equivalencies=None, inplace=True):
+        """
+        Public method to convert the unit of the x data.
+        ------
+        Parameters:
+            xunit (str): the new unit
+            equivalencies (astropy.units.equivalencies): equivalencies needed
+        Returns:
+            image (Plot2D): the plot with the units converted
+        """
+        image = self if inplace else self.copy()
+        current_xunit = 1 * _to_apu(image.xunit)
+        new_xunit = 1 * _to_apu(xunit)
+        conversion_factor = current_xunit.to_value(new_xunit, equivalencies=equivalencies)
+        image.x *= conversion_factor
+        image.header["xunit"] = _apu_to_headerstr(new_xunit.unit)
+        image.__updateparams()
+        return image
+    
+    def conv_yunit(self, yunit, equivalencies=None, inplace=True):
+        """
+        Public method to convert the unit of the y data.
+        ------
+        Parameters:
+            yunit (str): the new unit
+            equivalencies (astropy.units.equivalencies): equivalencies needed
+        Returns:
+            image (Plot2D): the image with the units converted
+        """
+        image = self if inplace else self.copy()
+        current_yunit = 1 * _to_apu(image.yunit)
+        new_yunit = 1 * _to_apu(yunit)
+        conversion_factor = current_xunit.to_value(new_yunit, equivalencies=equivalencies)
+        image.y *= conversion_factor
+        image.header["yunit"] = _apu_to_headerstr(new_yunit.unit)
+        image.__updateparams()
+        return image
+    
+    def set_xlabel(self, xlabel, inplace=True):
+        image = self if inplace else self.copy()
+        image.header["xlabel"] = xlabel
+        image.__updateparams()
+        return image
+    
+    def set_ylabel(self, ylabel, inplace=True):
+        image = self if inplace else self.copy()
+        image.header["ylabel"] = ylabel
+        image.__updateparams()
+        return image
+    
+    def set_xunit(self, xunit, inplace=True):
+        image = self if inplace else self.copy()
+        xunit = _apu_to_headerstr(_to_apu(xunit))
+        image.header["xunit"] = xunit
+        image.__updateparams()
+        return image
+    
+    def set_yunit(self, yunit, inplace=True):
+        image = self if inplace else self.copy()
+        yunit = _apu_to_headerstr(_to_apu(yunit))
+        image.header["yunit"] = yunit
+        image.__updateparams()
+        return image
+    
+    def stats_1d(self) -> None:
+        """
+        View the relevant 1D statistics of the data.
+        """
+        # remove nan values
+        mask = (~np.isnan(self.x)) & (~np.isnan(self.y))
+        xdata = self.x[mask]
+        ydata = self.y[mask]
+        
+        # x-axis
+        x_mean = np.mean(xdata)
+        x_std = np.std(xdata)
+        x_max = np.max(xdata)
+        x_min = np.min(xdata)
+        
+        # y-axis
+        y_mean = np.mean(ydata)
+        y_std = np.std(ydata)
+        y_max = np.max(ydata)
+        y_min = np.min(ydata)
+        
+        # print values
+        print("1D Statistics".center(25, "#"))
+        print("X-axis")
+        if self.xunit:
+            print(f"Mean: {x_mean:.4f} [{self.xunit}]")
+            print(f"SD: {x_std:.4f} [{self.xunit}]")
+            print(f"Min: {x_min:.4f} [{self.xunit}]")
+            print(f"Max: {x_max:.4f} [{self.xunit}]")
+        else:
+            print(f"Mean: {x_mean:.4f}")
+            print(f"SD: {x_std:.4f}")
+            print(f"Min: {x_min:.4f}")
+            print(f"Max: {x_max:.4f}")
+        print()  # skip a line
+        
+        print("Y-axis")
+        if self.yunit:
+            print(f"Mean: {y_mean:.4f} [{self.yunit}]")
+            print(f"SD: {y_std:.4f} [{self.yunit}]")
+            print(f"Min: {y_min:.4f} [{self.yunit}]")
+            print(f"Max: {y_max:.4f} [{self.yunit}]")
+        else:
+            print(f"Mean: {y_mean:.4f}")
+            print(f"SD: {y_std:.4f}")
+            print(f"Min: {y_min:.4f}")
+            print(f"Max: {y_max:.4f}")
+        print(25*"#")
+        
+    def linear(self, x=True, y=True, inplace=True):
+        """
+        Convert the scale of the image from log to linear.
+        ------
+        Parameters:
+            x (bool): True to convert the xaxis to linear scale
+            y (bool): True to convert the yaxis to linear scale
+            inplace (bool): True to modify the object in-place. False to return a new object.
+        Returns:
+            image (Plot2D): the new plot with scales converted.
+        """
+        image = self if inplace else self.copy()
+        
+        if x:
+            if image.header["scale"][0] == "log":
+                image.x = 10**(image.x)
+                image.header["scale"] = ("linear", image.header["scale"][1])
+            elif image.header["scale"][0] == "linear":
+                warnings.warn("the x-axis of the plot is already in " + \
+                      "linear scale and will not be converted.")
+        if y:
+            if image.header["scale"][1] == "log":
+                image.y = 10**(image.y)
+                image.header["scale"] = (image.header["scale"][0], "linear")
+            elif image.header["scale"][1] == "linear":
+                warnings.warn("the y-axis of the plot is already in linear scale " + \
+                      "and will not be converted.")
+        
+        # update parameters to match header
+        image.__updateparams()
+        
+        return image
+        
+    def logscale(self, x=True, y=True, inplace=True):
+        """
+        Convert the scale of the image from linear to log.
+        ------
+        Parameters:
+            x (bool): True to convert the xaxis to log scale
+            y (bool): True to convert the yaxis to log scale
+            inplace (bool): True to modify the object in-place. False to return a new object.
+        Returns:
+            image (Plot2D): the new plot with scales converted
+        """
+        image = self if inplace else self.copy()
+        
+        if x:
+            if image.header["scale"][0] == "linear":
+                image.x = np.log10(image.x)
+                image.header["scale"] = ("log", image.header["scale"][1])
+            elif image.header["scale"][0] == "log":
+                warnings.warn("the x-axis of the plot is already in log scale and will not be converted.")
+        if y:
+            if image.header["scale"][1] == "linear":
+                image.y = np.log10(image.y)
+                image.header["scale"] = (image.header["scale"][0], "log")
+            elif image.header["scale"][1] == "log":
+                warnings.warn("the y-axis of the plot is already in log scale and will not be converted.")
+        
+        # update parameters to match header
+        image.__updateparams()
+        
+        return image
+    
+    def set_threshold(self, threshold, inplace=True):
+        """
+        Public method to remove data points with y values that lie 
+        below the given threshold.
+        threshold (float): the threshold
+        inplace (bool): True to modify the plot in-place. 
+                        False to return a new plot.
+        """
+        image = self if inplace else self.copy()
+        mask = image.y > threshold
+        image.y = image.y[mask]
+        image.x = image.x[mask]
+        return image
+        
+    def trim(self, xlim=None, ylim=None, exclude=False, inplace=False):
+        """
+        Private method to trim the data. 
+        Parameters:
+            xlim (list[float, ...] | list[list[float, float], ...]): range of x values
+            ylim (list[float, ...] | list[list[float, float], ...]): range of y values
+            exclude (bool): True to exclude specified ranges. False to include.
+            inplace (bool): True to modify the plot in-place. False to return a new plot.
+        Returns:
+            image (Plot2D): the trimmed image.
+        """
+        warnings.warn("The method 'trim' is still in testing.")
+        image = self if inplace else self.copy()
+        if xlim is None and ylim is None:
+            warnings.warn("'xlim' and 'ylim' are not specified." + \
+                  "The original image will be returned.")
+            return image
+        else:
+            # convert to numpy arrays
+            xlim = np.array(xlim)
+            ylim = np.array(ylim)
+            
+            mask = np.full(image.x.shape, False)  # initialize mask
+            if xlim is not None:
+                # mask in x direction
+                if xlim.ndim == 1 and xlim.size == 2: 
+                    mask = mask | ((xlim[0]<=image.x)&(image.x<=xlim[1]))
+                elif xlim.ndim == 2:
+                    for (x1, x2) in xlim:
+                        mask = mask | ((x1<=image.x)&(image.x<=x2))
+                else:
+                    raise ValueError("Invalid range of x values provided.")
+                # mask in y direction
+                if ylim.ndim == 1 and ylim.size == 2:
+                    mask = mask | ((ylim[0]<=image.y)&(image.y<=ylim[1]))
+                elif ylim.ndim == 2:
+                    for (y1, y2) in ylim:
+                        mask = mask | ((y1<=image.y)&(image.y<=y2))
+                else:
+                    raise ValueError("Invalid range of y values provided.")
+                    
+            if exclude:
+                mask = ~mask
+                
+            # trim
+            image.x = image.x[mask]
+            image.y = image.y[mask]
+            
+        return image
+    
+    def __read_file(self, file, pandas=False, delimiter=None, 
+                    xloc=None, yloc=None, comment="#", header=None, 
+                    quiet=False, **kwargs):
+        
+        if not os.path.exists(file):
+            if not quiet:
+                print(f"Given directory '{file}' does not exist as a relative directory. " + \
+                       "Recursively finding file...")
+            maybe_filename = _find_file(file)
+        if maybe_filename is not None:
+            file = maybe_filename
+            if not quiet:
+                print(f"Found a matching filename: '{file}'")
+        else:
+            raise FileNotFoundError(f"Filename '{file}' does not exist.")
+        
+        def get_str_between(s: str, start: str, end: str) -> str:
+            start_idx: int = s.find(start)
+            if start_idx == -1:
+                return ""
+            start_idx += len(start)
+            end_idx = s.rfind(end)
+            if end_idx == -1:
+                return ""
+            return s[start_idx:end_idx]
+        
+        if pandas:
+            xunit = xlabel = yunit = ylabel = ""  # initalize values
+            is_spec_profile = False
+            with open(file, "r") as f:
+                for line in f:
+                    lower_line = line.lower()
+                    if "spectral profile" in lower_line:
+                        is_spec_profile = True
+                    if line.startswith("#"):
+                        if "xlabel" in lower_line:
+                            xunit = get_str_between(line, "[", "]")
+                            if is_spec_profile and xunit.lower() == "km/s" \
+                               and "radio velocity" in lower_line:
+                                xlabel = "radio velocity"
+                            else:
+                                xlabel = get_str_between(line, ": ", " [")
+                        elif "ylabel" in lower_line:
+                            yunit = get_str_between(line, "[", "]")
+                            if is_spec_profile and yunit.lower() == "kelvin":
+                                ylabel = "intensity"
+                            else:
+                                ylabel = get_str_between(line, ": ", " [")
+                    else:
+                        break
+                    
+            df = pd.read_csv(file,
+                             delimiter=" " if delimiter is None else delimiter, 
+                             comment=comment, 
+                             header=header,
+                             **kwargs)
+            xdata = np.array(df.iloc[:, (0 if xloc is None else xloc)], dtype=float)
+            ydata = np.array(df.iloc[:, (1 if yloc is None else yloc)], dtype=float)
+        else:
+            with open(file, "r") as f:
+                lines = np.array(f.readlines())
+            lines = np.char.strip(lines, "\n")
+            mask = (np.char.find(lines, comment) == -1)
+            lines_with_data = lines[mask]
+            lines_with_comments = lines[~mask]
+            
+            if delimiter is None:
+                # try different delimiters and see if one of them works!
+                delims_to_try = (" ", "\t", ",", ", ", ":", "/")
+                for delimiter in delims_to_try:
+                    try:
+                        lines_with_data = np.char.split(lines_with_data, delimiter)
+                        lines_with_data = np.array(lines_with_data.tolist(), dtype=float)
+                        xdata = lines_with_data[:, (0 if xloc is None else xloc)]
+                        ydata = lines_with_data[:, (1 if yloc is None else yloc)]
+                        break  # exit loop if there is no exception
+                    except ValueError:
+                        continue  # try next delimiter
+                else:
+                    raise ValueError("None of the delimiters worked " + \
+                                     "to split the data correctly.")
+            else:
+                lines_with_data = np.char.split(lines_with_data, delim)
+                lines_with_data = np.array(lines_with_data.tolist(), dtype=float)
+                xdata = lines_with_data[:, 0]
+                ydata = lines_with_data[:, 1]
+            
+            xunit = xlabel = yunit = ylabel = ""  # initialize values
+            is_spec_profile = False
+            for line in lines_with_comments:
+                lower_line = line.lower()
+                if "spectral profile" in lower_line:
+                    is_spec_profile = True
+                if line.startswith("#"):
+                    if "xlabel" in lower_line:
+                        xunit = get_str_between(line, "[", "]")
+                        if is_spec_profile and xunit.lower() == "km/s" \
+                           and "radio velocity" in lower_line:
+                            xlabel = "radio velocity"
+                        else:
+                            xlabel = get_str_between(line, ": ", " [")
+                    elif "ylabel" in lower_line:
+                        yunit = get_str_between(line, "[", "]")
+                        if is_spec_profile and yunit.lower() == "kelvin":
+                            ylabel = "intensity"
+                        else:
+                            ylabel = get_str_between(line, ": ", " [")
+                else:
+                    break
+        
+        return xdata, ydata, xlabel, ylabel, xunit, yunit
+    
+    def SED(self, distance):
+        """
+        Derive the bolometric temperature and luminosity from the spectral energy distribution.
+        Integration is used rather than fitting.
+        Parameters:
+            distance (float): distance to the target object
+        Returns:
+            mean_freq_GHz (float): the intensity-weighted mean frequency in GHz
+            Tbol (float): the bolometric 
+            Lbol
+        """
+        # get x, y axes, in order of x axis to correctly integrate
+        sort_idx = np.argsort(self.x)
+        x = self.x[sort_idx]
+        y = self.y[sort_idx]
+        
+        # parse units
+        xunit = _to_apu(self.xunit)
+        yunit = _to_apu(self.yunit)
+        
+        # parse frequency axis
+        if xunit.is_equivalent(u.Hz, equivalencies=u.spectral()):
+            freq = x * (1*xunit).to_value(u.Hz, equivalencies=u.spectral())
+        else:
+            raise Exception("Incorrect x-axis unit. " + \
+                            "Must be a unit of frequency (e.g., Hz).")
+            
+        # parse flux axis
+        if yunit.is_equivalent(u.Jy):
+            flux = y * (1*yunit).to_value(u.Jy)
+        elif yunit.is_equivalent(u.Hz*u.Jy, equivalencies=u.spectral()):
+            flux = y * (1*yunit).to_value(u.Hz*u.Jy)
+            flux /= freq
+        else:
+            raise Exception("Incorrect y-axis unit. Must be a unit of flux (e.g., Jy).")
+            
+        # intensity-weighted mean frequency
+        int_flux_dfreq = np.trapz(y=flux, x=freq)  # integrate flux wrt freq
+        mean_freq = np.trapz(y=freq*flux, x=freq)/int_flux_dfreq  # Hz
+        mean_freq_GHz = mean_freq / 1e9
+        
+        # use mean frequency to calculate bolometric temperature
+        Tbol = (1.25e-11 * mean_freq)  # K
+        
+        # bolometric luminosity
+        if isinstance(distance, u.Quantity):
+            if not (distance.unit).is_equivalent(u.pc):
+                raise Exception("Unit of distance provided is not a " + \
+                                "unit of length (e.g., pc).")
+        else:
+            distance *= u.pc
+        Lbol = (4*np.pi*(distance**2) * int_flux_dfreq*u.Jy*u.Hz).to_value(u.Lsun)
+        
+        # print results
+        print("Spectral Energy Distribution".center(40, "#"))
+        print(f"Mean frequency: {(mean_freq_GHz):.4f} [GHz]")
+        print(f"Tbol: {Tbol:.2f} [K]")
+        print(f"Lbol: {Lbol:.2f} [L_sun]")
+        print(40*"#", end="\n\n")
+        
+        return (mean_freq_GHz, Tbol, Lbol)
+        
+    def fit_SED(self):
+        raise Exception("Not implemented yet.")
+        
+    def imview(self, title=None, xlim=None, ylim=None, legendon=None, legendsize=6,
+               legendloc="best", bbox_to_anchor=(0.6, 0.95), xticks=None, yticks=None,
+               xlabelon=True, ylabelon=True, linewidth=None, linestyle="-", scale=("linear", "linear"),
+               linecolor=None, model_linewidth=None, model_linestyle="-", xlabel=None, ylabel=None, 
+               model_linecolor="tomato", ha="center", va="top", textcolor="k",
+               threshold=None, fit_xlim=None, fit_ylim=None, figsize=(2.76, 2.76), 
+               gauss_fit=False, components=1, p0=None, fixed_values=None, line_fit=False, 
+               alternative="two-sided", title_loc=(0.1, 0.875), plot_threshold=True, 
+               labelsize=7., curve_fit=None, threshold_color="gray", threshold_ls="dashed",
+               threshold_lw=None, fontsize=None, plot_predicted=True, dpi=600, color=None,
+               plot_type="line", axeslw=0.7, ticksize=3, labels=["Observation", "Model"], 
+               aspect_ratio=1., interpolation=None, linspace_num=10000, residuals_on=True,
+               capsize=1., elinewidth=None, fmt='none', marker=".", tick_direction="in",
+               ecolor=None, markeredgewidth=None, top_ticks=True, bottom_ticks=True, 
+               plot_ebars=None, left_ticks=True, right_ticks=True, savefig=None, 
+               linear_ticks=True, with_multiple=False, ax=None, plot=True, **kwargs):
+        """
+        Plot the 2D data with various customization options.
+
+        Parameters:
+        - title (str, optional): Title of the plot.
+        - xlim (list or tuple, optional): Limits for the x-axis.
+        - ylim (list or tuple, optional): Limits for the y-axis.
+        - legendon (bool, optional): Whether to display the legend.
+        - legendsize (int, optional): Font size of the legend.
+        - legendloc (str, optional): Location of the legend.
+        - bbox_to_anchor (tuple, optional): Bounding box anchor for the legend.
+        - xticks (list, optional): Tick values for the x-axis.
+        - yticks (list, optional): Tick values for the y-axis.
+        - xlabelon (bool, optional): Whether to display the x-axis label.
+        - ylabelon (bool, optional): Whether to display the y-axis label.
+        - linewidth (float, optional): Line width for the data plot.
+        - linestyle (str, optional): Line style for the data plot.
+        - linecolor (str, optional): Line color for the data plot.
+        - model_linewidth (float, optional): Line width for the model plot.
+        - model_linestyle (str, optional): Line style for the model plot.
+        - model_linecolor (str, optional): Line color for the model plot.
+        - ha (str, optional): Horizontal alignment for text.
+        - va (str, optional): Vertical alignment for text.
+        - textcolor (str, optional): Color for text.
+        - threshold (float, optional): Threshold value for a horizontal line.
+        - fit_xlim (list or tuple, optional): Limits for fitting on the x-axis.
+        - fit_ylim (list or tuple, optional): Limits for fitting on the y-axis.
+        - figsize (tuple, optional): Size of the figure.
+        - gauss_fit (bool, optional): Whether to perform Gaussian fitting.
+        - components (int, optional): Number of components for Gaussian fitting.
+        - p0 (list, optional): Initial guess for fitting parameters.
+        - fixed_values (dict, optional): Fixed values for fitting parameters.
+        - line_fit (bool, optional): Whether to perform linear fitting.
+        - alternative (str, optional): Alternative hypothesis for linear fitting.
+        - title_loc (tuple, optional): Location for the title.
+        - plot_threshold (bool, optional): Whether to plot the threshold line.
+        - labelsize (float, optional): Font size for labels.
+        - curve_fit (callable, optional): Function for custom curve fitting.
+        - threshold_color (str, optional): Color for the threshold line.
+        - threshold_ls (str, optional): Line style for the threshold line.
+        - threshold_lw (float, optional): Line width for the threshold line.
+        - fontsize (float, optional): Font size for the plot text.
+        - plot_predicted (bool, optional): Whether to plot predicted values.
+        - dpi (int, optional): Dots per inch for the figure.
+        - plot_type (str, optional): Type of plot ('line' or 'scatter').
+        - borderwidth (float, optional): Width of the plot border.
+        - ticksize (float, optional): Size of the plot ticks.
+        - labels (list, optional): Labels for the data and model.
+        - plot (bool, optional): Whether to display the plot.
+        - **kwargs: Additional keyword arguments for plotting.
+
+        Returns:
+        - ax (matplotlib.axes.Axes): The axes object of the plot.
+
+        Raises:
+        - ValueError: If 'xlim' or 'ylim' have a length greater than 2.
+        """
+        # get x and y axes
+        xdata = self.x
+        ydata = self.y
+        xerr = self.xerr 
+        yerr = self.yerr 
+
+        if plot_ebars is None:
+            plot_ebars = not (xerr is None and yerr is None)
+        
+        # remove bad values
+        mask = (~np.isnan(xdata)) & (~np.isnan(ydata)) 
+        if not np.all(mask):
+            xdata = xdata[mask]
+            ydata = ydata[mask]
+            if xerr is not None:
+                xerr = xerr[mask]
+            if yerr is not None:
+                yerr = yerr[mask]
+            
+        # initialize fontsize
+        if fontsize is None:
+            fontsize = labelsize
+
+        if linewidth is None:
+            linewidth = axeslw
+        
+        if threshold_lw is None:
+            threshold_lw = linewidth
+
+        if elinewidth is None:
+            elinewidth = linewidth
+
+        if model_linewidth is None:
+            model_linewidth = linewidth
+
+        if linecolor is None:
+            if interpolation:
+                linecolor = "cornflowerblue"
+            else:
+                linecolor = "k"
+
+        if plot_ebars and ecolor is None:
+            if color is None:
+                ecolor = linecolor
+            else:
+                ecolor = color 
+        if color is None:
+            color = linecolor
+            
+        # set image parameters
+        if ax is None:
+            params = {'axes.labelsize': labelsize,
+                      'axes.titlesize': labelsize,
+                      'font.size': fontsize,
+                      'figure.dpi': dpi,
+                      'legend.fontsize': legendsize,
+                      'xtick.labelsize': labelsize,
+                      'ytick.labelsize': labelsize,
+                      'font.family': _fontfamily,
+                      "mathtext.fontset": _mathtext_fontset,
+                      'mathtext.tt': _mathtext_tt,
+                      'axes.linewidth': axeslw,
+                      'xtick.major.width': axeslw,
+                      'ytick.major.width': axeslw,
+                      'figure.figsize': figsize,
+                      'xtick.major.size': ticksize,
+                      'ytick.major.size': ticksize,
+                      }
+            rcParams.update(params)
+            
+        # initialize xlim and ylim
+        if not with_multiple:
+            if xlim is None:
+                xmin = np.nanmin(xdata)
+                xmax = np.nanmax(xdata)
+                xrange = xmax - xmin
+                xlim = [xmin-0.1*xrange, xmax+0.1*xrange]
+            elif len(xlim) > 2:
+                raise ValueError("'xlim' cannot have a length greater than 2.")
+            elif xlim[0] > xlim[1]:  # swap if xlim is invalid
+                warnings.warn("'xlim' is not correctly specified. Swapping...")
+                if isinstance(xlim, tuple):
+                    xlim = list(xlim)
+                xlim[0], xlim[1] = xlim[1], xlim[0]
+                
+            if ylim is None:
+                ymin = np.nanmin(ydata)
+                ymax = np.nanmax(ydata)
+                yrange = ymax - ymin
+                ylim = [ymin-0.1*yrange, ydata.max()+0.1*yrange]
+            elif len(xlim) > 2:
+                raise ValueError("'xlim' cannot have a length greater than 2.")
+            elif ylim[0] > ylim[1]:  # swap if ylim is invalid
+                warnings.warn("'ylim' is not correctly specified. Swapping...")
+                if isinstance(ylim, tuple):
+                    ylim = list(ylim)
+                ylim[0], ylim[1] = ylim[1], ylim[0]
+        
+        if ax is None:
+            fig, ax = plt.subplots(nrows=1, ncols=1, sharex=False, sharey=False)
+
+        # interpolation:
+        if isinstance(interpolation, str):
+            if not interpolation.islower():
+                interpolation = interpolation.lower()  # make it case-insensitive
+
+            if interpolation in ("linear", "nearest", "nearest-up", "zero", "slinear", 
+                               "quartic", "cubic", "previous", "next"):
+                # create callable
+                func: Callable = interpolate.interp1d(x=xdata, y=ydata, kind=interpolation)
+                x_interp = np.linspace(xdata.min(), xdata.max(), linspace_num)
+                y_interp = func(x_interp)
+
+            else:
+                raise ValueError(f"Invalid interpolation method: {interpolation}. Must be one of 'linear', 'nearest', " + \
+                                  "'nearest-up', 'zero', 'slinear', 'quartic', 'cubic', 'previous', or 'next'.")
+        else:
+            # do nothing if user does not wish to interpolate data:
+            x_interp = xdata
+            y_interp = ydata
+
+        # parse plot type -> make it case-insensitive
+        if not plot_type.islower():  
+            plot_type = plot_type.lower()
+
+        # start plotting data
+        ax = _customizable_scale(ax=ax, xdata=x_interp, ydata=y_interp,
+                                 scale=scale, xticks=xticks, yticks=yticks,
+                                 plot_type=plot_type, linewidth=linewidth,
+                                 linestyle=linestyle, linecolor=linecolor,
+                                 label=labels[0], marker=marker, color=color,
+                                 plot_ebars=plot_ebars, linear_ticks=linear_ticks, 
+                                 **kwargs)
+        
+        # plot error bars
+        if xerr is not None or yerr is not None:
+            if markeredgewidth is None:
+                markeredgewidth = elinewidth
+            ax.errorbar(x=xdata, y=ydata, xerr=xerr, yerr=yerr, 
+                        fmt=fmt, marker=marker, ecolor=ecolor, elinewidth=elinewidth, 
+                        capsize=capsize, markeredgewidth=markeredgewidth, 
+                        label=labels[0])
+
+        # set labels
+        if xlabelon:
+            if xlabel:
+                ax.set_xlabel(xlabel, fontsize=fontsize)
+            elif self.xlabel:
+                xlabel = self.xlabel.title()
+                if self.xunit:
+                    xunit = _unit_plt_str(_apu_to_str(_to_apu(self.xunit)))
+                    xlabel += " (" + xunit +")" 
+                ax.set_xlabel(xlabel, fontsize=fontsize)
+        
+        if ylabelon:
+            if ylabel:
+                ax.set_ylabel(ylabel, fontsize=fontsize)
+            elif self.ylabel:
+                ylabel = self.ylabel.title()
+                if self.yunit:
+                    yunit = _unit_plt_str(_apu_to_str(_to_apu(self.yunit)))
+                    ylabel += " (" + yunit +")" 
+                ax.set_ylabel(ylabel, fontsize=fontsize)
+            
+        # plot threshold as horizontal line
+        if plot_threshold and threshold is not None:
+            ax.axhline(y=threshold, color=threshold_color, ls=threshold_ls, lw=threshold_lw)
+        
+        # perform fitting if needed
+        if threshold is not None:
+            if fit_ylim is None:
+                fit_ylim = [ydata.min()-np.std(ydata), threshold]
+            else:
+                warnings.warn("'threshold' and 'fit_ylim' parameters were both given. " + \
+                              "Only 'fit_ylim' will be effective.")
+        
+        if (gauss_fit or line_fit or curve_fit):
+            if gauss_fit:
+                # do Gaussian fitting
+                popt, perr, func = self.gauss_fit(fit_xlim=fit_xlim, 
+                                                  fit_ylim=fit_ylim, 
+                                                  components=components, 
+                                                  p0=p0, 
+                                                  fixed_values=fixed_values)
+            elif line_fit:
+                popt, perr = self.linear_regression(alternative=alternative)
+                func = lambda x, slope, y_int: slope*x + y_int
+            elif curve_fit:
+                popt, perr = self.curve_fit(function=curve_fit, p0=p0)
+                func = curve_fit
+                
+            # predict and plot model
+            smooth_x, predicted_y = self.__predict(popt, func, xlim=None, linspace_num=linspace_num)
+            ax.plot(smooth_x, predicted_y, lw=model_linewidth, label=labels[1],
+                    ls=model_linestyle, color=model_linecolor)
+            
+            if legendon is None:  # modify default value
+                legendon = True
+
+            # # plot residuals
+            # if residuals_on:
+            #     raise Exception("Not implemented yet.")
+            #     # # calculate residuals
+            #     # residuals = ydata - func(xdata, *popt)
+
+            #     # # plot residuals
+            #     # height = 
+            #     # bbox_to_anchor = ()
+            #     # residuals_ax = inset_axes(ax, 
+            #     #                           width="100%", 
+            #     #                           height=, 
+            #     #                           loc="", 
+            #     #                           borderpad=0.,
+            #     #                           bbox_to_anchor=,
+            #     #                           bbox_transform=ax.transAxes)
+
+            
+        if legendon is not None and legendon:
+            ax.legend(frameon=False, loc=legendloc, bbox_to_anchor=bbox_to_anchor)
+            
+        # plot title
+        if not with_multiple:
+            if title is not None:
+                # determine location on the xy axes
+                xlim_range = xlim[1] - xlim[0]
+                ylim_range = ylim[1] - ylim[0]
+                title_x = xlim[0] + xlim_range * title_loc[0]
+                title_y = ylim[0] + ylim_range * title_loc[1]
+                ax.text(title_x, title_y, title, color=textcolor, fontsize=fontsize)
+        
+            # set xlim and ylim
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+        
+            # tick parameters:
+            ax.tick_params(which='both', direction=tick_direction, bottom=bottom_ticks, 
+                           top=top_ticks, left=left_ticks, right=right_ticks, 
+                           colors="k", labelrotation=0, labelcolor="k", labelsize=labelsize)
+            
+            # set aspect ratio
+            if aspect_ratio:
+                horizontal_limit = ax.get_xlim()
+                horizontal_range = horizontal_limit[1] - horizontal_limit[0]
+                vertical_limit = ax.get_ylim()
+                vertical_range = vertical_limit[1] - vertical_limit[0]
+                real_aspect_ratio = abs(1./aspect_ratio*horizontal_range/vertical_range)
+                ax.set_aspect(real_aspect_ratio)
+            
+            if savefig:
+                plt.savefig(**savefig)
+
+            if plot:
+                plt.show()
+        
+        return ax
+    
+    def linear_regression(self, alternative="two-sided"):
+        """
+        Perform a linear regression on the x and y data of the plot.
+
+        Parameters:
+        - alternative (str, optional): Defines the alternative hypothesis.
+          The default value is "two-sided". Other options are "less" and "greater".
+
+        Returns:
+        - output (tuple): A tuple containing two lists:
+            - [slope, intercept]: The slope and intercept of the regression line.
+            - [slope_err, intercept_err]: The standard error of the slope and intercept.
+
+        Prints:
+        - The slope and its error with units.
+        - The intercept and its error with units.
+        - The correlation coefficient (r) and its square (r^2).
+        - The p-value for the hypothesis test.
+        """
+        result = linregress(x=self.x, y=self.y, alternative=alternative)
+        slope = result.slope
+        intercept = result.intercept
+        rvalue = result.rvalue
+        pvalue = result.pvalue
+        slope_err = result.stderr
+        intercept_err = result.intercept_stderr
+        
+        print("Linear Regression".center(40, "#"))
+        if self.yunit and self.xunit:
+            slope_unit = f"[{self.yunit}/{self.xunit}]"
+        elif self.yunit:
+            slope_unit = f"[{self.yunit}]"
+        elif self.xunit:
+            slope_unit = f"[1/{self.xunit}]"
+        else:
+            slope_unit = ""
+        print(f"slope: {slope:.4f} +/- {slope_err:.4f} " + slope_unit)
+        if self.yunit:
+            print(f"intercept: {intercept:.4f} +/- {intercept_err:.4f} [{self.yunit}]")
+        else:
+            print(f"intercept: {intercept:.4f} +/- {intercept_err:.4f}")
+        print(f"r: {rvalue:.4f}")
+        print(f"r2: {(rvalue**2):.4f}")
+        print(f"p-value ({alternative}): {pvalue:.4f}")
+        print(40*"#", end="\n\n")
+        
+        output = ([slope, intercept], [slope_err, intercept_err])
+        return output
+    
+    def curve_fit(self, function, p0=None, **kwargs):
+        """
+        Fit the data to a given callable function.
+        Parameters:
+            function (callable): the function that will be fitted
+            p0 (list): a list of parameters to be inputted
+            **kwargs: other keyword arguments for 'curve_fit' function of scipy
+        Returns:
+            popt: the best-fit parameters.
+            perr: errors associated with the best-fit parameters.
+        """
+        mask = (~np.isnan(self.x))&(~np.isnan(self.y))
+        
+        
+        
+        # perform fitting based on a function
+        try:
+            popt, pcov = curve_fit(f=function, xdata=self.x, ydata=self.y, 
+                                   p0=p0, **kwargs)
+        except:
+            print("Failed to fit the given function.")
+            return None
+        
+        # find standard errors of the parameters:
+        perr = np.sqrt(np.diag(pcov))
+        
+        # retreve parameter names by inspecting the callable:
+        param_names = tuple(inspect.signature(function).parameters.keys())
+        
+        # print fitting results:
+        print("Fitting Results".center(40, "#"))
+        for i, param in enumerate(param_names):
+            print(f"{param}: {popt[i]:.4f} +/- {perr[i]:.4f}")
+        print(40*"#")
+        
+        return popt, perr
+
+    def gauss_fit(self, fit_xlim=None, fit_ylim=None, components=1, p0=None, fixed_values=None):
+        """
+        Public method to fit a Gaussian function to the data.
+        --------
+        Parameters:
+            fit_range (2d array): 
+            components (int): number of gaussian components to be fitted
+            p0 (list[float]): Initial parameters. 
+                              Order is [x, amplitude, fwhm].
+                              If there are multiple components, set the initial values to:
+                              [[x1, a1, fwhm1], [x2, a2, fwhm2], [x3, a3, fwhm3]], etc.
+                              Default is None (guess based on data).
+                              If components > 1, default is all ones.
+            fixed_values (list[None | float]): Values that will be fixed while fitting.
+                                               None to not fix the value.
+                                               If there are multiple components, set to:
+                                               [[x1, a1, fwhm1], [x2, a2, fwhm2], [x3, a3, fwhm3]], etc.
+        Returns:
+            popt (list[float]): List of best-fit values.
+            pcov (list[float]): SD associated with the best-fit values.
+        """
+        # remove invalid values while fitting
+        mask = (~np.isnan(self.x)) & (~np.isnan(self.y))
+        
+        # remove values that lie outside the specified ranges
+        if fit_xlim is not None:  
+            fit_xlim = np.asarray(fit_xlim).flatten()
+            xmask = np.array([False]*self.x.size)  # initialize
+            for (x1, x2) in zip(fit_xlim[::2], fit_xlim[1::2]):
+                xmask = xmask | ((x1<=self.x) & (self.x<=x2))
+            mask = mask & xmask
+
+        if fit_ylim is not None:
+            fit_ylim = np.asarray(fit_ylim).flatten()
+            ymask = np.array([False]*self.y.size)  # initialize
+            for (y1, y2) in zip(fit_ylim[::2], fit_ylim[1::2]):
+                ymask = ymask | ((y1<=self.y) & (self.y<=y2))
+            mask = mask & ymask
+
+        # apply mask
+        masked_x = self.x[mask]
+        masked_y = self.y[mask]
+
+        # convert to array and reshape
+        if fixed_values is not None:
+            if not isinstance(fixed_values, np.ndarray):
+                fixed_values = np.array(fixed_values, dtype=object)
+            if fixed_values.shape != (components, 3):
+                fixed_values = fixed_values.reshape((components, 3))
+        elif fixed_values is None:
+            fixed_values = np.array([[None]*3]*components)
+        
+        # check whether values are fixed:
+        is_fixed = list(list(param is not None for param in comp) \
+                        for comp in fixed_values.tolist())
+        
+        # reassign p0 to a parsable reshape
+        if p0 is not None:
+            if isinstance(p0, list) and not isinstance(p0[0], list):  # check if p0 is 1d list:
+                p0 = [p0]  # convert to 2d list
+            elif isinstance(p0, np.ndarray):
+                # only acceptable if p0 is 2-dimensional
+                if p0.ndim == 1:
+                    p0 = p0[np.newaxis, :]
+                elif p0.ndim > 2:
+                    raise ValueError("p0 should not be more than 2 dimensions.")
+
+            for comp in p0:   # add nan values to p0:
+                if len(comp) != 3:
+                    comp += [np.nan]*(3-len(comp))
+
+            flattened_p0 = np.array(p0).flatten()  # flatten
+            p0 = flattened_p0[~np.isnan(flattened_p0)]
+        elif p0 is None and components == 1:
+            guess_x0 = np.average(masked_x, weights=masked_y)
+            sd_weights = masked_y / np.sum(masked_y)
+            guess_std = np.sqrt(np.sum((masked_x - guess_x0)**2 * sd_weights))
+            guess_fwhm = guess_std * 2.355  # std -> fwhm
+            guess_a = np.max(masked_y)
+            p0 = [guess_val for i, guess_val in enumerate((guess_x0, guess_a, guess_fwhm)) \
+                  if not is_fixed[0][i]]  # Need to fix this line
+            print(f"Initial Guess: {p0}")
+
+        local_namespace = {"np": np}
+
+        # fix values
+        for i in range(components):
+            params = ("x0", "a", "fwhm")
+            valid_params = [param for j, param in enumerate(params) if not is_fixed[i][j]]
+            valid_params = ", ".join(valid_params)
+            fwhm_in_fn = fixed_values[i][2] if is_fixed[i][2] else 'fwhm'
+            amp_in_fn = fixed_values[i][1] if is_fixed[i][1] else 'a'
+            center_in_fn = fixed_values[i][0] if is_fixed[i][0] else 'x0'
+            exec_code = f"def gauss_component{i+1}(x, {valid_params}): \n"
+            exec_code += f"  sigma = {fwhm_in_fn} / 2.355 \n"
+            exec_code += f"  return {amp_in_fn}*np.exp(-(x-{center_in_fn})**2/(2*sigma**2))"
+
+            exec(exec_code, local_namespace)
+
+        # define function that is the sum of all gaussian components
+        exec_code = f"def gauss(x, "
+        for i in range(components):
+            params = (f"x0_{i+1}", f"a{i+1}", f"fwhm{i+1}")
+            valid_params = [param for j, param in enumerate(params) if not is_fixed[i][j]]
+            valid_params = ", ".join(valid_params)
+            exec_code += valid_params
+            if i != components - 1:
+                exec_code += ", "
+
+        exec_code += "): \n"
+
+        for i in range(components):
+            if i == 0:
+                exec_code += "  return "
+            params = (f"x0_{i+1}", f"a{i+1}", f"fwhm{i+1}")
+            valid_params = [param for j, param in enumerate(params) if not is_fixed[i][j]]
+            valid_params = ", ".join(valid_params)
+            exec_code += f"gauss_component{i+1}(x, {valid_params})"
+            if i != components - 1:
+                exec_code += "+"
+        
+        exec(exec_code, local_namespace)
+        gauss = local_namespace['gauss']
+        
+        # start fitting gaussian function
+        try:
+            popt, pcov = curve_fit(f=gauss, xdata=masked_x, ydata=masked_y, p0=p0)
+        except:
+            print("Fitting failed.")
+            return None
+        perr = np.sqrt(np.diag(pcov))
+
+        # start printing results
+        j = 0  # counter
+        print("Gaussian Fitting Results".center(40, "#"))
+        for i in range(components):
+            print(f"Component {i+1}")
+            if not is_fixed[i][0]:
+                print(f"Center: {popt[j]:.4f} +/- {perr[j]:.4f}")
+                j += 1
+            if not is_fixed[i][1]:
+                print(f"Amplitude: {popt[j]:.4f} +/- {perr[j]:.4f}")
+                j += 1
+            if not is_fixed[i][2]:
+                print(f"FWHM: {popt[j]:.4f} +/- {perr[j]:.4f}")
+                j += 1
+            if i != components - 1:  # if i corresponds to the last index
+                print()
+        print(40*"#", end="\n\n")
+
+        return popt, perr, gauss
+    
+#     def hf_fit(self, restfreq, components=3):
+#         """
+#         Perform hyperfine fitting to the spectrum.
+#         Parameters:
+#             restfreq (float): the rest frequnecy in GHz.
+#         """
+#         # physical constants
+#         clight = const.c.cgs  # speed of light in vacuum
+#         h = const.h.cgs  # planck constant
+#         k_B = const.k_B.cgs  # Boltzmann's constant
+#         T_bg = 2.725*u.K  # cosmic microwave background temperature
+        
+#         if components == 3:
+            
+    def __predict(self, popt, func, xlim=None, linspace_num=10000):
+        """
+        Private function to predict values based on results of fitting.
+        (AKA last forward prop)
+        ------
+        Parameters:
+            popt (list[float]): a list of best-fit parameters
+            func (callable): function that gives y given x (that can be used ot predict y-values)
+            xlim (list[float], optional): The [min, max] values of x.
+                                          Default is to set as (min of x - 1 sd, max of x + 1 sd)
+                                            
+            linspace_num (int): spacing between two x values in y
+        Returns:
+            smoothx (np.ndarray[float]): array of x values that correspond to the predicted y values
+            predicted_y
+        """
+        if xlim is None:
+            masked_x = self.x[~np.isnan(self.x)]  # remove invalid values (nan)
+            x_sd = np.std(masked_x)  # standard deviation of x
+            xlim = (masked_x.min() - x_sd, masked_x.max() + x_sd)  # default xlim
+        smoothx = np.linspace(xlim[0], xlim[1], linspace_num)
+        predicted_y = func(smoothx, *popt)
+        return (smoothx, predicted_y)
+    
+#     def __residual(self, smoothx, observed_y, predicted_y):
+#         return predicted_y - observed_y
+#        
+    def export_csv(self, outname, delimiter=",", overwrite=False):  
+        """
+        Export the plot data to a CSV file.
+
+        Parameters:
+        - outname (str): The name of the output CSV file.
+        - delimiter (str, optional): The delimiter to use in the CSV file. Default is a comma (",").
+        - overwrite (bool, optional): Whether to overwrite the existing file. Default is False.
+
+        Description:
+        - Adds the ".csv" extension to the output file name if not already present.
+        - If `overwrite` is False, appends "(1)", "(2)", etc., to the file name to avoid overwriting.
+        - If `overwrite` is True and the file exists, deletes the existing file.
+        - Writes the data to the CSV file with the specified delimiter, including header information.
+
+        Raises:
+        - OSError: If there is an issue writing to the file.
+
+        Notes:
+        - The CSV file includes metadata such as the export date, x-axis label and unit, and y-axis label and unit.
+        """
+        # add file name extension if not in user input
+        if not outname.endswith(".csv"):
+            outname += ".csv"
+        
+        # if not overwrite, add (1), (2), (3), etc. to file name before '.fits'
+        if not overwrite:
+            outname = _prevent_overwriting(outname)
+        else:
+            if os.path.exists(outname):
+                os.system(f"rm -rf {outname}")
+        
+        file_content = "# Exported from Astroviz. \n"
+        file_content += f"# Date: {self.header['date']} \n"
+        file_content += f"# xLabel: {self.xlabel} [{self.xunit}] \n"
+        file_content += f"# yLabel: {self.ylabel} [{self.yunit}] \n"
+        file_content += f"# x,y \n"
+        data = np.vstack(self.x, self.y).T.astype(str)
+        data_lines = np.apply_along_axis(lambda arr: ",".join(arr), 1, data)
+        data_lines = "\n".join(data_lines)
+        file_content += data_lines
+        
+        with open(outname, "w") as f:
+            f.write(file_content)
+        print(f"File saved as '{outname}'.")
+
 
 class Region:
     """
@@ -5681,18 +8058,11 @@ class Region:
             self.__readfile(quiet=quiet)
     
     def __readfile(self, quiet=False):
-        # recursively finds file
-        def find_file(file):  
-            for root, dirs, files in os.walk(os.getcwd()):
-                if file in files:
-                    return os.path.join(root, file)
-            return None 
-
         if not os.path.exists(self.regionfile):
             if not quiet:
                 print(f"Given directory '{fitsfile}' does not exist as a relative directory. " + \
                        "Recursively finding file...")
-            maybe_filename = find_file(self.regionfile)
+            maybe_filename = _find_file(self.regionfile)
             if maybe_filename is not None:
                 self.regionfile = maybe_filename
                 if not quiet:
@@ -5838,6 +8208,1189 @@ class Region:
             raise Exception("Not implemented yet.")
 
 
+class ImageMatrix:
+    """
+    A class for handling and plotting multiple images with customizable annotations.
+    """
+    def __init__(self, figsize=(11.69, 16.57), axes_padding='auto', 
+                 dpi=600, labelsize=10., fontsize=12., axeslw=1., 
+                 tickwidth=None, ticksize=3., tick_direction="in", 
+                 cbarloc="right", **kwargs):
+        """
+        Initialize the ImageMatrix instance with default parameters.
+
+        Parameters:
+        - figsize (tuple of float or int, optional): The size of the figure in inches. Default is (11.69, 8.27).
+        - axes_padding (tuple of float, optional): The padding between axes. Default is (0.2, 0.2).
+        - dpi (float or int, optional): The dots per inch (DPI) setting for the figure. Default is 600.
+        - **kwargs: Additional keyword arguments to set or update the plotting parameters.
+
+        Description:
+        - This method initializes an ImageMatrix instance with default plotting parameters.
+        - It sets up attributes such as `images`, `figsize`, `shape`, `size`, `axes_padding`, and `dpi`.
+        - Default plotting parameters are defined in `self.default_params`.
+        - Additional keyword arguments can be passed to customize plotting parameters, which are set using the `set_params` method.
+        - Initializes internal dictionaries to store special parameters, shapes, lines, and text annotations.
+        - Initializes `fig` and `axes` attributes for the Matplotlib figure and axes.
+
+        Attributes:
+        - images (list): A list to store images.
+        - figsize (tuple): The size of the figure in inches.
+        - shape (tuple): The shape of the image matrix (initially (0, 0)).
+        - size (int): The size of the image matrix (initially 0).
+        - axes_padding (tuple): The padding between axes.
+        - dpi (float or int): The dots per inch (DPI) setting for the figure.
+        - default_params (dict): A dictionary of default plotting parameters.
+        - other_kwargs (dict): A dictionary for additional keyword arguments for plotting parameters.
+        - specific_kwargs (dict): A dictionary for specific keyword arguments for individual images.
+        - fig (matplotlib.figure.Figure or None): The Matplotlib figure object.
+        - axes (list or None): The list of Matplotlib axes objects.
+        """
+        # set default parameters
+        self.images: list = []  # empty list
+        self.figsize: Tuple[Union[float, int]] = figsize
+        self.shape: Tuple[int] = (0, 0)  # empty tuple
+        self.size: int = 0   # empty shape
+        
+        # parse 'axes padding' parameter 
+        if isinstance(axes_padding, (int, np.integer, float, np.floating)):
+            self.axes_padding = (axes_padding, axes_padding)
+        elif hasattr(axes_padding, "__iter__") and len(axes_padding) == 2:
+            self.axes_padding = axes_padding
+        elif axes_padding == "auto":
+            self.axes_padding = axes_padding
+        else:
+            raise ValueError("'axes_padding' must be a number, a tuple of two numbers, or 'auto'")
+            
+        # parse dpi
+        self.dpi: Union[float, int] = dpi
+        
+        # default parameters
+        if tickwidth is None:
+            tickwidth = axeslw  # set it to be the same as axeslw if not specified
+            
+        # parse 'cbarloc'
+        if not cbarloc.islower():
+            cbarloc = cbarloc.lower()
+        if cbarloc not in ("right", "top"):
+            raise ValueError("'cbarloc' must be either 'right' or 'top'.")
+            
+        self.default_params: dict = {'axes.labelsize': labelsize,
+                                     'axes.titlesize': fontsize,
+                                     'font.size': fontsize,
+                                     'xtick.labelsize': labelsize,
+                                     'ytick.labelsize': labelsize,
+                                     'xtick.top': True,  # draw ticks on the top side
+                                     'xtick.major.top': True,
+                                     'figure.figsize': figsize,
+                                     'font.family': _fontfamily,
+                                     'mathtext.fontset': _mathtext_fontset,
+                                     'mathtext.tt': _mathtext_tt,
+                                     'axes.linewidth': axeslw, 
+                                     'xtick.major.width': tickwidth,
+                                     'xtick.major.size': ticksize,
+                                     'xtick.direction': tick_direction,
+                                     'ytick.major.width': tickwidth,
+                                     'ytick.major.size': ticksize,
+                                     'ytick.direction': tick_direction,
+                                     }
+            
+        self.other_kwargs: dict = {"labelsize": labelsize, 
+                                   "fontsize": fontsize, 
+                                   "cbarloc": cbarloc}
+        self.specific_kwargs: dict = {}
+        self.set_params(new_params=kwargs)
+        
+        # initialize private attributes:
+        self.__label_abc: bool = False
+        self.__lines: dict = {}
+        self.__shapes: dict = {}
+        self.__texts: dict = {}
+        self.__show_mag: list = []
+        self.__set_positions: dict = {}
+        self.__cbarloc = cbarloc
+                    
+        self.fig = None
+        self.axes = None
+        
+    def __ravel_index(self, multi_dim_index):
+        """
+        Converts a multi-dimensional index to a single-dimensional index or 
+        validates a single-dimensional index.
+
+        Parameters:
+            - multi_dim_index (int or iterable): The index to be converted or validated. 
+                                               This can either be a single integer 
+                                               representing a flat index or an iterable 
+                                               (like a tuple or list) of length 2 
+                                               representing a 2D index.
+
+        Returns:
+            - (int) The single-dimensional index corresponding to the provided multi-dimensional index.
+
+        Raises:
+            - ValueError
+                - If `multi_dim_index` is an int and is out of bounds for the array size.
+                - If `multi_dim_index` is an iterable and its length is not 2.
+                - If `multi_dim_index` is an iterable and contains indices out of bounds 
+                  for the array shape.
+                - If `multi_dim_index` is neither an int nor an iterable of length 2.
+        """
+        if isinstance(multi_dim_index, (int, np.integer)):
+            # check if it can be parsed as a one-dim index
+            if multi_dim_index > self.size - 1:
+                raise ValueError(f"Index {multi_dim_index} is out of bounds for size {self.size}")
+            # return itself if it is an integer
+            return multi_dim_index
+        elif hasattr(multi_dim_index, "__iter__") and hasattr(multi_dim_index, "__getitem__"):
+            # check if it can be parsed as a two-dim index
+            if len(multi_dim_index) != 2:
+                raise ValueError("'multi_dim_index' must be an iterable of length 2")
+            row, col = multi_dim_index
+            if not (0 <= row < self.shape[0] and 0 <= col < self.shape[1]):
+                raise ValueError(f"Index {multi_dim_index} is out of bounds for shape {self.shape}")
+            return np.ravel_multi_index(multi_dim_index, self.shape)
+        else:
+            raise ValueError("multi_dim_index must be an int or an iterable of length 2")
+            
+    def set_params(self, new_params=None, **kwargs):
+        """
+        Set or update the plotting parameters for the image matrix.
+
+        Parameters:
+        - new_params (dict, optional): A dictionary of new parameters to set or update. Default is None.
+        - **kwargs: Additional keyword arguments to set or update the plotting parameters.
+
+        Returns:
+        - self (ImageMatrix): The updated ImageMatrix instance with the new parameters.
+
+        Description:
+        - This method sets or updates the default plotting parameters for the image matrix.
+        - The parameters can be provided either as a dictionary (`new_params`) or as keyword arguments.
+        - If a parameter key is found in `rcParams`, it updates the corresponding entry in `self.default_params`.
+        - Otherwise, it updates the entry in `self.other_kwargs`.
+        - This allows for flexible customization of plotting parameters for the image matrix.
+        """
+        # set new dictionary
+        if new_params is None:
+            new_params = kwargs
+        
+        # iterate over 'new_params' dict to replace default values
+        for key, value in new_params.items():
+            if key in rcParams:
+                self.default_params[key] = value
+            else:
+                self.other_kwargs[key] = value
+
+        return self
+    
+    def copy(self):
+        """
+        Create a deep copy of the ImageMatrix instance.
+
+        Returns:
+        - ImageMatrix: A deep copy of the current ImageMatrix instance.
+
+        Description:
+        - This method creates and returns a deep copy of the current ImageMatrix instance.
+        - A deep copy ensures that all nested objects and attributes within the ImageMatrix are also copied, 
+          preventing any changes to the original instance from affecting the copy.
+
+        Example:
+        - To create a copy of an existing ImageMatrix instance:
+          >>> matrix_copy = original_matrix.copy()
+        """
+        return copy.deepcopy(self)
+        
+    def reshape(self, *shape, inplace=True):
+        """
+        Reshape the image matrix into a different 2D shape.
+
+        Parameters:
+        - shape (tuple of int): The new shape for the image matrix. It should be a tuple containing two integers.
+        - inplace (bool, optional): Whether to modify the image matrix in place. Default is True.
+
+        Returns:
+        - matrix (ImageMatrix): The reshaped image matrix.
+
+        Raises:
+        - ValueError: If the length of `shape` is greater than 2 or if any element in `shape` is not an integer.
+
+        Description:
+        - This method changes the shape of the image matrix to the specified `shape`.
+        - If `inplace` is False, a copy of the image matrix is created and modified.
+        - If the length of `shape` is 1, it is converted to a 2D shape with one row.
+        - The shape and size of the image matrix are updated to match the new shape.
+        """
+        # old shape
+        old_shape = self.shape
+        
+        # create copy if inplace is set to True
+        matrix = self if inplace else self.copy()
+        
+        # parse args
+        if len(shape) == 1:
+            shape = shape[0]
+        
+        # check if shape satisfies length requirement
+        if len(shape) == 1:
+            shape = (1, shape[0])
+        elif len(shape) > 2:
+            raise ValueError("Length of 'shape' is greater than 2.")
+        
+        # change items in shape to int:
+        if any(not isinstance(item, (int, np.integer)) for item in shape):
+            shape = tuple(int(item) for item in shape)
+
+        # raise value error
+        new_size = np.multiply(*shape)
+        length_of_images = len(self.images)
+        if new_size < length_of_images:
+            warnings.warn(f"Not all {length_of_images} images will be plotted with shape {shape}.")
+
+        # modify shape and size
+        matrix.shape = shape
+        matrix.size = new_size
+                
+        return matrix
+        
+    def add_image(self, image=None, **kwargs) -> None:
+        """
+        Add an image to the ImageMatrix.
+
+        Parameters:
+        - image (Spatialmap, PVdiagram, Plot2D, or None): The image to be added to the matrix.
+        - plot (bool, optional): Whether to plot the image after adding it. Default is False.
+        - **kwargs: Additional keyword arguments to be passed to the plot method.
+
+        Returns:
+        - self (ImageMatrix): The updated ImageMatrix instance.
+
+        Raises:
+        - ValueError: If the image added is not of an acceptable type (Spatialmap, PVdiagram, Plot2D, or None).
+
+        Description:
+        - Checks if the provided image is of an acceptable type.
+        - Adds the image to the image matrix.
+        - Reshapes the matrix if the number of images exceeds the current size.
+        - Stores specific keyword arguments for the added image.
+        - Optionally plots the image if the `plot` parameter is set to True.
+        """
+        # check type of input
+        acceptable_types = (Spatialmap, PVdiagram, Plot2D, type(None))
+        if not isinstance(image, acceptable_types):
+            raise ValueError("The image added is not of an acceptable type.")
+        
+        # add image
+        self.images.append(image)
+        
+        
+        if self.size == 0:
+            self.reshape((1, 1), inplace=True)
+        elif self.size == 1:
+            self.reshape((1, 2), inplace=True)
+        elif self.size == 2:
+            self.reshape((1, 3), inplace=True)
+        elif self.size == 3:
+            self.reshape((2, 2), inplace=True)
+        elif len(self.images) > self.size:
+            new_shape = (self.shape[0]+1, self.shape[1])  # add a new row if it exceeds current size
+            self.reshape(new_shape, inplace=True)
+            
+        # set specific keyword arguments
+        self.specific_kwargs[len(self.images)-1] = kwargs
+
+    def __create_panel_labels(self) -> List[str]:
+        """
+        Generates a list of panel labels for the instance.
+
+        This method creates panel labels in a sequential pattern, starting from 'a', 'b', 'c', ..., 'z',
+        and then 'aa', 'ab', 'ac', ..., 'az', 'ba', 'bb', ..., 'zz', and so on. The length of the list
+        of labels is determined by the number of items in `self.images`.
+
+        Returns:
+            List[str]: A list of panel labels.
+        """
+        # create generator object
+        def labels() -> iter:
+            i = 1
+            while True:
+                for label in itertools.product(string.ascii_lowercase, repeat=i):
+                    yield ''.join(label)
+                i += 1
+
+        # allocate memory for labels by creating a list
+        generator = labels()
+        return list(next(generator) for _ in range(len(self.images)))
+                
+    def plot(self, plot=True):
+        """
+        Plot the images in the image matrix along with any added annotations.
+
+        Parameters:
+        - plot (bool, optional): Whether to display the plot. Default is True.
+
+        Returns:
+        - fig (matplotlib.figure.Figure): The figure object containing the plots.
+        - axes (list of matplotlib.axes.Axes): The axes objects of the plots.
+
+        Description:
+        - This method sets the default plotting parameters and creates a figure with subplots
+          according to the shape of the image matrix.
+        - Each image in the image matrix is plotted in its respective subplot.
+        - If an image is 'None' or the subplot index exceeds the number of images, the subplot is turned off.
+        - Additional keyword arguments for plotting are passed to the `imview` method of each image.
+        - If `self.__label_abc` is True, each subplot is labeled with a sequential letter (a, b, c, ...).
+        - The figure's padding and dpi are adjusted according to the instance's attributes.
+        - After plotting the images, any lines, shapes, or texts stored in the instance are drawn on the figure.
+        - The figure is displayed if `plot` is True, and the figure and axes objects are returned.
+
+        Example:
+        - To plot the image matrix and display it:
+          >>> fig, axes = image_matrix.plot()
+
+        - To plot the image matrix without displaying it (e.g., for saving to a file):
+          >>> fig, axes = image_matrix.plot(plot=False)
+        """
+        rcParams.update(self.default_params)  # set default parameters
+        if self.axes_padding == "auto":
+            fig, axes = plt.subplots(*self.shape, figsize=self.figsize, 
+                                     constrained_layout=True)  # set fig, axes, etc.
+        else:
+            fig, axes = plt.subplots(*self.shape, figsize=self.figsize)  # set fig, axes, etc.
+            
+        if isinstance(axes, mpl.axes._axes.Axes):
+            axes = [axes]
+        else: 
+            axes = axes.flatten()  # flatten axes
+        other_kwargs = self.other_kwargs  # other keyword arguments
+        
+        label_idx: int = 0
+        all_labels: List[str] = self.__create_panel_labels()
+        for i, ax in enumerate(axes):
+            # plot blank images if image is 'None' or the ax is out of range.
+            if i >= len(self.images) or (image := self.images[i]) is None:  
+                ax.spines["bottom"].set_color('none')
+                ax.spines["top"].set_color('none')
+                ax.spines["left"].set_color('none')
+                ax.spines["right"].set_color('none')
+                ax.axis('off')
+            else:
+                specific_kwargs = self.specific_kwargs[i]
+                this_kwarg = copy.deepcopy(other_kwargs)
+                
+                # check if all parameters are valid
+                valid_args = tuple(inspect.signature(image.imview).parameters.keys())
+                this_kwarg = dict((key, value) for key, value in this_kwarg.items() if key in valid_args)
+                this_kwarg.update(specific_kwargs)
+                
+                # add figure labels if necessary
+                if "title" in this_kwarg:
+                    title = this_kwarg["title"]
+                    this_kwarg.pop("title")
+                else:
+                    title = ""
+                    
+                # add panel labels if necessary
+                if self.__label_abc:
+                    title = f"({all_labels[label_idx]}) " + title
+                    label_idx += 1
+                    
+                # plot using 'imview' method
+                if hasattr(image, "imview"):
+                    ax = image.imview(ax=ax, plot=False, title=title, **this_kwarg)
+                else:
+                    ax = image.plot(ax=ax, plot=False, title=title, **this_kwarg)
+                  
+        # adjust padding
+        if self.axes_padding != "auto":
+            wspace, hspace = self.axes_padding
+            fig.subplots_adjust(wspace=wspace, hspace=hspace)
+        
+        # set dpi
+        fig.set_dpi(self.dpi)
+        
+        # set instances
+        self.fig = fig
+        self.axes = axes
+        
+        # draw other annotations
+        fig, axes = self.__draw_lines(fig, axes)
+        fig, axes = self.__draw_shapes(fig, axes)
+        fig, axes = self.__add_texts(fig, axes)
+        fig, axes = self.__plot_mag(fig, axes)
+        
+        # set horizontal positions
+        fig, axes = self.__set_horizontal_positions(fig, axes)
+        
+        if plot:
+            plt.show()
+        
+        return fig, axes
+        
+    def label_panels(self) -> None:
+        """
+        Enable labeling of panels with sequential letters (a, b, c, ...).
+
+        Description:
+        - This method sets an internal flag to enable the labeling of panels with sequential letters.
+        - When this flag is set to True, each panel in the image matrix will be 
+          labeled with a sequential letter (a, b, c, ...).
+        """
+        self.__label_abc = True
+        
+    def show_magnification(self, zoomed_out_idx, zoomed_in_idx, 
+                           linestyle="dashed", linecolor="skyblue", 
+                           linewidth=1.0, edgecolor=None, 
+                           facecolor="none", **kwargs) -> None:
+        """
+        Highlights a zoomed-in region within a zoomed-out image and draws connecting lines.
+
+        This method adds a rectangle to the zoomed-out image, highlighting the region that is 
+        zoomed in on another subplot. Additionally, it draws lines connecting the corners of 
+        the zoomed-in region to the corresponding region in the zoomed-out image.
+
+        Parameters:
+            zoomed_out_idx (int or tuple): The index or coordinates of the zoomed-out image 
+                                           in the image matrix.
+            zoomed_in_idx (int or tuple): The index or coordinates of the zoomed-in image in 
+                                          the image matrix.
+            linestyle (str, optional): The style of the connecting lines. Default is "dashed".
+            linecolor (str, optional): The color of the connecting lines. Default is "skyblue".
+            linewidth (float, optional): The width of the connecting lines. Default is 1.0.
+            edgecolor (str, optional): The edge color of the rectangle. If None, defaults to 
+                                       the value of `linecolor`. Default is None.
+            facecolor (str, optional): The face color of the rectangle. Default is "none".
+            **kwargs: Additional keyword arguments to be passed to the `Rectangle` patch.
+
+        Returns:
+            None
+
+        Description:
+        - This method transforms the provided indices into raveled indices and stores the 
+          parameters required for highlighting and connecting the zoomed regions.
+        - The actual drawing of the rectangle and lines is handled in the `__plot_mag` method, 
+          which is called during the plotting process.
+        """
+        # ravel indicies:
+        zoomed_out_idx = self.__ravel_index(zoomed_out_idx)
+        zoomed_in_idx = self.__ravel_index(zoomed_in_idx)
+        
+        if zoomed_out_idx == zoomed_in_idx:
+            raise ValueError("Same indicies for zoomed in/out images were provided.")
+        
+        # default value of edge color:
+        if edgecolor is None:
+            edgecolor = linecolor
+            
+        # set keyword arguments as dictionary:
+        set_kwargs = {"linestyle": linestyle, "linecolor": linecolor,
+                      "linewidth": linewidth, "facecolor": facecolor,
+                      "edgecolor": edgecolor}
+        
+        # append to private variable
+        self.__show_mag.append((zoomed_out_idx, zoomed_in_idx, 
+                                set_kwargs, kwargs))
+        
+    def __plot_mag(self, fig, axes):
+        if not self.__show_mag:
+            return fig, axes
+        
+        for (out_idx, in_idx, set_kwargs, kwargs) in self.__show_mag:
+            # skip loop if one of the images is a blank one
+            if self.images[out_idx] is None or self.images[in_idx] is None:
+                continue
+            
+            # get values
+            out_ax = axes[out_idx]  # zoomed-out axis
+            out_xlim = out_ax.get_xlim()
+            out_xrange = abs(out_xlim[1] - out_xlim[0])
+            out_ylim = out_ax.get_ylim()
+            out_yrange = abs(out_ylim[1] - out_ylim[0])
+            
+            in_ax = axes[in_idx]  # zoomed-in axis
+            in_xlim = in_ax.get_xlim()
+            in_xrange = abs(in_xlim[1] - in_xlim[0])
+            in_ylim = in_ax.get_ylim()
+            in_yrange = abs(in_ylim[1] - in_ylim[0])
+            
+            # swap out and in indicies if they are opposite
+            if in_xrange > out_xrange and in_yrange > out_yrange:
+                out_idx, in_idx = in_idx, out_idx  # python swap!
+                out_ax = axes[out_idx]  # zoomed-out axis
+                out_xlim = out_ax.get_xlim()
+                out_xrange = abs(out_xlim[1] - out_xlim[0])
+                out_ylim = out_ax.get_ylim()
+                out_yrange = abs(out_ylim[1] - out_ylim[0])
+
+                in_ax = axes[in_idx]  # zoomed-in axis
+                in_xlim = in_ax.get_xlim()
+                in_xrange = abs(in_xlim[1] - in_xlim[0])
+                in_ylim = in_ax.get_ylim()
+                in_yrange = abs(in_ylim[1] - in_ylim[0])
+            
+            # add rectangle in zoomed-out image:
+            br_xy = (min(in_xlim), min(in_ylim))  # bottom right xy coord
+            rect = patches.Rectangle(xy=br_xy, 
+                                     width=in_xrange, 
+                                     height=in_yrange, 
+                                     angle=0,
+                                     linewidth=set_kwargs["linewidth"], 
+                                     linestyle=set_kwargs["linestyle"], 
+                                     edgecolor=set_kwargs["edgecolor"], 
+                                     facecolor=set_kwargs["facecolor"], 
+                                     **kwargs)
+            out_ax.add_patch(rect)
+            
+            fig.canvas.draw()
+            transFigure = fig.transFigure.inverted()
+            
+            # Get the locations of the axes in the grid
+            out_loc = np.unravel_index(out_idx, self.shape)
+            in_loc = np.unravel_index(in_idx, self.shape)
+            
+            # Calculate the coordinates for the lines based on the location of the axes
+            if out_loc[0] == in_loc[0]:  # same row -> plot side to side
+                if out_loc[1] > in_loc[1]:  # right is zoomed out, left is zoomed in
+                    in_coords = [(in_xlim[1], in_ylim[0]), (in_xlim[1], in_ylim[1])]
+                    out_coords = [(in_xlim[0], in_ylim[0]), (in_xlim[0], in_ylim[1])]
+                else:  # left is zoomed out, right is zoomed in
+                    in_coords = [(in_xlim[0], in_ylim[0]), (in_xlim[0], in_ylim[1])]
+                    out_coords = [(in_xlim[1], in_ylim[0]), (in_xlim[1], in_ylim[1])]
+            else:  # different rows -> plot one above the other
+                if out_loc[0] > in_loc[0]:  # top is zoomed out, bottom is zoomed in
+                    in_coords = [(in_xlim[0], in_ylim[0]), (in_xlim[1], in_ylim[0])]
+                    out_coords = [(in_xlim[0], in_ylim[1]), (in_xlim[1], in_ylim[1])]
+                else:  # bottom is zoomed out, top is zoomed in
+                    in_coords = [(in_xlim[0], in_ylim[1]), (in_xlim[1], in_ylim[1])]
+                    out_coords = [(in_xlim[0], in_ylim[0]), (in_xlim[1], in_ylim[0])]
+            
+            # plot
+            for in_coord, out_coord in zip(in_coords, out_coords):
+                in_fig_coord = transFigure.transform(in_ax.transData.transform(in_coord))
+                out_fig_coord = transFigure.transform(out_ax.transData.transform(out_coord))
+                
+                line = plt.Line2D((in_fig_coord[0], out_fig_coord[0]), 
+                                  (in_fig_coord[1], out_fig_coord[1]),
+                                  transform=fig.transFigure, 
+                                  color=set_kwargs["linecolor"],
+                                  linestyle=set_kwargs["linestyle"], 
+                                  linewidth=set_kwargs["linewidth"])
+                fig.lines.append(line)
+
+        return fig, axes
+            
+    def add_text(self, img_idx, x, y, s, **kwargs) -> None:
+        """
+        Add text to the specified image in the image matrix.
+
+        Parameters:
+        - img_idx (int): The index of the image to which the text will be added.
+        - x (float): The x-coordinate for the text position.
+        - y (float): The y-coordinate for the text position.
+        - s (str): The text string to be displayed.
+        - **kwargs: Additional keyword arguments to be passed to the `text` method of the axes.
+
+        Returns:
+        - None
+
+        Raises:
+        - ValueError: If the specified image index is invalid.
+
+        Description:
+        - This method creates a text object with specified properties and adds it to the specified image in the image matrix.
+        - The text properties such as position, string, and other text attributes can be customized through `kwargs`.
+        - The text specifications are stored in `self.__texts` and will be drawn when the image matrix is plotted.
+        """
+        img_idx = self.__ravel_index(img_idx)
+        
+        kwargs.update({"s": s, "x": x, "y": y})
+        
+        if img_idx in self.__texts:
+            self.__texts[img_idx].append(kwargs)
+        else:
+            self.__texts[img_idx] = [kwargs]
+            
+    def __add_texts(self, fig, axes) -> None:
+        """
+        Draw stored text objects on the specified axes in the image matrix.
+
+        Parameters:
+        - fig (matplotlib.figure.Figure): The figure object containing the plots.
+        - axes (list of matplotlib.axes.Axes): The axes objects of the plots.
+
+        Returns:
+        - fig (matplotlib.figure.Figure): The updated figure object with the text objects drawn.
+        - axes (list of matplotlib.axes.Axes): The updated axes objects.
+
+        Description:
+        - This method draws text objects stored in `self.__texts` on the specified figure and axes.
+        - Each text object is associated with an image index and is added to the corresponding subplot.
+        - If there are no text objects to be drawn (`self.__texts` is empty), the method returns the figure and axes unmodified.
+
+        Text Drawing Process:
+        - The method first checks if there are any text objects to be drawn. If not, it returns the figure and axes unmodified.
+        - For each text object defined in `self.__texts`, the method retrieves the image index and the text properties.
+        - The text is added to the corresponding axis using the `text` method with the specified properties.
+        - The method ensures that the text objects are drawn when the figure is displayed by updating the axes with the text objects.
+
+        Raises:
+        - None
+        """
+        if not self.__texts:
+            return fig, axes
+        
+        for img_idx, kwargs_lst in self.__texts.items():
+            for kwargs in kwargs_lst:
+                axes[img_idx].text(**kwargs)
+                
+        return fig, axes
+    
+    def add_arrow(self, img_idx, xy1, xy2=None, dx=None, dy=None, 
+                  width=1., color="tomato", double_headed=False, **kwargs):
+        """
+        Add an arrow to a specific image in the image matrix.
+
+        Parameters:
+        - img_idx (int or tuple): The index or coordinates of the image to which the arrow will be added. 
+          If a tuple is provided, it should contain two elements representing coordinates.
+        - xy1 (tuple): The starting point of the arrow (x, y).
+        - xy2 (tuple, optional): The ending point of the arrow (x, y). If not provided, dx and dy must be specified.
+        - dx (float, optional): The length of the arrow along the x-axis. Required if xy2 is not provided.
+        - dy (float, optional): The length of the arrow along the y-axis. Required if xy2 is not provided.
+        - width (float, optional): The width of the arrow. Default is 1.0.
+        - color (str, optional): The color of the arrow. Default is "tomato".
+        - **kwargs: Additional keyword arguments to pass to `patches.Arrow`.
+
+        Raises:
+        - ValueError: If neither xy2 nor both dx and dy are provided.
+
+        Description:
+        - Converts the img_idx to a single-dimensional index using the `__ravel_index` method.
+        - Validates that either xy2 or both dx and dy are provided; raises a ValueError if not.
+        - Computes dx and dy from xy1 and xy2 if xy2 is provided.
+        - Creates an Arrow patch with the specified properties and additional keyword arguments.
+        - Adds the Arrow patch to the list of shapes for the specified image index.
+        """
+        # ravel index and check if the index is valid
+        img_idx = self.__ravel_index(img_idx)
+        
+        # check if all info is provided:
+        if xy2 is None and (dx is None or dy is None):
+            raise ValueError("Either 'xy2' or both 'dx' and 'dy' must be provided.")
+        
+        # get x1 and y1
+        x1, y1 = xy1
+        
+        # get dx and dy if xy2 is provided (this overwrites the provided 'dx' and 'dy')
+        if xy2 is not None:
+            x2, y2 = xy2
+            dx = x2 - x1
+            dy = y2 - y1
+
+        if double_headed:
+            # forward arrow
+            self.add_arrow(img_idx=img_idx, xy1=(x1+dx/2, y1+dy/2), dx=dx/2, dy=dy/2,
+                           width=width, color=color, double_headed=False, 
+                           **kwargs)
+
+            # backward arrow
+            self.add_arrow(img_idx=img_idx, xy1=(x1+dx/2, y1+dy/2), dx=-dx/2, dy=-dy/2,
+                           width=width, color=color, double_headed=False, 
+                           **kwargs)
+        else:
+            # create new patch object:
+            patch = patches.Arrow(x=x1, y=y1, dx=dx, dy=dy, color=color, 
+                                  width=width, **kwargs)
+            
+            # save the patch to the private instance:
+            if img_idx in self.__shapes:
+                self.__shapes[img_idx].append(patch)
+            else:
+                self.__shapes[img_idx] = [patch]
+
+    def add_rectangle(self, img_idx, xy=(0, 0), width=1, height=None, angle=0, 
+                      linewidth=1., edgecolor="skyblue", facecolor='none', 
+                      linestyle="dashed", center=True, **kwargs) -> None:
+        """
+        Add a rectangle to the specified image in the image matrix.
+
+        Parameters:
+        - img_idx (int): The index of the image to which the rectangle will be added.
+        - xy (tuple, optional): The (x, y) bottom left corner coordinates of the rectangle. Default is (0, 0).
+        - width (float, optional): The width of the rectangle. Default is 1.
+        - height (float, optional): The height of the rectangle. If None, it is set equal to the width. Default is None.
+        - angle (float, optional): The rotation angle of the rectangle in degrees. Default is 0.
+        - linewidth (float, optional): The width of the rectangle edge. Default is 1.
+        - edgecolor (str, optional): The edge color of the rectangle. Default is "skyblue".
+        - facecolor (str, optional): The fill color of the rectangle. Default is 'none'.
+        - linestyle (str, optional): The line style of the rectangle edge. Default is "dashed".
+        - **kwargs: Additional keyword arguments to be passed to the `Rectangle` constructor.
+
+        Returns:
+        - None
+
+        Raises:
+        - ValueError: If the specified image index is invalid.
+
+        Description:
+        - This method creates a rectangle patch and adds it to the specified image in the image matrix.
+        - The rectangle's properties such as width, height, angle, colors, and line styles can be customized.
+        - The rectangle is stored in `self.__shapes` and will be drawn when the image matrix is plotted.
+        """
+        # ravel index and check if the index is valid
+        img_idx = self.__ravel_index(img_idx)
+        
+        # set height to be same as width if height is not specified:
+        if height is None:
+            height = width
+        
+        # calculate bottom right if xy specified should be the center:
+        if center:
+            xy = (xy[0]-width/2, xy[1]-height/2)
+         
+        # create new patch object:
+        patch = patches.Rectangle(xy, width=width, height=height, angle=angle,
+                                  linewidth=linewidth, linestyle=linestyle, 
+                                  edgecolor=edgecolor, facecolor=facecolor, 
+                                  **kwargs)
+        
+        # save the patch to the private instance:
+        if img_idx in self.__shapes:
+            self.__shapes[img_idx].append(patch)
+        else:
+            self.__shapes[img_idx] = [patch]
+        
+    def add_ellipse(self, img_idx, xy=(0, 0), width=1, height=None, angle=0, 
+                    linewidth=1, facecolor='none', edgecolor="skyblue", 
+                    linestyle="dashed", center=True, **kwargs) -> None:
+        """
+        Add an ellipse to the specified image in the image matrix.
+
+        Parameters:
+        - img_idx (int): The index of the image to which the ellipse will be added.
+        - xy (tuple, optional): The (x, y) center coordinates of the ellipse. Default is (0, 0).
+        - width (float, optional): The width of the ellipse. Default is 1.
+        - height (float, optional): The height of the ellipse. If None, it is set equal to the width. Default is None.
+        - angle (float, optional): The rotation angle of the ellipse in degrees. Default is 0.
+        - linewidth (float, optional): The width of the ellipse edge. Default is 1.
+        - facecolor (str, optional): The fill color of the ellipse. Default is 'none'.
+        - edgecolor (str, optional): The edge color of the ellipse. Default is "skyblue".
+        - linestyle (str, optional): The line style of the ellipse edge. Default is "dashed".
+        - **kwargs: Additional keyword arguments to be passed to the `Ellipse` constructor.
+
+        Returns:
+        - None
+
+        Raises:
+        - ValueError: If the specified coordinates or image index are invalid.
+
+        Description:
+        - This method creates an ellipse patch and adds it to the specified image in the image matrix.
+        - The ellipse's properties such as width, height, angle, colors, and line styles can be customized.
+        - The ellipse is stored in `self.__shapes` and will be drawn when the image matrix is plotted.
+        """
+        # check whether coordinate specified is correct
+        img_idx = self.__ravel_index(img_idx)
+            
+        if height is None:
+            height = width
+        
+        if center:
+            xy = (xy[0]-width/2, xy[1]-height/2)
+        
+        patch = patches.Ellipse(xy=xy, width=width, height=height, facecolor=facecolor,
+                                angle=angle, linestyle=linestyle, **kwargs)
+        if img_idx in self.__shapes:
+            self.__shapes[img_idx].append(patch)
+        else:
+            self.__shapes[img_idx] = [patch]
+        
+    def add_patch(self, patch, img_idx=None) -> None:
+        """
+        Add a patch (shape) to the specified image(s) in the image matrix.
+
+        Parameters:
+        - patch (matplotlib.patches.Patch): The patch (shape) to be added to the image(s).
+        - img_idx (int or iterable of int, optional): The index or indices of the image(s) 
+          to which the patch will be added. If None, the patch will be added to all non-None 
+          images in the image matrix. Default is None.
+
+        Returns:
+        - None
+
+        Description:
+        - This method adds a patch (shape) to the specified image(s) in the image matrix.
+        - If `img_idx` is None, the patch will be added to all non-None images.
+        - If `img_idx` is an integer, the patch will be added to the corresponding image.
+        - If `img_idx` is an iterable, the patch will be added to each specified image.
+        - The patches are stored in `self.__shapes`, which is used by the `__draw_shapes` 
+          method to draw the patches on the figure.
+        """
+        if img_idx is None:
+            img_idx = [idx for idx in range(self.size) if self.images[idx] is not None]
+        
+        if hasattr(img_idx, "__iter__"):
+            for idx in img_idx:
+                if img_idx in self.__shapes:
+                    self.__shapes[img_idx].append(patch)
+                else:
+                    self.__shapes[img_idx] = [patch]
+        elif isinstance(img_idx, int):
+            if img_idx in self.__shapes:
+                self.__shapes[img_idx].append(patch)
+            else:
+                self.__shapes[img_idx] = [patch]
+        
+    def __draw_shapes(self, fig, axes):
+        """
+        Draw stored shapes on the specified axes in the image matrix.
+
+        Parameters:
+        - fig (matplotlib.figure.Figure): The figure object containing the plots.
+        - axes (list of matplotlib.axes.Axes): The axes objects of the plots.
+
+        Returns:
+        - fig (matplotlib.figure.Figure): The updated figure object with the shapes drawn.
+        - axes (list of matplotlib.axes.Axes): The updated axes objects.
+
+        Description:
+        - This method draws shapes stored in `self.__shapes` on the specified figure and axes.
+        - Each shape is associated with an image index and is added as a patch to the corresponding subplot.
+        - If there are no shapes to be drawn (`self.__shapes` is empty), the method returns the figure and axes unmodified.
+
+        Shape Drawing Process:
+        - The method first checks if there are any shapes to be drawn. If not, it returns the figure and axes unmodified.
+        - For each shape defined in `self.__shapes`, the method retrieves the image index and the patches (shapes) to be drawn.
+        - Each patch is added to the corresponding axis using the `add_patch` method.
+        - The method ensures that the shapes are drawn when the figure is displayed by updating the axes with the patches.
+        """
+        if not self.__shapes:
+            return fig, axes
+        
+        for img_idx, patches in self.__shapes.items():
+            for patch in patches:
+                # make a copy to prevent run-time errors when plotting the same figure the second time:
+                patch = copy.deepcopy(patch)
+                axes[img_idx].add_patch(patch)
+                
+        return fig, axes
+    
+    def add_line(self, coord1, coord2, color="skyblue", linewidth=1.0, 
+                 linestyle='dashed', **kwargs) -> None:
+        """
+        Add a line between two coordinates on the image matrix.
+
+        Parameters:
+        - coord1 (tuple): The starting coordinate of the line in the format 
+          (image index, x coordinate, y coordinate).
+        - coord2 (tuple): The ending coordinate of the line in the format 
+          (image index, x coordinate, y coordinate).
+        - color (str, optional): Color of the line. Default is 'k' (black).
+        - linewidth (float, optional): Width of the line. Default is 1.0.
+        - linestyle (str, optional): Style of the line. Default is '-' (solid line).
+        - **kwargs: Additional keyword arguments to be passed to the 'plot' method.
+
+        Returns:
+        - None
+
+        Raises:
+        - ValueError: If `coord1` or `coord2` are not in the correct format or the indices are invalid.
+
+        Description:
+        - This method draws a line between two specified coordinates on the image matrix.
+        - The coordinates must include the image index and the x and y positions within that image.
+        """
+        if len(coord1) != 3 or len(coord2) != 3:
+            raise ValueError("Length of coordinates specified must be 3 " +\
+                             "with the format (image index, x, y)")
+            
+        img_idx1, *_ = coord1
+        img_idx2, *_ = coord2
+        if img_idx1 > self.size - 1 or img_idx2 > self.size - 1:
+            raise ValueError("Image index specified exceeds size of ImageMatrix.")
+
+        kwargs.update({"color": color, 
+                       "linewidth": linewidth,
+                       "linestyle": linestyle})
+        self.__lines[(coord1, coord2)] = kwargs
+        
+    def __draw_lines(self, fig, axes):
+        """
+        Draw stored lines across different axes in the image matrix.
+
+        Parameters:
+        - fig (matplotlib.figure.Figure): The figure object containing the plots.
+        - axes (list of matplotlib.axes.Axes): The axes objects of the plots.
+
+        Returns:
+        - fig (matplotlib.figure.Figure): The updated figure object with the lines drawn.
+        - axes (list of matplotlib.axes.Axes): The updated axes objects.
+
+        Description:
+        - This method draws lines stored in `self.__lines` on the specified figure and axes.
+        - Each line is defined by two coordinates, where each coordinate includes the image index and
+          the (x, y) position within that image.
+        - The method transforms data coordinates to figure coordinates to draw lines that span across
+          different subplots.
+        - If there are no lines to be drawn (`self.__lines` is empty), the method returns the figure and axes unmodified.
+
+        Line Drawing Process:
+        - The method first checks if there are any lines to be drawn. If not, it returns the figure and axes unmodified.
+        - It then draws the canvas and uses the `transFigure` transformation to convert data coordinates to figure coordinates.
+        - For each line defined in `self.__lines`, the method retrieves the starting and ending coordinates, transforms them, 
+          and creates a `Line2D` object to draw the line across the figure.
+        - The `Line2D` object is appended to the figure's lines, ensuring the line is drawn when the figure is displayed.
+        """
+        # don't do anything if nothing needs to be plotted
+        if not self.__lines:
+            return fig, axes
+        
+        fig.canvas.draw()
+        transFigure = fig.transFigure.inverted()
+        
+        for (coord1, coord2), line_kwargs in self.__lines.items():
+            idx1, x1, y1 = coord1
+            idx2, x2, y2 = coord2
+            
+            ax1 = axes[idx1]
+            ax2 = axes[idx2]
+            
+            coord1_fig = transFigure.transform(ax1.transData.transform([x1, y1]))
+            coord2_fig = transFigure.transform(ax2.transData.transform([x2, y2]))
+            
+            line = plt.Line2D((coord1_fig[0], coord2_fig[0]), (coord1_fig[1], coord2_fig[1]),
+                              transform=fig.transFigure, **line_kwargs)
+            fig.lines.append(line)
+        
+        return fig, axes
+            
+    def clear_annotations(self, inplace=True) -> None:
+        """
+        Clear all stored annotations (lines, shapes, and texts) from the image matrix.
+        
+        Parameters:
+        - inplace (bool): Whether to modify the image matrix in place. Default is True.
+        
+        Description:
+        - This method clears all lines, shapes, and text annotations that have been added to the image matrix.
+        - After calling this method, the image matrix will have no annotations.
+        - This can be useful if you want to reset the annotations and start fresh.
+        """
+        matrix = self if inplace else self.copy()
+        matrix.__lines = {}
+        matrix.__shapes = {}
+        matrix.__texts = {}
+        matrix.__label_abc = False
+        
+    def savefig(self, fname, format="pdf", bbox_inches="tight", transparent=True, 
+                overwrite=False, **kwargs) -> None:
+        """
+        Save the current figure to a file.
+
+        Parameters:
+        - fname (str): The name of the file to save the figure to. If no extension is provided, '.pdf' will be added.
+        - format (str, optional): The format to save the figure in. Default is 'pdf'.
+        - bbox_inches (str, optional): Bounding box in inches. Default is 'tight'.
+        - transparent (bool, optional): If True, the background of the figure will be transparent. Default is True.
+        - overwrite (bool, optional): Whether to overwrite an existing file with the same name. Default is False.
+        - **kwargs: Additional keyword arguments to pass to `fig.savefig`.
+
+        Returns:
+        - None
+
+        Raises:
+        - Exception: If no figure is available to save.
+
+        Description:
+        - Checks if a figure is available to save; raises an exception if not.
+        - Adds a file extension to the filename if it is not provided.
+        - If `overwrite` is False and a file with the specified name exists, 
+          modifies the filename to avoid overwriting by appending a number.
+        - Saves the figure with the specified parameters.
+        """
+        fig = self.fig
+        
+        # check if figure needs to be plotted:
+        if fig is None:
+            raise Exception("No figure available to save. Plot the figure using '.plot()' before saving.")
+            
+        # check if format is correct:
+        if not format.islower():  # make it case insensitive
+            format = format.lower()
+        supported_formats = mpl.figure.FigureCanvasBase.get_supported_filetypes()
+        if format not in supported_formats:
+            supported_formats = str(tuple(supported_formats))[1:-1]
+            raise ValueError(f"{format} is not a supported filetype: {supported_formats}.")
+        
+        # add file extension if not provided:
+        extension = "." + format
+        len_ext = len(extension)
+        if not fname.endswith(extension):
+            fname += extension
+        
+        # add numbers if file exists:
+        if not overwrite:
+            fname = _prevent_overwriting(fname)
+        
+        # save file:
+        fig.savefig(fname, format=format, bbox_inches=bbox_inches, 
+                    transparent=transparent, **kwargs)
+        
+        # print directory:
+        print(f"Image successfully saved as '{fname}'")
+
+    def align_center(self, row) -> None:
+        ncol: int = self.shape[1]
+        begin_idx: int = self.__ravel_idx((row, 0))
+        end_idx: int = self.__ravel_idx((row, ncol))  # not included
+        number_of_nonblank_images: int = sum(image is not None for image in self.images[begin_idx, end_idx])
+        positions: np.ndarray = np.linspace(0, 1, number_of_nonblank_images+2)
+
+        i: int = 0  # increases by one when image is not None
+        for idx in enumerate(range(begin_idx, end_idx)):
+            if self.images[idx] is None:
+                continue
+            self.set_horizontal_position(self, idx, center=positions[i])
+            i += 1  # increment
+
+    def set_horizontal_position(self, img_idx, center=0.5) -> None:
+        # warning message
+        if self.axes_padding == "auto":
+            warnings.warn("Setting 'axes_padding' to 'auto' may result in different subplot sizes.")
+
+        # parse and ravel image index:
+        img_idx = self.__ravel_index(img_idx)
+        
+        # parse central coordinate:
+        if not isinstance(center, (float, np.floating, int, np.integer)):
+            raise ValueError("'center' must be an iterable or a float, int, or their numpy equivalents")
+            
+        if not (0 <= center <= 1):
+            raise ValueError("'center' must be within the range [0, 1]")
+        
+        self.__set_positions[img_idx] = center
+        
+    def __set_horizontal_positions(self, fig, axes):
+        if not self.__set_positions:
+            return fig, axes
+        
+        for idx, center in self.__set_positions.items():
+            # get ax
+            ax = axes[idx]
+            
+            # get current position to calculate width and height
+            points = ax.get_position().get_points()
+            x1, y1 = points[0]
+            x2, y2 = points[1]
+            width = abs(x2-x1)
+            height = abs(y2-y1)
+            
+            # calculate new position
+            left = center - width / 2
+            bottom = y1 - height / 2  
+            new_position = [left, bottom, width, height]
+            
+            # set new position
+            ax.set_position(new_position)
+        return fig, axes
+        
+    def clean_labels(self, only_one=False) -> None:
+        """
+        Adjusts the labels and color bar labels in a grid of subplots.
+
+        This method iterates over a grid of subplots and ensures that:
+            - X-axis and Y-axis labels are only displayed on the bottom-left subplot.
+            - Color bar labels are only displayed on the rightmost subplots.
+
+        The method updates the `specific_kwargs` dictionary for each subplot, which is used to configure
+        the display properties of each subplot in the grid.
+        """
+        if only_one:
+            for i in range(self.shape[0]):  # row 
+                for j in range(self.shape[1]):  # column
+                    # turn on labels only at bottom left corner
+                    if i == self.shape[0] - 1 and j == 0:
+                        xlabelon = True
+                        ylabelon = True
+                    else:
+                        xlabelon = False
+                        ylabelon = False
+
+                    # turn on color bar labels only on right/top columns
+                    if self.__cbarloc == "right":
+                        cbarlabelon = (j == self.shape[1] - 1)
+                    else:
+                        cbarlabelon = (i == 0)
+
+                    # set parameters
+                    ravelled_idx = self.__ravel_index((i, j))
+                    if ravelled_idx > len(self.images) - 1:
+                        break
+                    self.specific_kwargs[ravelled_idx]["xlabelon"] = xlabelon
+                    self.specific_kwargs[ravelled_idx]["ylabelon"] = ylabelon
+                    self.specific_kwargs[ravelled_idx]["cbarlabelon"] = cbarlabelon
+        else:
+            for i in range(self.shape[0]):  # row 
+                for j in range(self.shape[1]):  # column
+                    # turn on labels only at bottom left corner
+                    xlabelon = False
+                    ylabelon = False
+                    if i == self.shape[0] - 1:
+                        xlabelon = True
+                    if j == 0:
+                        ylabelon = True
+
+                    # turn on color bar labels only on right/top columns
+                    if self.__cbarloc == "right":
+                        cbarlabelon = (j == self.shape[1] - 1)
+                    else:
+                        cbarlabelon = (i == 0)
+
+                    # set parameters
+                    ravelled_idx = self.__ravel_index((i, j))
+                    if ravelled_idx > len(self.images) - 1:
+                        break
+                    self.specific_kwargs[ravelled_idx]["xlabelon"] = xlabelon
+                    self.specific_kwargs[ravelled_idx]["ylabelon"] = ylabelon
+                    self.specific_kwargs[ravelled_idx]["cbarlabelon"] = cbarlabelon
+        
+    def pop(self, image_location=-1, inplace=True):
+        """
+        Remove and return the image at the specified location from the image matrix.
+
+        Parameters:
+        - image_location (int or tuple, optional): The index or coordinates of the image to remove.
+          Default is -1, which removes the last image.
+        - inplace (bool, optional): Whether to modify the image matrix in place.
+          Default is True.
+
+        Returns:
+        - image (object): The removed image.
+
+        Raises:
+        - ValueError: If the specified location is invalid or exceeds the size of the image matrix.
+
+        Description:
+        - If `inplace` is False, creates a copy of the image matrix to modify.
+        - If `image_location` is a tuple, it should contain two elements representing coordinates.
+          The location is then flattened to a single index.
+        - If the specified `image_location` exceeds the size of the image matrix, a ValueError is raised.
+        - The image at the specified location is removed and replaced with `None`.
+        """
+        # parse index
+        image_location = self.__ravel_index(image_location)
+        
+        # make copy if user doesn't want to modify in-place
+        matrix = self if inplace else self.copy()
+        
+        # remove image by replacing it with a blank one
+        image = matrix.images[image_location]
+        matrix.images[image_location] = None
+        
+        return image
+
+
 def plt_1ddata(xdata=None, ydata=None, xlim=None, ylim=None, mean_center=False, title=None,
                legendon=True, xlabel="", ylabel="", threshold=None, linewidth=0.8,
                xtick_spacing=None, ytick_spacing=None, borderwidth=0.7,
@@ -5929,192 +9482,50 @@ def plt_1ddata(xdata=None, ydata=None, xlim=None, ylim=None, mean_center=False, 
     return ax
 
 
-def _plt_spectrum(velocity=None, intensity=None, csvfile=None, xlim=None, ylim=None, 
-                  gaussfit=True, mean_center=True, title=None, legendon=True,
-                  xlabel=r"Velocity offset ($\rm km~s^{-1}$)", ylabel=r"Intensity ($\rm K$)", 
-                  threshold=None, linewidth=0.8, figsize=(2.76, 2.76), xtick_spacing=None,
-                  ytick_spacing=None, borderwidth=0.7, labelsize=7,
-                  fontsize=8, ticksize=3,legendsize=6, title_position=0.92,
-                  bbox_to_anchor=(0.6, 0.95), legendloc="best", skiprows=5,
-                  delimiter="\t", vsys=0., subtract_vsys=False, dpi=600,
-                  threshold_color="gray", **kwargs):
-    
+def exportfits(image, *args, **kwargs):
     """
-    Plot and analyze spectral data with optional Gaussian fitting.
+    Duplicate function of 'exportfits' method to export the given image to a FITS file.
 
     Parameters:
-        velocity (array-like, optional): Array of velocity values.
-        intensity (array-like, optional): Corresponding intensity values.
-        csvfile (str, optional): Path to a CSV file containing velocity and intensity data.
-        xlim (list, optional): Limits for the x-axis (velocity).
-        ylim (list, optional): Limits for the y-axis (intensity).
-        gaussfit (bool, optional): If True, fits a Gaussian model to the data.
-        mean_center (bool, optional): If True, centers the plot around the mean of the data.
-        title (str, optional): Title for the plot.
-        legendon (bool, optional): If True, displays a legend.
-        xlabel/ylabel (str, optional): Labels for the x and y axes.
-        threshold (float, optional): Threshold value for plotting and analysis.
-        linewidth (float, optional): Line width for plotting.
-        figsize (tuple, optional): Size of the figure.
-        xtick_spacing/ytick_spacing (float, optional): Spacing for x and y ticks.
-        borderwidth, labelsize, fontsize (float, optional): Various formatting parameters.
-        ticksize, legendsize, title_position (float, optional): Additional formatting parameters.
-        bbox_to_anchor, legendloc (tuple/str, optional): Legend positioning.
-        skiprows (int, optional): Number of rows to skip when reading a CSV file.
-        delimiter (str, optional): Delimiter for CSV file.
-        vsys (float, optional): Systemic velocity.
-        subtract_vsys (bool, optional): If True, subtracts systemic velocity from the velocity data.
-        dpi (int, optional): Resolution of the figure.
-        threshold_color (str, optional): Color for the threshold line.
+    - image (object): An image instance that has an `exportfits` method.
+    - *args: Additional positional arguments to be passed to the `exportfits` method of the image instance.
+    - **kwargs: Additional keyword arguments to be passed to the `exportfits` method of the image instance.
+
+    Returns:
+    - The result of the `exportfits` method of the image instance.
+
+    Raises:
+    - AttributeError: If the 'image' parameter does not have an `exportfits` method.
+    
+    Description:
+    - This function acts as a wrapper around the `exportfits` method of the provided image instance.
+    - It simply forwards any additional arguments to the `exportfits` method of the image instance.
     """
-    if xlim is None:
-        xlim = (np.nanmin(xdata), np.nanmax(xdata))
-    if ylim is None:
-        ylim = []
-    
-    def gauss(x, amp, mean, fwhm):
-        sigma = fwhm / 2.355
-        return amp * np.exp(-np.square(x-mean)/(2*sigma**2))
-
-    def fit_gauss(xdata, ydata, xrange=None, threshold=None, p0=None, return_params=True):
-        xlim = np.nanmin(xdata), np.nanmax(xdata)
-        xdata = np.array(xdata) if not isinstance(xdata, np.ndarray) else xdata
-        ydata = np.array(ydata) if not isinstance(ydata, np.ndarray) else ydata
-
-        if xrange is not None and len(xrange) == 2:
-            mask = (xdata>np.nanmin(xrange)) & (xdata<np.nanmax(xrange))
-            xdata = xdata[mask]
-            ydata = ydata[mask]
-
-        if threshold is not None and isinstance(threshold, (float, int)):
-            mask = ydata > threshold
-            xdata = xdata[mask]
-            ydata = ydata[mask]
-
-        if p0 is None:
-            init_amp = np.nanmax(ydata)
-            init_mean = np.trapz(x=xdata, y=ydata*xdata)/np.trapz(x=xdata, y=ydata)
-            init_fwhm = (np.nanmax(xdata) - np.nanmin(xdata))/2
-            p0 = [init_amp, init_mean, init_fwhm]
-
-        # Perform fitting
-        popt, pcov = curve_fit(f=gauss, xdata=xdata, ydata=ydata, p0=p0)
-        perr = np.sqrt(np.diag(pcov))
-
-        # Get fitting results
-        amp_opt, mean_opt, fwhm_opt = popt
-        amp_err, mean_err, fwhm_err = perr
-
-        print(10*"#"+"Fitting Results"+10*"#")
-        print("Amplitude = %0.2f +/- %0.2f"%(amp_opt, amp_err))
-        print("Mean = %0.2f +/- %0.2f"%(mean_opt, mean_err))
-        print("FWHM = %0.2f +/- %0.2f"%(fwhm_opt, fwhm_err))
-        print(35*"#")
-
-        # get best-fit curve
-        xsmooth = np.linspace(xlim[0], xlim[1], 10000)
-        ysmooth = gauss(xsmooth, amp_opt, mean_opt, fwhm_opt)
-
-        return (xsmooth, ysmooth, [popt, perr]) if return_params else (xsmooth, ysmooth)
-    if velocity is None or intensity is None:
-        if csvfile is None:
-            raise Exception("Please specify the 'velocity' and 'intensity' parameters or 'csvfile'.")
-        else:
-            if subtract_vsys and vsys == 0:
-                print("WARNING: vsys is set to 0. vobs = vobs-vsys.")
-            dataset = pd.read_csv(csvfile, skiprows=skiprows, delimiter=delimiter)
-            velocity = dataset["# x"]
-            velocity = velocity - vsys if subtract_vsys else velocity
-            xlabel=r"Radio velocity ($\rm km~s^{-1}$)" if not subtract_vsys else r"Velocity offset ($\rm km~s^{-1}$)"
-            intensity = dataset["y"]
-    
-    if fontsize is None:
-        fontsize = labelsize
-    
-    params = {'axes.labelsize': labelsize,
-              'axes.titlesize': labelsize,
-              'font.size': fontsize,
-              'figure.dpi': dpi,
-              'legend.fontsize': legendsize,
-              'xtick.labelsize': labelsize,
-              'ytick.labelsize': labelsize,
-              'font.family': _fontfamily,
-              "mathtext.fontset": _mathtext_fontset, #"Times New Roman"
-              'mathtext.tt': _mathtext_tt,
-              'axes.linewidth': borderwidth,
-              'xtick.major.width': borderwidth,
-              'ytick.major.width': borderwidth,
-              'figure.figsize': figsize,
-#               'xtick.minor.width': 1.0,
-#               'ytick.minor.width': 1.0,
-               'xtick.major.size': ticksize,
-               'ytick.major.size': ticksize,
-                }
-    rcParams.update(params)
-    
-    fig, ax = plt.subplots(nrows=1,ncols=1,sharex=False,sharey=False, figsize=figsize)
-    plt.subplots_adjust(wspace=0.4)
-    
-    ax.plot(velocity, intensity, color="k", lw=linewidth, label="Observation")
-    
-    if gaussfit:
-        xsmooth, model, [popt, perr] = fit_gauss(velocity, intensity, threshold=threshold, 
-                                   return_params=True, **kwargs)
-        ax.plot(xsmooth, model, color="tomato", lw=linewidth, label="Model")
-        
-    if legendon:
-        ax.legend(frameon=False, loc=legendloc, bbox_to_anchor=bbox_to_anchor)
-        
-    ax.tick_params(which='both',direction='in',bottom=True, top=True, left=True, right=True,
-                   colors="k", labelrotation=0, labelcolor="k")
-    
-    if len(xlim) == 2:
-        ax.set_xlim(xlim)
-    if len(ylim) == 2:
-        ax.set_ylim(ylim)
-    xlim = ax.get_xlim()
-    ylim = ax.get_ylim()
-    
-    if xtick_spacing is not None:
-        ax.set_xticks(np.arange(-100, 100, xtick_spacing))
-        ax.set_xlim(xlim)
-    if ytick_spacing is not None:
-        ax.set_yticks(np.arange(-100, 100, ytick_spacing))
-        ax.set_ylim(ylim)
-        
-    if mean_center:
-        xlim = ax.get_xlim()
-        half_range = (np.max(xlim) - np.min(xlim))/2
-        xmean = popt[1]
-        xlim = (xmean-half_range, xmean+half_range)
-        ax.set_xlim(xlim)
-    
-    if title is not None:
-        xlim = ax.get_xlim() 
-        ylim = ax.get_ylim() 
-        xrange = np.max(xlim) - np.min(xlim)
-        yrange = np.max(ylim) - np.min(ylim)
-        xposition = xlim[0]+(1-title_position)*xrange
-        yposition = ylim[0]+title_position*yrange
-        ax.text(x=xposition, y=yposition, 
-                s=title, color="k", ha="left", va="top", fontsize=fontsize)
-    
-    if threshold is not None:
-        ax.axhline(y=threshold, linestyle="dashed", linewidth=linewidth, color=threshold_color)
-        
-    ax.set_xlabel(xlabel, fontsize=labelsize)
-    ax.set_ylabel(ylabel, fontsize=labelsize)
-    
-    return ax
-
-
-# duplicate function
-def exportfits(image, *args, **kwargs):
     return image.exportfits(*args, **kwargs)
 
 
-# deuplicate function to quickly plot a FITS file if directory is known
 def imview(image, *args, **kwargs):
+    """
+    Duplicated function of 'imview' method to quickly plot a FITS file if directory is known
+
+    Parameters:
+    - image (str or object): The image to be displayed. This can be:
+        - A string representing the directory path to a FITS file.
+        - An instance of Datacube, Spatialmap, or PVdiagram.
+    - *args: Additional positional arguments to be passed to the `imview` method of the image instance.
+    - **kwargs: Additional keyword arguments to be passed to the `imview` method of the image instance.
+
+    Returns:
+    - The result of the `imview` method of the image instance.
+
+    Raises:
+    - ValueError: If the 'image' parameter is neither a directory to a FITS file nor an image instance.
+
+    Description:
+    - If `image` is an instance of Datacube, Spatialmap, or PVdiagram, calls its `imview` method.
+    - If `image` is a string, treats it as a directory to a FITS file, imports the FITS file, and calls its `imview` method.
+    - Otherwise, raises a ValueError indicating an invalid 'image' parameter.
+    """
     if isinstance(image, (Datacube, Spatialmap, PVdiagram)):
         return image.imview(*args, **kwargs)
     elif isinstance(image, str):
@@ -6124,14 +9535,41 @@ def imview(image, *args, **kwargs):
         raise ValueError("'image' parameter must be a directory to a FITS file or an image instance.")
 
 
-def search_molecular_line(restfreq, unit="GHz", printinfo=True):
+def search_molecular_line(restfreq, unit="GHz", species_id=None, 
+                          printinfo=True, return_table=False):
     """
-    Function to search for molecular line info given a rest frequency.
-    This function requires internet connection.
-    """
-    # import data base
-    from astroquery.splatalogue import Splatalogue 
+    Search for molecular line information given a rest frequency.
     
+    Parameters:
+    - restfreq (float): The rest frequency of the molecular line.
+    - unit (str, optional): The unit of the rest frequency. Default is "GHz".
+    - printinfo (bool, optional): Whether to print the retrieved information. Default is True.
+    
+    Returns:
+    - tuple: A tuple containing the following information about the molecular line:
+        - species (str): The species of the molecular line.
+        - chemical_name (str): The chemical name of the species.
+        - freq (float): The frequency of the molecular line in GHz.
+        - freq_err (float): The measurement error of the frequency in GHz.
+        - qns (str): The resolved quantum numbers.
+        - CDMS_JPL_intensity (float): The CDMS/JPL intensity.
+        - Sijmu_sq (float): The S_ij * mu^2 value in Debye^2.
+        - Sij (float): The S_ij value.
+        - Aij (float): The Einstein A coefficient in 1/s.
+        - Lovas_AST_intensity (float): The Lovas/AST intensity.
+        - lerg (float): The lower energy level in Kelvin.
+        - uerg (float): The upper energy level in Kelvin.
+        - gu (float): The upper state degeneracy.
+        - constants (tuple): The rotational constants (A, B, C) in MHz.
+        - source (str): The source of the data.
+    
+    Raises:
+    - ValueError: If the rest frequency is None.
+    
+    Notes:
+    - This function requires an internet connection to query the Splatalogue database.
+    - If the frequency does not closely match any known molecular lines, a warning will be printed.
+    """
     # error checking for rest frequency
     if restfreq is None:
         raise ValueError("The rest frequency cannot be 'None'.")
@@ -6139,52 +9577,43 @@ def search_molecular_line(restfreq, unit="GHz", printinfo=True):
     if unit != "GHz":
         restfreq = u.Quantity(restfreq, unit).to_value(u.GHz)   # convert unit to GHz
     
-    # search for best-match result.
-    possible_lines = Splatalogue.query_lines(restfreq*u.GHz-0.01*u.GHz, restfreq*u.GHz+0.01*u.GHz,
-                                             show_upper_degeneracy=True, only_NRAO_recommended=False)
-    freq1 = possible_lines["Freq-GHz(rest frame,redshifted)"]
-    freq2 = possible_lines["Meas Freq-GHz(rest frame,redshifted)"]
-    possible_restfreq = np.where(np.ma.is_masked(freq1), freq2, freq1)
-    error = np.abs(possible_restfreq - restfreq)
-    idx = np.nanargmin(error)
-    best_match_result = possible_lines[idx]
-    
+    results = _best_match_line(restfreq, species_id=species_id, return_table=return_table)
+    if return_table:
+        return results
+
     # find information of the line 
-    species = best_match_result["Species"]
-    chemical_name = best_match_result["Chemical Name"]
-    freq = possible_restfreq[idx]
-    freq_err = best_match_result["Meas Freq Err(rest frame,redshifted)"]
-    qns = best_match_result["Resolved QNs"]
-    CDMS_JPL_intensity = best_match_result["CDMS/JPL Intensity"]
-    Sijmu_sq = best_match_result["S<sub>ij</sub>&#956;<sup>2</sup> (D<sup>2</sup>)"]
-    Sij = best_match_result["S<sub>ij</sub>"]
-    log10_Aij = best_match_result["Log<sub>10</sub> (A<sub>ij</sub>)"]
+    species_id = results["SPECIES_ID"]
+    species = results["SPECIES"]
+    chemical_name = results["CHEMICAL_NAME"]
+    freq = results["FREQUENCY"]
+    qns = results["QUANTUM_NUMBERS"]
+    intensity = results["INTENSITY"]
+    Sijmu_sq = results["SMU2"]
+    log10_Aij = results["LOGA"]
     Aij = 10**log10_Aij
-    Sijmu_sq = best_match_result["S<sub>ij</sub>&#956;<sup>2</sup> (D<sup>2</sup>)"]
-    Lovas_AST_intensity = best_match_result["Lovas/AST Intensity"]
-    lerg = best_match_result["E_L (K)"]
-    uerg = best_match_result["E_U (K)"]
-    gu = best_match_result["Upper State Degeneracy"]
-    source = best_match_result["Linelist"]
-    
+    lerg = results["EL"]
+    uerg = results["EU"]
+    try:
+        upper_state, lower_state = map(int, qns.strip("J=").split('-'))
+        gu = 2 * upper_state + 1
+    except ValueError:
+        warnings.warn("Failed to calculated upper state degeneracy.")
+        gu = None
+    source = results["LINELIST"]
+
     # find species id
-    species_ids = Splatalogue.get_species_ids(species.split("v=")[0])
-    species_id = None
-    for key, value in species_ids.items():
-        str_lst = key[6:].split(" - ")
-        if str_lst[0].replace(" ", "") == species and str_lst[1] == chemical_name:
-            species_id = value
-            break
     if species_id is None:
-        print("Failed to find species ID / rotational constants. \n")
+        warnings.warn("Failed to find species ID / rotational constants. \n")
         constants = None
+        url = None
+        display_url = None
     else:
         # find rotational constant
+        url = f"https://splatalogue.online/splata-slap/species/{species_id}"
+        display_url = f"https://splatalogue.online/#/species?id={species_id}"
         try:
             # search the web for rotational constants 
             from urllib.request import urlopen
-            url = f"https://splatalogue.online/splata-slap/species/{species_id}"
-            display_url = f"https://splatalogue.online/#/species?id={species_id}"
             page = urlopen(url)
             html = page.read().decode("utf-8")
             metadata = eval(html.replace("null", "None"))[0]['metaData']  # list of dictionaries
@@ -6201,16 +9630,12 @@ def search_molecular_line(restfreq, unit="GHz", printinfo=True):
                               for rot_const in (a_const, b_const, c_const))
                 
     # store data in a list to be returned and convert masked data to NaN
-    data = [species, chemical_name, freq, freq_err, qns, CDMS_JPL_intensity, Sijmu_sq,
-            Sij, Aij, Lovas_AST_intensity, lerg, uerg, gu, constants, source]
+    data = [species, chemical_name, freq, None, qns, intensity, Sijmu_sq,
+            None, Aij, None, lerg, uerg, gu, constants, source]
     
     for i, item in enumerate(data):
         if np.ma.is_masked(item):
             data[i] = np.nan
-    
-    # error as warning
-    if not np.isclose(error[idx], 0.):
-        print("WARNING: This image may not be of a molecular line. \n")
     
     # print information if needed
     if printinfo:
@@ -6221,12 +9646,10 @@ def search_molecular_line(restfreq, unit="GHz", printinfo=True):
         print(f"Frequency: {data[2]} +/- {data[3]} [GHz]")
         print(f"Resolved QNs: {data[4]}")
         if not np.isnan(data[5]) and data[5] != 0:
-            print(f"CDMS/JPL Intensity: {data[5]}")        
+            print(f"Intensity: {data[5]}")        
         print(f"Sij mu2: {data[6]} [Debye2]")
         print(f"Sij: {data[7]}")
         print(f"Einstein A coefficient (Aij): {data[8]:.3e} [1/s]")
-        if not np.isnan(data[9]) and data[9] != 0:
-            print(f"Lovas/AST intensity: {data[9]}")
         print(f"Lower energy level: {data[10]} [K]")
         print(f"Upper energy level: {data[11]} [K]")
         print(f"Upper state degeneracy (gu): {data[12]}")
@@ -6249,7 +9672,7 @@ def search_molecular_line(restfreq, unit="GHz", printinfo=True):
 
 def planck_function(v, T):
     """
-    Public function to calculate the planck function value
+    Public function to calculate the planck function value.
     Parameters:
         v (float): frequency of source [GHz]
         T (float): temperature [K]
@@ -6274,7 +9697,7 @@ def planck_function(v, T):
     return Bv.to_value(u.Jy)
 
 
-def clip_percentile(data, area=0.95, bins="auto", plot=True, xlim=None):
+def clip_percentile(data, area=0.95):
     """
     Public function to calculate the interval containing the percentile (from middle).
     Parameters:
@@ -6285,52 +9708,24 @@ def clip_percentile(data, area=0.95, bins="auto", plot=True, xlim=None):
     Returns:
         The interval (tuple(float)) containing the area (from middle).
     """
-    if not (0 <= area <= 1):
+    if 0 <= area <= 1:
+        area *= 100
+    else:
         raise ValueError("Percentile must be between 0 and 1.")
         
-    # get left and right tails
-    left_tail = (1 - area) / 2
-    right_tail = area + left_tail
-
-    # flatten data
+    upper_tail = (100+area)/2
+    lower_tail = (100-area)/2
     flattened_data = data.flatten()
-    flattened_data = flattened_data[~np.isnan(flattened_data)]  # remove nan values
-
-    # get histogram data
-    freq, bin_edges = np.histogram(flattened_data, bins=bins)  # create histogram data
-    middle_bins = (bin_edges[:-1]+bin_edges[1:])/2  # middle bins
-    cum_areas = np.cumsum(freq)  # cumulative areas
-    rel_cum_areas = cum_areas/cum_areas[-1]  # relative cumulative areas
-    
-    # calculate mean value of histogram
-    mean = np.average(middle_bins, weights=freq)
-
-    # get index of left and right tails
-    left_idx = np.where(rel_cum_areas>=left_tail)[0][0]
-    right_idx = np.where(rel_cum_areas>=right_tail)[0][0]
-
-    # get interval
-    interval = (middle_bins[left_idx], middle_bins[right_idx])
+    flattened_data = flattened_data[~np.isnan(flattened_data)]
+    lower_bound = np.percentile(flattened_data, lower_tail, method="linear")
+    upper_bound = np.percentile(flattened_data, upper_tail, method="linear")
+    interval = (lower_bound, upper_bound)
     
     # print info
-    title = f"{100*area}th percentile"
-    print(15*"#"+title+15*"#")
+    print(f"{area}th percentile".center(40, "#"))
     print(f"Interval: {interval}")
-    print(f"Mean of histogram: %.4f"%mean)
-    print((30+len(title))*"#")
-    
-    # plot data if needed
-    if plot:
-        fig = plt.figure(figsize=(3.2, 2.4))
-        ax = fig.add_subplot(111)
-        ax.hist(flattened_data, bins=bins)
-        ymin, ymax = ax.get_ylim()
-        ax.vlines(x=interval, ymin=ymin, ymax=ymax, colors="r", lw=1, ls="dashed")
-        ax.vlines(x=mean, ymin=ymin, ymax=ymax, colors="g", lw=1, ls="dashed")
-        if xlim is not None:
-            ax.set_xlim(xlim)
-        ax.set_ylim(ymin, ymax)
-        
+    print(40*"#", end="\n\n")
+
     return interval
 
 
@@ -6349,7 +9744,7 @@ def H2_column_density(continuum, T_dust, k_v):
     mmw = 2.8            # mean molecular weight
     
     # convert continuum to brightness temperature
-    I_v = continuum.conv_bunit("Jy/sr")
+    I_v = continuum.conv_bunit("Jy/sr", inplace=False)
     if not isinstance(I_v.data, u.Quantity):
         I_v *= u.Jy
     v = continuum.restfreq * u.Hz
@@ -6364,64 +9759,6 @@ def H2_column_density(continuum, T_dust, k_v):
     B_v = planck_function(v=v.to_value(u.GHz), T=T_dust)*u.Jy
     H2_cd = (I_v / (k_v*B_v*mmw*m_p)).to_value(u.cm**-2)
     return H2_cd
-
-
-def __Qrot_linear(T, B0):
-    """
-    Private function to calculate rotational partition function value of a linear molecule.
-    Source: https://doi.org/10.48550/arXiv.1501.01703
-    Parameters:
-        T: excitation temperature (K)
-        B0: rotational constant of the molecule (MHz)
-    Returns:
-        Value of rotational partition function.
-    """ 
-    # constants
-    k = const.k_B.cgs
-    h = const.h.cgs
-    
-    # assign units
-    if not isinstance(T, u.Quantity):
-        T *= u.K
-    if not isinstance(B0, u.Quantity):
-        B0 *= u.MHz
-        
-    # warning checking
-    if T <= 2.*u.K:
-        print("WARNING: Approximation error of partition function is greater than 1%.")
-    
-    # linear diatomic molecules
-    Qrot = k*T/h/B0 + 1/3 + 1/15*(h*B0/k/T) + 4/315*(h*B0/k/T)**2 + 1/315*(h*B0/k/T)**3
-    return Qrot.cgs.value
-
-
-def __Qrot_linear_polyatomic(T, B0):
-    """
-    Private function to calculate rotational partition function value of linear polyatomic molecule.
-    Source: https://doi.org/10.48550/arXiv.1501.01703
-    Parameters:
-        T: excitation temperature (K)
-        B0: rotational constant of the molecule (MHz)
-    Returns:
-        Value of rotational partition function.
-    """ 
-    # constants
-    k = const.k_B.cgs
-    h = const.h.cgs
-    
-    # assign units
-    if not isinstance(T, u.Quantity):
-        T *= u.K
-    if not isinstance(B0, u.Quantity):
-        B0 *= u.MHz
-        
-    # warning checking
-    if T <= 3.5*u.K:
-        print("WARNING: Approximation error of partition function is greater than 1%.")
-    
-    # linear diatomic molecules
-    Qrot = k*T/h/B0 * np.exp(h*B0/3/k/T)
-    return Qrot.cgs.value
 
 
 def J_v(v, T):
@@ -6476,10 +9813,10 @@ def column_density_linear_optically_thin(image, T_ex, T_bg=2.726, B0=None, R_i=1
     
     # convert units 
     if isinstance(image, Spatialmap):
-        image = image.conv_bunit("K.km/s")*u.K*u.km/u.s
+        image = image.conv_bunit("K.km/s", inplace=False)*u.K*u.km/u.s
     elif isinstance(image, Datacube):
-        image = image.conv_bunit("K")
-        image = image.conv_specunit("km/s")
+        image = image.conv_bunit("K", inplace=False)
+        image = image.conv_specunit("km/s", inplace=False)
         dv = image.header["dv"]
         image = image*dv*(u.K*u.km/u.s)
     else:
@@ -6494,7 +9831,7 @@ def column_density_linear_optically_thin(image, T_ex, T_bg=2.726, B0=None, R_i=1
         B0 = line_data[13][1]*u.MHz  # rotational constant
     elif not isinstance(B0, u.Quantity):
         B0 *= u.MHz
-    Q_rot = __Qrot_linear(T=T_ex, B0=B0)  # partition function
+    Q_rot = _Qrot_linear(T=T_ex, B0=B0)  # partition function
         
     # error checking to make sure molecule is linear
     if line_data[13] is not None:
@@ -6539,3 +9876,195 @@ def column_density_linear_optically_thick(moment0_map, T_ex, tau, T_bg=2.726, R_
     corr_factor = tau/(1-np.exp(-tau))
     cd_img = corr_factor*cd_opt_thin
     return cd_img
+
+
+def to_casa(image, outname, whichrep=0, whichhdu=-1, 
+            zeroblanks=True, overwrite=False, defaultaxes=False,
+            defaultaxesvalues=[], beam=[]) -> None:
+    """
+    Function to convert image object into CASA image format. 
+    Wraps the 'importfits' function of casatasks.
+
+    Parameters:
+        image (Datacube, Spatialmap, PVdiagram): The image object to be converted.
+        outname (str): The output name for the CASA image file. Must end with ".image".
+        whichrep (int, optional): The FITS representation to convert. Defaults to 0.
+        whichhdu (int, optional): The HDU (Header/Data Unit) number to convert. Defaults to -1.
+        zeroblanks (bool, optional): Replace undefined values with zeros. Defaults to True.
+        overwrite (bool, optional): Overwrite the output file if it already exists. Defaults to False.
+        defaultaxes (bool, optional): Use default axes for the output CASA image. Defaults to False.
+        defaultaxesvalues (str, optional): Default axes values, provided as a string. Defaults to '[]'.
+        beam (str, optional): Beam parameters, provided as a string. Defaults to '[]'.
+
+    Raises:
+        ValueError: If 'image' is not an instance of 'Datacube', 'Spatialmap', or 'PVdiagram'.
+        ValueError: If 'outname' is not a string.
+
+    Returns:
+        None
+
+    Example:
+        to_casa(my_image, "output_image")
+    """
+    # within-function import statement
+    import casatasks
+
+    # error checking & parse parameters
+    if not isinstance(image, (Datacube, Spatialmap, PVdiagram)):
+        raise ValueError("'image' must be an instance of 'Datacube', 'Spatialmap', or 'PVdiagram'")
+
+    if not isinstance(outname, str):
+        raise ValueError("'outname' must be a string (a directory that the image will be saved as)")
+
+    if not outname.endswith(".image"):
+        outname += ".image"  # add file extension
+
+    if not overwrite:
+        outname = _prevent_overwriting(outname)
+
+    # generate temporary FITS file
+    temp_fits_name = str(dt.datetime.now()).replace(" ", "") + ".fits"
+    temp_fits_name = _prevent_overwriting(temp_fits_name)
+    hdu = fits.PrimaryHDU(data=image.data, header=image.get_hduheader())
+    hdu.writeto(temp_fits_name, overwrite=False)
+
+    # convert FITS file to CASA image format
+    casatasks.importfits(fitsimage=temp_fits_name,
+                         imagename=outname,
+                         whichrep=whichrep,
+                         whichhdu=whichhdu,
+                         zeroblanks=zeroblanks,
+                         overwrite=overwrite,
+                         defaultaxes=defaultaxes,
+                         defaultaxesvalues=defaultaxesvalues,
+                         beam=beam)
+
+    # remove temporary FITS file
+    os.remove(temp_fits_name)
+
+    # Tell user that the image has been successfully saved.
+    print(f"Image successfully saved as '{outname}' in CASA format")
+    
+
+# ------------------- Below are functions intended for internal use -----------------------
+
+
+def _get_moment_map(moment: int, data: np.ndarray, 
+                    vaxis: np.ndarray, ny: int, 
+                    nx: int, keep_nan: bool,
+                    bunit: str, specunit: str,
+                    header: dict) -> np.ndarray:
+    """
+    Private method to get the data array of the specified moment map.
+    Used for the public method 'immoments'.
+    """
+    # intialize parameters
+    nv = vaxis.size
+    dv = vaxis[1] - vaxis[0]
+
+    # mean value of spectrum (unit: intensity)
+    if moment == -1:
+        momdata = np.nanmean(data, axis=1)
+    
+    # integrated value of the spectrum (unit: intensity*km/s)
+    elif moment == 0:
+        momdata = np.nansum(data, axis=1)*dv
+    
+    # intensity weighted coordinate (unit: km/s) 
+    elif moment == 1:
+        reshaped_vaxis = vaxis[np.newaxis, :, np.newaxis, np.newaxis]
+        momdata = np.nansum(data*reshaped_vaxis, axis=1) / np.nansum(data, axis=1)
+    
+    # intensity weighted dispersion of the coordinate (unit: km/s)
+    elif moment == 2:
+        reshaped_vaxis = vaxis.reshape((1, nv, 1, 1))
+        vv = np.broadcast_to(reshaped_vaxis, (1, nv, ny, nx))
+        meanvel = np.nansum(data*vv, axis=1) / np.nansum(data, axis=1)
+        momdata = np.sqrt(np.nansum(data*(vv-meanvel)**2, axis=1)/np.nansum(data, axis=1))
+        
+    # median value of the spectrum (unit: intensity)
+    elif moment == 3:
+        momdata = np.nanmedian(data, axis=1)
+    
+    # median coordinate (unit: km/s)
+    elif moment == 4:
+        momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
+        for i in range(momdata.shape[2]):
+            for j in range(momdata.shape[3]):
+                pixdata = data[0, :, i, j]  # shape: (nv,)
+                if np.all(np.isnan(pixdata)):
+                    momdata[0, 0, i, j] = np.nan
+                else:
+                    sorted_data = np.sort(pixdata)
+                    sorted_data = sorted_data[~np.isnan(sorted_data)] # remove nan so that median is accurate
+                    median_at_pix = sorted_data[sorted_data.size//2]  # this is approximation of median, not always exact
+                    vidx = np.where(pixdata == median_at_pix)[0][0]   # get index of coordinate of median
+                    momdata[0, 0, i, j] = vaxis[vidx]
+    
+    # standard deviation about the mean of the spectrum (unit: intensity)
+    elif moment == 5:
+        momdata = np.nanstd(data, axis=1)
+    
+    # root mean square of the spectrum (unit: intensity)
+    elif moment == 6:
+        momdata = np.sqrt(np.nanmean(data**2, axis=1))
+    
+    # absolute mean deviation of the spectrum (unit: intensity)
+    elif moment == 7:
+        momdata = np.nanmean(np.abs(data-np.nanmean(data, axis=1)), axis=1)
+        
+    # maximum value of the spectrum (unit: intensity)
+    elif moment == 8:
+        momdata = np.nanmax(data, axis=1)
+        
+    # coordinate of the maximum value of the spectrum (unit: km/s)
+    elif moment == 9:
+        momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
+        for i in range(momdata.shape[2]):
+            for j in range(momdata.shape[3]):
+                pixdata = data[0, :, i, j]  # intensity values of data cube at this pixel
+                if np.all(np.isnan(pixdata)):
+                    momdata[0, 0, i, j] = np.nan  # assign nan if all nan at that pixel
+                else:
+                    momdata[0, 0, i, j] = vaxis[np.nanargmax(pixdata)]
+        
+    # minimum value of the spectrum (unit: intensity)
+    elif moment == 10:
+        momdata = np.nanmin(data, axis=1)
+    
+    # coordinate of the minimum value of the spectrum (unit: km/s) 
+    elif moment == 11:
+        momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
+        for i in range(momdata.shape[2]):
+            for j in range(momdata.shape[3]):
+                pixdata = data[0, :, i, j]  # intensity values of data cube at this pixel
+                if np.all(np.isnan(pixdata)):
+                    momdata[0, 0, i, j] = np.nan  # assign nan if all nan at that pixel
+                else:
+                    momdata[0, 0, i, j] = vaxis[np.nanargmin(pixdata)]  
+
+    # reshape moment map data
+    momdata = momdata.reshape((1, 1, ny, nx))
+                    
+    # replace map pixels with nan if entire spectrum at that pixel is nan
+    if keep_nan:
+        mask = np.all(np.isnan(data), axis=1, keepdims=True)
+        momdata[mask] = np.nan
+
+    if moment in (-1, 3, 5, 6, 7, 8, 10):
+        bunit = bunit
+    elif moment == 0:
+        bunit = f"{bunit}.{specunit}"
+    else:
+        bunit = specunit
+
+    # update header information
+    newheader = copy.deepcopy(header)
+    newheader["imagetype"] = "spatialmap"
+    newheader["shape"] = momdata.shape
+    newheader["vrange"] = None
+    newheader["nchan"] = 1
+    newheader["dv"] = None
+    newheader["bunit"] = bunit
+    
+    return Spatialmap(header=newheader, data=momdata)
