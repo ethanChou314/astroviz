@@ -1307,3 +1307,159 @@ def _Qrot_linear_polyatomic(T, B0):
     # linear diatomic molecules
     Qrot = k*T/h/B0 * np.exp(h*B0/3/k/T)
     return Qrot.cgs.value
+
+
+def _get_moment_map(moment: int, data: np.ndarray, 
+                    vaxis: np.ndarray, ny: int, 
+                    nx: int, keep_nan: bool,
+                    bunit: str, specunit: str,
+                    header: dict) -> np.ndarray:
+    """
+    Private method to get the data array of the specified moment map.
+    Used for the public method 'immoments'.
+    """
+    from .spatialmap import Spatialmap
+
+
+    # intialize parameters
+    nv = vaxis.size
+    dv = vaxis[1] - vaxis[0]
+
+    # mean value of spectrum (unit: intensity)
+    if moment == -1:
+        momdata = np.nanmean(data, axis=1)
+    
+    # integrated value of the spectrum (unit: intensity*km/s)
+    elif moment == 0:
+        momdata = np.nansum(data, axis=1)*dv
+    
+    # intensity weighted coordinate (unit: km/s) 
+    elif moment == 1:
+        reshaped_vaxis = vaxis[np.newaxis, :, np.newaxis, np.newaxis]
+        momdata = np.nansum(data*reshaped_vaxis, axis=1) / np.nansum(data, axis=1)
+    
+    # intensity weighted dispersion of the coordinate (unit: km/s)
+    elif moment == 2:
+        reshaped_vaxis = vaxis.reshape((1, nv, 1, 1))
+        vv = np.broadcast_to(reshaped_vaxis, (1, nv, ny, nx))
+        meanvel = np.nansum(data*vv, axis=1) / np.nansum(data, axis=1)
+        momdata = np.sqrt(np.nansum(data*(vv-meanvel)**2, axis=1)/np.nansum(data, axis=1))
+        
+    # median value of the spectrum (unit: intensity)
+    elif moment == 3:
+        momdata = np.nanmedian(data, axis=1)
+    
+    # median coordinate (unit: km/s)
+    elif moment == 4:
+        momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
+        for i in range(momdata.shape[2]):
+            for j in range(momdata.shape[3]):
+                pixdata = data[0, :, i, j]  # shape: (nv,)
+                if np.all(np.isnan(pixdata)):
+                    momdata[0, 0, i, j] = np.nan
+                else:
+                    sorted_data = np.sort(pixdata)
+                    sorted_data = sorted_data[~np.isnan(sorted_data)] # remove nan so that median is accurate
+                    median_at_pix = sorted_data[sorted_data.size//2]  # this is approximation of median, not always exact
+                    vidx = np.where(pixdata == median_at_pix)[0][0]   # get index of coordinate of median
+                    momdata[0, 0, i, j] = vaxis[vidx]
+    
+    # standard deviation about the mean of the spectrum (unit: intensity)
+    elif moment == 5:
+        momdata = np.nanstd(data, axis=1)
+    
+    # root mean square of the spectrum (unit: intensity)
+    elif moment == 6:
+        momdata = np.sqrt(np.nanmean(data**2, axis=1))
+    
+    # absolute mean deviation of the spectrum (unit: intensity)
+    elif moment == 7:
+        momdata = np.nanmean(np.abs(data-np.nanmean(data, axis=1)), axis=1)
+        
+    # maximum value of the spectrum (unit: intensity)
+    elif moment == 8:
+        momdata = np.nanmax(data, axis=1)
+        
+    # coordinate of the maximum value of the spectrum (unit: km/s)
+    elif moment == 9:
+        momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
+        for i in range(momdata.shape[2]):
+            for j in range(momdata.shape[3]):
+                pixdata = data[0, :, i, j]  # intensity values of data cube at this pixel
+                if np.all(np.isnan(pixdata)):
+                    momdata[0, 0, i, j] = np.nan  # assign nan if all nan at that pixel
+                else:
+                    momdata[0, 0, i, j] = vaxis[np.nanargmax(pixdata)]
+        
+    # minimum value of the spectrum (unit: intensity)
+    elif moment == 10:
+        momdata = np.nanmin(data, axis=1)
+    
+    # coordinate of the minimum value of the spectrum (unit: km/s) 
+    elif moment == 11:
+        momdata = np.empty((1, 1, data.shape[2], data.shape[3]))
+        for i in range(momdata.shape[2]):
+            for j in range(momdata.shape[3]):
+                pixdata = data[0, :, i, j]  # intensity values of data cube at this pixel
+                if np.all(np.isnan(pixdata)):
+                    momdata[0, 0, i, j] = np.nan  # assign nan if all nan at that pixel
+                else:
+                    momdata[0, 0, i, j] = vaxis[np.nanargmin(pixdata)]  
+
+    # reshape moment map data
+    momdata = momdata.reshape((1, 1, ny, nx))
+                    
+    # replace map pixels with nan if entire spectrum at that pixel is nan
+    if keep_nan:
+        mask = np.all(np.isnan(data), axis=1, keepdims=True)
+        momdata[mask] = np.nan
+
+    if moment in (-1, 3, 5, 6, 7, 8, 10):
+        bunit = bunit
+    elif moment == 0:
+        bunit = f"{bunit}.{specunit}"
+    else:
+        bunit = specunit
+
+    # update header information
+    newheader = copy.deepcopy(header)
+    newheader["imagetype"] = "spatialmap"
+    newheader["shape"] = momdata.shape
+    newheader["vrange"] = None
+    newheader["nchan"] = 1
+    newheader["dv"] = None
+    newheader["bunit"] = bunit
+    
+    return Spatialmap(header=newheader, data=momdata)
+
+
+def _clip_percentile(data, area=0.95):
+    """
+    Public function to calculate the interval containing the percentile (from middle).
+    Parameters:
+        data: the 2D data of an image
+        area: the total area (from center)
+        bins: the number of bins of the histogram
+        xlim: the x field of view of the histogram
+    Returns:
+        The interval (tuple(float)) containing the area (from middle).
+    """
+    if 0 <= area <= 1:
+        area *= 100
+    else:
+        raise ValueError("Percentile must be between 0 and 1.")
+        
+    upper_tail = (100+area)/2
+    lower_tail = (100-area)/2
+    flattened_data = data.flatten()
+    flattened_data = flattened_data[~np.isnan(flattened_data)]
+    lower_bound = np.percentile(flattened_data, lower_tail, method="linear")
+    upper_bound = np.percentile(flattened_data, upper_tail, method="linear")
+    interval = (lower_bound, upper_bound)
+    
+    # print info
+    print(f"{area}th percentile".center(40, "#"))
+    print(f"Interval: {interval}")
+    print(40*"#", end="\n\n")
+
+    return interval

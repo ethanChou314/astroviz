@@ -1,0 +1,8 @@
+LICENSE
+README.md
+setup.py
+astroviz.egg-info/PKG-INFO
+astroviz.egg-info/SOURCES.txt
+astroviz.egg-info/dependency_links.txt
+astroviz.egg-info/requires.txt
+astroviz.egg-info/top_level.txt

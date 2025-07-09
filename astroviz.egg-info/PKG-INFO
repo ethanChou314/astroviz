@@ -1,0 +1,14 @@
+Metadata-Version: 2.1
+Name: astroviz
+Version: 0.1.0
+Summary: A tool for data analysis and visualization in radio astronomy
+Author: Ethan Chou
+Author-email: ethanchou04@gmail.com
+Requires-Python: >=3.8
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: astropy
+Requires-Dist: scipy
+Requires-Dist: matplotlib
+Requires-Dist: astroquery
