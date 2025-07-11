@@ -1,4 +1,9 @@
 from .common import *
+from .datacube import Datacube
+from .spatialmap import Spatialmap
+from .pvdiagram import PVdiagram
+from .plot2d import Plot2D
+from .region import Region
 
 
 class ImageMatrix:

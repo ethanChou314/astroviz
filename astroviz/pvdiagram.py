@@ -1204,4 +1204,6 @@ class PVdiagram:
         Example:
             image.to_casa("output_image")
         """
+        from .io import to_casa
+        
         to_casa(self, *args, **kwargs)

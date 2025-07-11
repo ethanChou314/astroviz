@@ -413,6 +413,9 @@ def to_casa(image, outname, whichrep=0, whichhdu=-1,
     """
     # within-function import statement
     import casatasks
+    from .datacube import Datacube
+    from .spatialmap import Spatialmap
+    from .pvdiagram import PVdiagram
 
     # error checking & parse parameters
     if not isinstance(image, (Datacube, Spatialmap, PVdiagram)):
@@ -473,6 +476,10 @@ def imview(image, *args, **kwargs):
     - If `image` is a string, treats it as a directory to a FITS file, imports the FITS file, and calls its `imview` method.
     - Otherwise, raises a ValueError indicating an invalid 'image' parameter.
     """
+    from .datacube import Datacube
+    from .spatialmap import Spatialmap
+    from .pvdiagram import PVdiagram
+    
     if isinstance(image, (Datacube, Spatialmap, PVdiagram)):
         return image.imview(*args, **kwargs)
     elif isinstance(image, str):

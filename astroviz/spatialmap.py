@@ -572,6 +572,9 @@ class Spatialmap:
             - If the image contains NaN values, they will be replaced with zeros during the shifting process.
             - The new reference coordinate is updated in the image header.
         """
+        from .datacube import Datacube
+        from .pvdiagram import PVdiagram
+
         unit = self.unit if unit is None else unit
         if isinstance(coord, (Spatialmap, Datacube, PVdiagram)):
             coord = coord.header["refcoord"]
@@ -2440,4 +2443,6 @@ class Spatialmap:
         Example:
             image.to_casa("output_image")
         """
+        from .io import to_casa
+        
         to_casa(self, *args, **kwargs)

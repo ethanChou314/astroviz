@@ -235,6 +235,9 @@ def column_density_linear_optically_thin(image, T_ex, T_bg=2.726, B0=None, R_i=1
     Returns:
         cd_img (Spatialmap/Datacube): the column density map
     """
+    from .spatialmap import Spatialmap
+    from .datacube import Datacube
+    
     # constants
     k = const.k_B.cgs
     h = const.h.cgs

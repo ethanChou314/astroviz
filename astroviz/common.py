@@ -5,7 +5,7 @@ from .utils import (_unnormalize_location, _normalize_location, _change_cell_siz
                    _relative2icrs, _to_apu, _apu_to_str, _apu_to_headerstr, _best_match_line,
                    _unit_plt_str, _convert_Bunit, _Qrot_linear, _get_beam_dim_along_pa,
                    _Qrot_linear_polyatomic, _match_limits, _get_optimal_columns, _get_moment_map,
-                   _clip_percentile)
+                   _clip_percentile, _best_match_line)
 
 # numerical packages
 import numpy as np
@@ -152,5 +152,5 @@ __all__ = [
     "List", 
     "Dict", 
     "Union", 
-    "Optional"
+    "Optional",
 ]

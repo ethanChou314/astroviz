@@ -1644,7 +1644,8 @@ class Datacube:
         region.relative = region.header["relative"] = True
         return region
         
-    def pvextractor(self, region, vrange=None, width=1, preview=True, **kwargs):
+    def pvextractor(self, region, vrange=None, width=1, preview=True, 
+                    parallel=True, **kwargs):
         """
         This method extracts the pv diagram along the specified pv slice.
         Parameters:
@@ -1677,8 +1678,10 @@ class Datacube:
         
         # shift and then rotate image
         pa_prime = 90.-pa
-        shifted_img = self.imshift(center, inplace=False, printcc=False) if center != (0, 0) else self.copy()
-        rotated_img = shifted_img.rotate(angle=-pa_prime, ccw=False, inplace=False) if pa_prime != 0 else shifted_img
+        shifted_img = self.imshift(center, inplace=False, printcc=False, parallel=parallel) \
+                      if center != (0, 0) else self.copy()
+        rotated_img = shifted_img.rotate(angle=-pa_prime, ccw=False, inplace=False) \
+                      if pa_prime != 0 else shifted_img
         
         # trim data
         xmask = (-length/2 <= self.xaxis) & (self.xaxis <= length/2)
@@ -2373,5 +2376,7 @@ class Datacube:
         Example:
             image.to_casa("output_image")
         """
+        from .io import to_casa
+        
         to_casa(self, *args, **kwargs)
 
