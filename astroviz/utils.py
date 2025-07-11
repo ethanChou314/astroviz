@@ -2,7 +2,6 @@
 Utilities module for astroviz.
 """
 
-
 # numerical packages
 import numpy as np
 import pandas as pd

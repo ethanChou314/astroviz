@@ -36,6 +36,8 @@ def search_molecular_line(restfreq, unit="GHz", species_id=None,
     - This function requires an internet connection to query the Splatalogue database.
     - If the frequency does not closely match any known molecular lines, a warning will be printed.
     """
+    from .utils import _best_match_line
+    
     # error checking for rest frequency
     if restfreq is None:
         raise ValueError("The rest frequency cannot be 'None'.")
@@ -43,7 +45,8 @@ def search_molecular_line(restfreq, unit="GHz", species_id=None,
     if unit != "GHz":
         restfreq = u.Quantity(restfreq, unit).to_value(u.GHz)   # convert unit to GHz
     
-    results = _best_match_line(restfreq, species_id=species_id, return_table=return_table)
+    results = _best_match_line(restfreq, species_id=species_id, 
+                               return_table=return_table)
     if return_table:
         return results
 
@@ -192,6 +195,7 @@ def H2_column_density(continuum, T_dust, k_v):
     # start calculating
     B_v = planck_function(v=v.to_value(u.GHz), T=T_dust)*u.Jy
     H2_cd = (I_v / (k_v*B_v*mmw*m_p)).to_value(u.cm**-2)
+
     return H2_cd
 
 
@@ -216,6 +220,7 @@ def J_v(v, T):
     
     # calculate R-J equivalent temperature
     Jv = (h*v/k) / (np.exp(h*v/k/T)-1)
+
     return Jv.to(u.K)
 
 
@@ -283,6 +288,7 @@ def column_density_linear_optically_thin(image, T_ex, T_bg=2.726, B0=None, R_i=1
     constant = aa*bb*cc*dd/f
     cd_img = constant*image
     cd_img = cd_img.to_value(u.cm**-2)
+
     return cd_img
 
 
